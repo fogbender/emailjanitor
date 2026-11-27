@@ -223,6 +223,31 @@ defmodule EmailJanitor.WorkerServerTest do
     refute_receive {:attempted, "b"}, 100
   end
 
+  test "opaque bounded host references are resolved and can be explicitly repaired" do
+    owner = self()
+    refs = ["group:inbox.1", "owner@example.com", "plain"]
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, refs} end,
+         resolve: fn ref -> {:ok, config(ref)} end,
+         step: fn cfg ->
+           send(owner, {:opaque, cfg.inbox.id})
+           {:ok, %{status: :rate_limited, more?: false}}
+         end,
+         interval_ms: 5_000}
+      )
+
+    for ref <- refs, do: assert_receive({:opaque, ^ref}, 1_000)
+    wait_failed_refs(server, refs, 100)
+    Server.wake(server, "owner@example.com")
+    assert_receive {:opaque, "owner@example.com"}, 1_000
+    refute_receive {:opaque, "plain"}, 100
+    Server.wake(server, String.duplicate("x", 257))
+    refute_receive {:opaque, _}, 100
+  end
+
   test "new explicit wake refreshes the trusted list without reviving another failed inbox" do
     owner = self()
     refs = start_supervised!({Agent, fn -> ["a"] end})

@@ -73,6 +73,20 @@ defmodule EmailJanitor.Gmail.SDK do
     end)
   end
 
+  defp thread_call(fun) do
+    case call(fun) do
+      {:error, :not_found} -> {:error, :thread_not_found}
+      result -> result
+    end
+  end
+
+  defp message_call(fun) do
+    case call(fun) do
+      {:error, :not_found} -> {:error, :message_not_found}
+      result -> result
+    end
+  end
+
   @impl true
   def history_id(inbox_id, opts) do
     guarded(fn ->
