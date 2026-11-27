@@ -1,6 +1,7 @@
 defmodule EmailJanitor.Mail.Feedback.Route do
   @enforce_keys [:key, :inbox_id]
-  defstruct @enforce_keys
+  @derive {Inspect, only: [:key, :inbox_id]}
+  defstruct @enforce_keys ++ [guard: nil]
 end
 
 defmodule EmailJanitor.Mail.Feedback.Context do
@@ -20,7 +21,7 @@ end
 defmodule EmailJanitor.Mail.Feedback.Config do
   @enforce_keys [:transport_scope, :transport_inbox, :mail, :parser_executable, :route, :resolve]
   @derive {Inspect, only: [:transport_inbox]}
-  defstruct @enforce_keys ++ [signup_url: nil]
+  defstruct @enforce_keys ++ [signup_url: nil, signup_secret: nil]
   alias EmailJanitor.{Inbox, Mail, Store.Scope}
 
   def new(opts) do
@@ -34,7 +35,8 @@ defmodule EmailJanitor.Mail.Feedback.Config do
          true <- Bitwise.band(mode, 0o111) != 0,
          route when is_function(route, 1) <- opts[:route],
          resolve when is_function(resolve, 1) <- opts[:resolve],
-         true <- signup?(opts[:signup_url]) do
+         true <- signup?(opts[:signup_url]),
+         true <- signup_secret?(opts[:signup_url], opts[:signup_secret]) do
       {:ok,
        %__MODULE__{
          transport_scope: scope,
@@ -43,7 +45,8 @@ defmodule EmailJanitor.Mail.Feedback.Config do
          parser_executable: parser,
          route: route,
          resolve: resolve,
-         signup_url: opts[:signup_url]
+         signup_url: opts[:signup_url],
+         signup_secret: opts[:signup_secret]
        }}
     else
       _ -> {:error, :invalid_feedback_configuration}
@@ -54,6 +57,13 @@ defmodule EmailJanitor.Mail.Feedback.Config do
     do:
       is_binary(value) and byte_size(value) in 1..1024 and
         Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, value)
+
+  defp signup_secret?(nil, _), do: true
+
+  defp signup_secret?(_, %EmailJanitor.Content{} = secret),
+    do: byte_size(EmailJanitor.Content.read(secret)) in 32..128
+
+  defp signup_secret?(_, _), do: false
 
   defp signup?(nil), do: true
 

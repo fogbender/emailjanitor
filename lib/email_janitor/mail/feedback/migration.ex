@@ -27,6 +27,21 @@ defmodule EmailJanitor.Mail.Feedback.Migration do
       timestamps(type: :utc_datetime_usec)
     end
 
+    # Permanent anonymous at-most-once signup evidence: keyed sender digest only,
+    # independent of expiring receipts, outgoing metadata and recipient addresses.
+    create table(:mail_signup_once, primary_key: false) do
+      add(:sender_hash, :binary, primary_key: true)
+      add(:created_at, :utc_datetime_usec, null: false)
+    end
+
+    create(index(:mail_signup_once, [:created_at]))
+
+    create(
+      constraint(:mail_signup_once, :signup_sender_hash_size,
+        check: "octet_length(sender_hash)=32"
+      )
+    )
+
     create(index(:mail_feedback, [:next_attempt_at, :id]))
     create(index(:mail_feedback, [:state, :next_attempt_at, :authenticated_at, :inserted_at]))
     create(index(:mail_feedback, [:sender_inbox_id, :state]))
@@ -100,5 +115,14 @@ defmodule EmailJanitor.Mail.Feedback.Record do
     field(:lease_until, :utc_datetime_usec)
     field(:next_attempt_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
+  end
+end
+
+defmodule EmailJanitor.Mail.Feedback.SignupTombstone do
+  use Ecto.Schema
+  @primary_key {:sender_hash, :binary, autogenerate: false}
+  @derive {Inspect, only: [:created_at]}
+  schema "mail_signup_once" do
+    field(:created_at, :utc_datetime_usec)
   end
 end

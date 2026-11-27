@@ -13,8 +13,23 @@ defmodule EmailJanitor.Mail.Feedback do
     Ledger,
     Record,
     ReplyParser,
-    Route
+    Route,
+    SignupTombstone
   }
+
+  @doc "Keyed address-free signup suppression identity. The trusted host owns the stable secret."
+  def signup_sender_hash(%Content{} = secret, address) do
+    with key = Content.read(secret),
+         true <- byte_size(key) in 32..128,
+         {:ok, normalized} <- EmailJanitor.Address.normalize(address),
+         true <- normalized == address do
+      {:ok, :crypto.mac(:hmac, :sha256, key, "emailjanitor-signup:" <> address)}
+    else
+      _ -> {:error, :invalid_signup_sender}
+    end
+  rescue
+    _ -> {:error, :invalid_signup_sender}
+  end
 
   def install(scope) do
     with result when result in [:ok, :already_up] <- EmailJanitor.Mail.Store.install(scope),
@@ -50,23 +65,28 @@ defmodule EmailJanitor.Mail.Feedback do
          {:ok, id} <- RFCMessageID.request_id(route.inbox_id, envelope.rfc_message_id),
          now = DateTime.utc_now(),
          {:ok, _} <-
-           Ledger.admit(config.transport_scope, %Record{
-             id: id,
-             kind: :feedback,
-             source_ses_id: envelope.ses_id,
-             sender_address: envelope.from,
-             sender_inbox_id: route.inbox_id,
-             rfc_message_id: envelope.rfc_message_id,
-             route_key: route.key,
-             received_at: envelope.received_at,
-             expires_at: envelope.expires_at,
-             inserted_at: now,
-             updated_at: now
-           }) do
+           Ledger.admit(
+             config.transport_scope,
+             %Record{
+               id: id,
+               kind: :feedback,
+               source_ses_id: envelope.ses_id,
+               sender_address: envelope.from,
+               sender_inbox_id: route.inbox_id,
+               rfc_message_id: envelope.rfc_message_id,
+               route_key: route.key,
+               received_at: envelope.received_at,
+               expires_at: envelope.expires_at,
+               inserted_at: now,
+               updated_at: now
+             },
+             route.guard
+           ) do
       {:ok, id}
     else
       {:error, :feedback_reference_conflict} -> :rejected
       {:error, :feedback_rate_limited} -> :ignored
+      {:error, :feedback_connection_changed} -> :ignored
       false -> :rejected
       _ -> {:error, :feedback_unavailable}
     end
@@ -78,11 +98,9 @@ defmodule EmailJanitor.Mail.Feedback do
   defp accept_signup(config, envelope) do
     scope = config.transport_scope
 
-    recipient_id =
-      "feedback-recipient-" <> Base.encode16(:crypto.hash(:sha256, envelope.from), case: :lower)
-
-    day = Date.to_iso8601(DateTime.to_date(envelope.received_at))
-    {:ok, id} = RFCMessageID.request_id(recipient_id, "signup-" <> day <> "@emailjanitor.invalid")
+    {:ok, sender_hash} = signup_sender_hash(config.signup_secret, envelope.from)
+    recipient_id = "feedback-recipient-" <> Base.encode16(sender_hash, case: :lower)
+    {:ok, id} = RFCMessageID.request_id(recipient_id, "signup-once@emailjanitor.invalid")
 
     case scope.repo.transaction(fn ->
            scope.repo.one!(
@@ -94,6 +112,9 @@ defmodule EmailJanitor.Mail.Feedback do
            )
 
            existing = Ledger.get(scope, id)
+           tombstone = scope.repo.get(SignupTombstone, sender_hash, prefix: scope.prefix)
+
+           if tombstone && is_nil(existing), do: scope.repo.rollback(:signup_already_answered)
 
            if existing do
              existing
@@ -103,16 +124,20 @@ defmodule EmailJanitor.Mail.Feedback do
 
              count =
                scope.repo.aggregate(
-                 from(r in Record,
-                   where:
-                     r.kind == :signup and r.received_at >= ^start and
-                       r.received_at < ^DateTime.add(start, 86400)
+                 from(r in SignupTombstone,
+                   where: r.created_at >= ^start and r.created_at < ^DateTime.add(start, 86400)
                  ),
                  :count,
                  prefix: scope.prefix
                )
 
              if count >= 100, do: scope.repo.rollback(:signup_rate_limited)
+
+             scope.repo.insert!(
+               %SignupTombstone{sender_hash: sender_hash, created_at: envelope.received_at},
+               prefix: scope.prefix
+             )
+
              {:ok, inbox} = Inbox.new(recipient_id, envelope.from)
 
              case scope.repo.one(
