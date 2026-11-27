@@ -1,7 +1,7 @@
 defmodule EmailJanitor.Store do
   @moduledoc "Scoped durable intents and restoration history. No raw email or provider output is accepted."
   import Ecto.Query
-  alias EmailJanitor.{Inbox, Proposal, Reconciliation}
+  alias EmailJanitor.{Inbox, Policy, Proposal, Reconciliation}
   alias EmailJanitor.Store.{Action, Mailbox, Migration, Scope}
 
   def install(%Scope{repo: repo, prefix: prefix}) do
@@ -20,7 +20,7 @@ defmodule EmailJanitor.Store do
     end
   end
 
-  def intent(%Scope{} = scope, inbox_id, %Proposal{} = proposal, history_id)
+  def intent(%Scope{} = scope, inbox_id, %Proposal{} = proposal, history_id, opts \\ [])
       when is_binary(history_id) do
     true = Regex.match?(~r/\A[0-9]{1,32}\z/, history_id)
 
@@ -62,7 +62,16 @@ defmodule EmailJanitor.Store do
       if existing do
         {:existing, existing}
       else
-        {:created, scope.repo.insert!(record, prefix: scope.prefix)}
+        policy = Keyword.get(opts, :policy, Policy.unlimited())
+        now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
+
+        case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
+          :ok -> {:created, scope.repo.insert!(record, prefix: scope.prefix)}
+          # A block commits the host's pending-candidate metadata but never creates
+          # a Gmail mutation intent. Errors roll back the entire reservation.
+          {:blocked, reason} -> {:blocked, reason}
+          {:error, reason} -> scope.repo.rollback(reason)
+        end
       end
     end)
   end
