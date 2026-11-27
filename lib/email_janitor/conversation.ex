@@ -496,7 +496,7 @@ defmodule EmailJanitor.Conversation do
                 _, _ -> {:error, :restore_unavailable}
               end
 
-            restore_result(ctx, restore, effect_id, result)
+            restore_result(ctx, restore, effect_id, result, Enum.map(remaining, & &1.message_id))
         end
 
       case record_results(ctx, receipt, remaining, status, id) do
@@ -593,7 +593,7 @@ defmodule EmailJanitor.Conversation do
   defp restore_result({:existing, :intent, _}), do: {"unavailable", nil}
 
   defp restore_result({:existing, :cancelled, _}), do: {"unsupported", nil}
-  defp restore_result({:error, :restore_pending}), do: {"protected", nil}
+  defp restore_result({:error, :restore_pending}), do: {"unavailable", nil}
 
   defp restore_result({:error, reason})
        when reason in [
@@ -607,6 +607,24 @@ defmodule EmailJanitor.Conversation do
        do: {"unsupported", nil}
 
   defp restore_result(_), do: {"unavailable", nil}
+
+  defp restore_result(ctx, restore, effect_id, {:error, :restore_pending}, ids) do
+    if Code.ensure_loaded?(restore) and function_exported?(restore, :overlap_outcome, 4) do
+      case apply(restore, :overlap_outcome, [ctx.scope, ctx.inbox, ids, effect_id]) do
+        {:unresolved, _} -> {"protected", nil}
+        _ -> {"unavailable", nil}
+      end
+    else
+      {"unavailable", nil}
+    end
+  rescue
+    _ -> {"unavailable", nil}
+  catch
+    _, _ -> {"unavailable", nil}
+  end
+
+  defp restore_result(ctx, restore, effect_id, result, _ids),
+    do: restore_result(ctx, restore, effect_id, result)
 
   defp restore_result(ctx, restore, effect_id, {:error, reason} = result)
        when reason not in [

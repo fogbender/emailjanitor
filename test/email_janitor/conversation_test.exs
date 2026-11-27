@@ -41,24 +41,30 @@ defmodule EmailJanitor.ConversationFixtureGmail do
   def prepare_add_inbox(_inbox, ids, opts) do
     {:ok,
      fn ->
-       result =
-         Agent.get_and_update(opts[:state], fn state ->
-           if opts[:reject_restore] do
-             {{:rejected, :rate_limited},
-              %{state | calls: state.calls ++ [{:restore_attempt, ids}]}}
-           else
-             messages =
-               Enum.map(state.messages, fn message ->
-                 if message.id in ids,
-                   do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
-                   else: message
-               end)
+       before = if hook = opts[:before_restore], do: hook.(), else: :ok
 
-             {:ok, %{state | messages: messages, calls: state.calls ++ [{:restore, ids}]}}
-           end
-         end)
+       if before == :abort do
+         {:rejected, :rate_limited}
+       else
+         result =
+           Agent.get_and_update(opts[:state], fn state ->
+             if opts[:reject_restore] do
+               {{:rejected, :rate_limited},
+                %{state | calls: state.calls ++ [{:restore_attempt, ids}]}}
+             else
+               messages =
+                 Enum.map(state.messages, fn message ->
+                   if message.id in ids,
+                     do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
+                     else: message
+                 end)
 
-       if opts[:restore_timeout], do: {:error, :timeout}, else: result
+               {:ok, %{state | messages: messages, calls: state.calls ++ [{:restore, ids}]}}
+             end
+           end)
+
+         if opts[:restore_timeout], do: {:error, :timeout}, else: result
+       end
      end}
   end
 end
@@ -78,11 +84,14 @@ end
 defmodule EmailJanitor.ConversationFixtureRestore do
   def apply(_, _, effect_id, _, _, _, opts) do
     Process.put({__MODULE__, :outcome}, Keyword.get(opts, :fixture_outcome, fn _ -> :none end))
+    Process.put({__MODULE__, :overlap}, Keyword.get(opts, :fixture_overlap, :none))
     opts[:fixture_restore].(effect_id)
   end
 
   def outcome(_, _, effect_id),
     do: Process.get({__MODULE__, :outcome}, fn _ -> :none end).(effect_id)
+
+  def overlap_outcome(_, _, _, _), do: Process.get({__MODULE__, :overlap}, :none)
 end
 
 defmodule EmailJanitor.ConversationFixtureCancelledRestore do
@@ -1096,7 +1105,8 @@ defmodule EmailJanitor.ConversationTest do
         ctx
         | execution_options: [
             restore_adapter: EmailJanitor.ConversationFixtureRestore,
-            fixture_restore: result
+            fixture_restore: result,
+            fixture_overlap: {:unresolved, Ecto.UUID.generate()}
           ]
       }
     end
@@ -1578,5 +1588,49 @@ defmodule EmailJanitor.ConversationTest do
     refute Enum.any?(receipt.results, &(&1["status"] == "unresolved"))
     assert TestRepo.all(EmailJanitor.Restore.Effect, prefix: ctx.scope.prefix) == []
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "an overlapping live restore stays retryable and completes after the first is cancelled",
+       t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    {gmail, opts} = ctx.gmail
+    observer = self()
+
+    before = fn ->
+      send(observer, {:pending_restore_wire, self()})
+
+      receive do
+        :abort -> :abort
+      end
+    end
+
+    first = %{
+      context(ctx, operation: :restore, target: :none)
+      | gmail: {gmail, Keyword.put(opts, :before_restore, before)}
+    }
+
+    task =
+      Task.async(fn ->
+        Conversation.respond(first, Ecto.UUID.generate(), Content.new("Undo."))
+      end)
+
+    assert_receive {:pending_restore_wire, owner}, 3_000
+
+    second = %{
+      context(ctx, operation: :restore, target: :none)
+      | conversation_id: Ecto.UUID.generate()
+    }
+
+    id = Ecto.UUID.generate()
+    assert {:error, :effects_pending} = Conversation.respond(second, id, Content.new("Undo."))
+    refute Ledger.get(ctx.scope, ctx.inbox.id, second.conversation_id, id).completed
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    send(owner, :abort)
+    assert {:ok, rejected} = Task.await(task)
+    assert Content.read(rejected) =~ "could not restore"
+    assert {:ok, restored} = Conversation.respond(second, id, Content.new("Retry."))
+    assert Content.read(restored) =~ "returned 1 email"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"], {:restore, ["message-1"]}]
   end
 end
