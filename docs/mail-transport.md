@@ -96,6 +96,12 @@ JSON supplied through an arbitrary HTTP endpoint.
 SES message ID, envelope recipients and explicit verdict statuses; direct-body
 SNS/S3 ObjectCreated events are rejected. SES envelope and authentication verdicts
 are transport evidence, not proof that a particular human sent a message.
+The [SES notification contract](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-notifications-contents.html)
+describes the action's `objectKey` as `mail.messageId`. Accept that bare ID or
+the exact `incoming/<messageId>` form for prefixed actions, then construct the
+same canonical `incoming/<messageId>` reference. Neither form can select another
+object or alter the configured bucket/prefix; live receipt round trips remain
+a launch gate.
 The host must match a known connected identity, authenticate its conversation,
 reject bounces/automatic/bulk replies, and choose the trusted Scope/inbox. Where
 this requires reading MIME first, keep the queue unacknowledged until the host
@@ -126,8 +132,15 @@ row exists, so a host crash before its cap response can recover that decision.
 Deduplicate that response independently by the stable receipt ID.
 
 Every accepted receipt expires one hour after SES received it; failure/retries
-never extend the deadline. Run `Spool.sweep/2` at least minutely to purge expired
-rows including failed authentication/parsing. Run `Spool.sweep_orphans/2` globally
+never extend the deadline. Run `Spool.sweep(scope, config, marker \\ nil)` at least
+minutely to purge expired rows including failed authentication/parsing. It
+processes at most 100 rows per page in stable ID order, returning `{:ok, marker}`
+or `{:error, :spool_cleanup_failed, marker}`. Continue each non-nil marker even
+after failures so a failed early page cannot starve later objects. Start the
+next complete pass with nil to retry failed objects.
+`{:error, :outer_transaction}` and `{:error, :invalid_spool_marker}` are terminal
+caller errors without a continuation; fix the caller before starting another pass.
+Run `Spool.sweep_orphans/2` globally
 for each spool bucket at least minutely, following each returned marker until nil.
 On a per-object failure it returns `{:error, :spool_cleanup_failed, next_marker}`;
 continue that marker too so a bad early object cannot block later pages, and

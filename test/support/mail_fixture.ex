@@ -65,7 +65,7 @@ defmodule EmailJanitor.MailFixture do
           "type" => "S3",
           "topicArn" => config.topic_arn,
           "bucketName" => config.bucket,
-          "objectKey" => "incoming/" <> id
+          "objectKey" => id
         }
       }
     }

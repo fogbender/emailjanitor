@@ -200,7 +200,7 @@ defmodule EmailJanitor.MailStoreTest do
       prefix: ctx.scope.prefix
     )
 
-    assert :ok = Spool.sweep(ctx.scope, config)
+    assert {:ok, nil} = Spool.sweep(ctx.scope, config)
     assert_received {:method, "DELETE"}
     refute_received {:method, "GET"}
     saved = TestRepo.get!(Incoming, row.id, prefix: ctx.scope.prefix)
@@ -234,6 +234,37 @@ defmodule EmailJanitor.MailStoreTest do
     assert_received {"GET", "/janitor-spool/"}
     assert_received {"DELETE", "/janitor-spool/incoming/unroutable"}
     refute_received {"GET", _}
+  end
+
+  test "bounded cleanup continues past failed early pages and retries them on the next pass",
+       ctx do
+    config =
+      F.config(fn conn ->
+        id = Path.basename(conn.request_path)
+        status = if id <= "bulk-0100", do: 503, else: 200
+        Plug.Conn.send_resp(conn, status, "")
+      end)
+
+    past = DateTime.add(DateTime.utc_now(), -3700)
+
+    for number <- 1..201 do
+      id = "bulk-" <> String.pad_leading(Integer.to_string(number), 4, "0")
+      {receipt, _} = F.receipt(config, id, past)
+      assert {:ok, _} = Spool.accept(ctx.scope, ctx.inbox.id, receipt)
+    end
+
+    assert {:error, :spool_cleanup_failed, "bulk-0100"} = Spool.sweep(ctx.scope, config)
+    assert {:ok, "bulk-0200"} = Spool.sweep(ctx.scope, config, "bulk-0100")
+    assert {:ok, nil} = Spool.sweep(ctx.scope, config, "bulk-0200")
+    assert Spool.get(ctx.scope, "bulk-0001").state == :purge
+    assert Spool.get(ctx.scope, "bulk-0201").state == :deleted
+
+    deleted = from(i in Incoming, where: i.state == :deleted)
+    assert TestRepo.aggregate(deleted, :count, prefix: ctx.scope.prefix) == 101
+    working = F.config(fn conn -> Plug.Conn.send_resp(conn, 200, "") end)
+    assert {:ok, nil} = Spool.sweep(ctx.scope, working)
+    assert TestRepo.aggregate(deleted, :count, prefix: ctx.scope.prefix) == 201
+    assert {:error, :invalid_spool_marker} = Spool.sweep(ctx.scope, working, "../other")
   end
 
   test "outer transactions cannot dispatch or accept uncommitted references", ctx do
@@ -405,7 +436,7 @@ defmodule EmailJanitor.MailStoreTest do
     )
 
     working = F.config(fn conn -> Plug.Conn.send_resp(conn, 204, "") end)
-    assert :ok = Spool.sweep(ctx.scope, working)
+    assert {:ok, nil} = Spool.sweep(ctx.scope, working)
     saved = Spool.get(ctx.scope, row.id)
     assert saved.state == :deleted
     assert saved.outcome == :processed
@@ -417,7 +448,7 @@ defmodule EmailJanitor.MailStoreTest do
       prefix: ctx.scope.prefix
     )
 
-    assert :ok = Spool.sweep(ctx.scope, working)
+    assert {:ok, nil} = Spool.sweep(ctx.scope, working)
     assert Spool.get(ctx.scope, row.id) == nil
   end
 
@@ -606,7 +637,7 @@ defmodule EmailJanitor.MailStoreTest do
       prefix: ctx.scope.prefix
     )
 
-    assert :ok = Spool.sweep(ctx.scope, config)
+    assert {:ok, nil} = Spool.sweep(ctx.scope, config)
     assert %{state: :deleted, outcome: :expired} = Spool.get(ctx.scope, row.id)
     send(owner, :finish)
     assert :ok = Task.await(task, 5000)
@@ -658,7 +689,7 @@ defmodule EmailJanitor.MailStoreTest do
       prefix: ctx.scope.prefix
     )
 
-    assert :ok = Spool.sweep(ctx.scope, config)
+    assert {:ok, nil} = Spool.sweep(ctx.scope, config)
     assert %{state: :deleted, outcome: :expired} = Spool.get(ctx.scope, row.id)
     send(owner, :finish)
     assert {:error, :mail_too_large} = Task.await(task, 5000)

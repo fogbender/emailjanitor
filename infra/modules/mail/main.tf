@@ -40,6 +40,7 @@ locals {
   ruleset    = "${var.name}-mail"
   rule       = "receive"
   rule_arn   = "arn:${local.partition}:ses:${local.region}:${local.account_id}:receipt-rule-set/${local.ruleset}:receipt-rule/${local.rule}"
+  topic_arn  = "arn:${local.partition}:sns:${local.region}:${local.account_id}:${var.name}-receipts"
   sender     = "janitor@${var.mail_domain}"
 }
 
@@ -88,6 +89,24 @@ resource "aws_kms_key" "spool" {
   description             = "Email Janitor temporary incoming mail"
   enable_key_rotation     = true
   deletion_window_in_days = 7
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EnableAccountIAM", Effect = "Allow"
+      Principal = { AWS = "arn:${local.partition}:iam::${local.account_id}:root" }
+      Action    = "kms:*", Resource = "*"
+      }, {
+      Sid       = "ReceiptTopicEncryption", Effect = "Allow"
+      Principal = { Service = "sns.amazonaws.com" }
+      Action    = ["kms:GenerateDataKey", "kms:Decrypt"], Resource = "*"
+      Condition = {
+        ArnEquals = { "aws:SourceArn" = local.topic_arn }
+        StringEquals = {
+          "kms:EncryptionContext:aws:sns:topicArn" = local.topic_arn
+        }
+      }
+    }]
+  })
 }
 
 resource "aws_s3_bucket" "spool" {
