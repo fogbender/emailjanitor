@@ -51,7 +51,12 @@ defmodule EmailJanitor.ConversationFixtureBlockedPolicy do
 end
 
 defmodule EmailJanitor.ConversationFixtureRestore do
-  def apply(_, _, effect_id, _, _, _, opts), do: opts[:fixture_restore].(effect_id)
+  def apply(_, _, effect_id, _, _, _, opts) do
+    Process.put({__MODULE__, :outcome}, Keyword.get(opts, :fixture_outcome, fn _ -> :none end))
+    opts[:fixture_restore].(effect_id)
+  end
+
+  def outcome(_, _, effect_id), do: Process.get({__MODULE__, :outcome}).(effect_id)
 end
 
 defmodule EmailJanitor.ConversationFixtureCancelledRestore do
@@ -1325,5 +1330,95 @@ defmodule EmailJanitor.ConversationTest do
     assert {:ok, reply} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Undo."))
     assert Content.read(reply) =~ "could not restore"
     refute Content.read(reply) =~ "try again"
+  end
+
+  test "an unfinished plain question does not swallow the next read-only answer", t do
+    ctx = t.ctx
+
+    assert {:ok, _} =
+             EmailJanitor.Owner.workflow(fn ->
+               Ledger.reserve(
+                 ctx.scope,
+                 ctx.inbox.id,
+                 ctx.conversation_id,
+                 Ecto.UUID.generate(),
+                 %Plan{
+                   operation: :answer,
+                   references: [],
+                   preference_target: :none,
+                   search_complete: true
+                 },
+                 [],
+                 ctx.guard
+               )
+             end)
+
+    script = fn _, _, _ ->
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new("The requested explanation."),
+         search_complete: true
+       }}
+    end
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               %{ctx | model: [script: script]},
+               Ecto.UUID.generate(),
+               Content.new("Another question.")
+             )
+
+    assert Content.read(reply) == "The requested explanation."
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "metadata-only restore outcomes distinguish no admission from positive and ambiguous effects",
+       t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    ctx = context(ctx, operation: :restore, target: :none)
+
+    for state <- [:none, :prepared, :done, :unresolved, :wrong_id] do
+      outcome = fn effect ->
+        case state do
+          :none -> :none
+          :wrong_id -> {:done, Ecto.UUID.generate()}
+          state -> {state, effect}
+        end
+      end
+
+      current = %{
+        ctx
+        | execution_options: [
+            restore_adapter: EmailJanitor.ConversationFixtureRestore,
+            fixture_restore: fn _ -> {:error, :restore_unavailable} end,
+            fixture_outcome: outcome
+          ]
+      }
+
+      id = Ecto.UUID.generate()
+      result = Conversation.respond(current, id, Content.new("Undo."))
+
+      case state do
+        state when state in [:none, :prepared, :wrong_id] ->
+          assert {:error, :effects_pending} = result
+          refute Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+
+        state ->
+          assert {:ok, reply} = result
+
+          assert Content.read(reply) =~
+                   if(state == :done, do: "returned 1 email", else: "uncertain")
+
+          assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+      end
+    end
+
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 end

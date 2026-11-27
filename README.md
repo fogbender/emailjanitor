@@ -101,7 +101,8 @@ version, then bump affected inbox versions atomically. UUID effect receipts
 deduplicate retries for seven days without retaining conversation text or text
 hashes. Reusing a request UUID returns its original effect, even after a later
 correction; callers compare that receipt's revision with current state before
-describing what is active. Clearing a scope removes its older receipts. Writes
+describing what is active. Clearing a scope removes its instruction text while
+keeping recovery metadata for the same seven-day retry window. Writes
 prune expired receipts; hosts also call `Preferences.purge_receipts/2` during
 maintenance. The [migration registry](docs/migrations.md) reserves optional module
 versions alongside the core sequence. Registration serializes

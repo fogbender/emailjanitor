@@ -335,7 +335,8 @@ defmodule EmailJanitor.Conversation do
   # report only durable facts; the user can ask their next question separately.
   defp read_only_reply(%{prior_receipt: %Receipt{} = prior}, proposal, snapshot) do
     uncertain =
-      not prior.completed or prior.preference_status in [:pending, :failed] or
+      (not prior.completed and prior.operation != :answer) or
+        prior.preference_status in [:pending, :failed] or
         Enum.any?(prior.results, &(&1["status"] in ["unresolved", "unavailable"]))
 
     if uncertain, do: Outcome.render(prior, snapshot), else: proposal.reply
