@@ -356,7 +356,10 @@ defmodule EmailJanitor.ConversationTest do
     }
 
     request_id = Ecto.UUID.generate()
-    assert {:error, _} = Conversation.respond(ctx, request_id, Content.new("Mark it Done."))
+
+    assert {:error, :conversation_unavailable} =
+             Conversation.respond(ctx, request_id, Content.new("Mark it Done."))
+
     assert_receive {:isolated_owner, owner}
     refute owner == caller
     refute Process.alive?(owner)
@@ -402,5 +405,119 @@ defmodule EmailJanitor.ConversationTest do
     assert Agent.get(t.state, & &1.calls) == []
     assert TestRepo.aggregate(Action, :count, :id, prefix: ctx.scope.prefix) == 0
     Agent.stop(connected)
+  end
+
+  test "resume reports a confirmed nested action even when its workflow died before the receipt result",
+       t do
+    {:ok, control} = Agent.start_link(fn -> %{} end)
+    ctx = context(t.ctx, target: :none)
+    {gmail, opts} = ctx.gmail
+
+    ctx = %{
+      ctx
+      | execution_options: [
+          on_plan_admitted: fn _, _, _ ->
+            owner = self()
+            Agent.update(control, &Map.put(&1, :owner, owner))
+            :ok
+          end
+        ],
+        gmail:
+          {gmail,
+           Keyword.put(opts, :before, fn ->
+             Process.exit(Agent.get(control, & &1.owner), :kill)
+           end)}
+    }
+
+    request_id = Ecto.UUID.generate()
+
+    assert {:error, :conversation_unavailable} =
+             Conversation.respond(ctx, request_id, Content.new("Mark it Done."))
+
+    assert_confirmed_action(ctx, 200)
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+
+    ctx = %{
+      ctx
+      | execution_options: [],
+        gmail: {gmail, opts},
+        model: [script: fn _, _, _ -> raise "must resume without a model" end]
+    }
+
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "marked 1 email Done"
+    refute Content.read(reply) =~ "needed no inbox change"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    Agent.stop(control)
+  end
+
+  test "completed references need not be loaded again to resume the remaining effects", t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    [action] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+
+    {:ok, first} =
+      EmailJanitor.Conversation.Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+
+    {:ok, second} =
+      EmailJanitor.Conversation.Reference.new(ctx.inbox.id, "message-2", "thread-1", "", "")
+
+    request_id = Ecto.UUID.generate()
+
+    task =
+      Task.async(fn ->
+        plan = %Plan{
+          operation: :done,
+          references: [first.token, second.token],
+          preference_target: :none,
+          instruction: Content.new(""),
+          reply: Content.new(""),
+          query: Content.new(""),
+          search_complete: true
+        }
+
+        assert {:ok, _} =
+                 Ledger.reserve(
+                   ctx.scope,
+                   ctx.inbox.id,
+                   ctx.conversation_id,
+                   request_id,
+                   plan,
+                   [first, second],
+                   fn -> :ok end
+                 )
+
+        assert {:ok, _} =
+                 Ledger.record_result(
+                   ctx.scope,
+                   ctx.inbox.id,
+                   ctx.conversation_id,
+                   request_id,
+                   first.token,
+                   "done",
+                   action.id
+                 )
+      end)
+
+    Task.await(task)
+    # The finalized reference has disappeared; only the new message is readable.
+    Agent.update(t.state, &%{&1 | messages: [message(id: "message-2")]})
+    ctx = %{ctx | model: [script: fn _, _, _ -> raise "must resume without a model" end]}
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "marked 2 emails Done"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"], ["message-2"]]
+  end
+
+  defp assert_confirmed_action(_ctx, 0), do: flunk("nested action did not finish")
+
+  defp assert_confirmed_action(ctx, attempts) do
+    case TestRepo.all(Action, prefix: ctx.scope.prefix) do
+      [%{state: :done}] ->
+        :ok
+
+      _ ->
+        Process.sleep(5)
+        assert_confirmed_action(ctx, attempts - 1)
+    end
   end
 end

@@ -86,6 +86,23 @@ defmodule EmailJanitor.Conversation.Lookup do
     end
   end
 
+  @doc false
+  def confirmed_since(ctx, message_id, since) do
+    ctx.scope.repo.one(
+      from(a in Action,
+        where:
+          a.inbox_id == ^ctx.inbox.id and a.state in [:done, :restored] and
+            ^message_id in a.applied_message_ids and a.dispatch_started_at >= ^since,
+        order_by: [desc: a.inserted_at],
+        limit: 1,
+        select: a.id
+      ),
+      prefix: ctx.scope.prefix,
+      log: false,
+      telemetry_event: nil
+    )
+  end
+
   defp action(ctx, message_id) do
     ctx.scope.repo.one(
       from(a in Action,

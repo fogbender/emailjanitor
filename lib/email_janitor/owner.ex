@@ -10,8 +10,21 @@ defmodule EmailJanitor.Owner do
   @deadline_key {__MODULE__, :execution_deadline}
 
   @doc "Run one execution in an isolated owner, never the caller's reusable process."
-  def run(fun, timeout_ms \\ 60_000) when timeout_ms in 1..60_000 do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
+  def run(fun, timeout_ms \\ 60_000) when timeout_ms in 1..60_000,
+    do: run_with_budget(fun, timeout_ms)
+
+  @doc "An isolated workflow owner covering bounded planning and several independent executions."
+  def workflow(fun, timeout_ms \\ 900_000) when timeout_ms in 1..900_000,
+    do: run_with_budget(fun, timeout_ms)
+
+  defp run_with_budget(fun, timeout_ms) do
+    own_deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    deadline =
+      case Process.get(@deadline_key) do
+        inherited when is_integer(inherited) -> min(inherited, own_deadline)
+        _ -> own_deadline
+      end
 
     task =
       Task.Supervisor.async_nolink(EmailJanitor.ExecutorSupervisor, fn ->
