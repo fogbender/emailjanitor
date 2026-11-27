@@ -23,7 +23,8 @@ variable "bedrock_model_id" {
   default     = "amazon.nova-micro-v1:0"
   description = "One regional Bedrock foundation model, not an inference profile or wildcard."
   validation {
-    condition     = can(regex("^[a-z0-9-]+\\.[a-zA-Z0-9.:-]+$", var.bedrock_model_id))
+    condition = (can(regex("^[a-z0-9-]+\\.[a-zA-Z0-9.:-]+$", var.bedrock_model_id)) &&
+    !can(regex("^(us|eu|apac|global|jp|au|ca|us-gov)\\.", var.bedrock_model_id)))
     error_message = "Provide a regional foundation-model ID without slashes, ARN prefixes or wildcards."
   }
 }

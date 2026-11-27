@@ -84,6 +84,18 @@ run "reject_wildcard_model" {
   expect_failures = [var.bedrock_model_id]
 }
 
+run "reject_cross_region_inference_profile" {
+  command = plan
+  variables { bedrock_model_id = "us.amazon.nova-micro-v1:0" }
+  expect_failures = [var.bedrock_model_id]
+}
+
+run "reject_global_inference_profile" {
+  command = plan
+  variables { bedrock_model_id = "global.anthropic.claude-x" }
+  expect_failures = [var.bedrock_model_id]
+}
+
 run "receiving_requires_explicit_opt_in" {
   command = plan
   variables { activate_receiving = true }
