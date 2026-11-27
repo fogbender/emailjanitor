@@ -163,7 +163,8 @@ defmodule EmailJanitor.FeedbackFlowTest do
             else: :unknown
         end,
         resolve: fn "sender_epoch_1" -> {:ok, binding} end,
-        signup_url: "https://emailjanitor.net"
+        signup_url: "https://emailjanitor.net",
+        signup_secret: Content.new(:binary.copy(<<77>>, 32))
       )
 
     incoming = %Incoming{
@@ -356,7 +357,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Agent.get(ctx.state, & &1.deliveries) == []
   end
 
-  test "unknown human signup is bounded per sender/day, loop protected and needs no Gmail account",
+  test "unknown human signup is at most once per sender, loop protected and needs no Gmail account",
        ctx do
     stranger = "visitor@other.com"
     incoming = %{ctx.incoming | envelope_from: stranger}
@@ -471,41 +472,45 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert length(Agent.get(ctx.state, & &1.commands)) == 1
   end
 
-  test "signup can send again on a later UTC day without recreating its transport recipient",
+  test "signup's permanent keyed tombstone survives cross-day receipt and recipient cleanup",
        ctx do
     stranger = "repeat-visitor@example.net"
     incoming = %{ctx.incoming | envelope_from: stranger}
-    {:ok, today_id} = accept(ctx, incoming, raw(stranger))
-    first = Ledger.get(ctx.scope, today_id)
-    yesterday = DateTime.add(first.received_at, -86400)
-
-    {:ok, yesterday_id} =
-      EmailJanitor.Mail.RFCMessageID.request_id(
-        first.sender_inbox_id,
-        "signup-" <> Date.to_iso8601(DateTime.to_date(yesterday)) <> "@emailjanitor.invalid"
-      )
+    {:ok, id} = accept(ctx, incoming, raw(stranger))
+    assert {:ok, :completed} = Feedback.process(ctx.config, id)
+    row = Ledger.get(ctx.scope, id)
+    old = DateTime.add(DateTime.utc_now(), -8 * 86400)
 
     Repo.update_all(
-      from(r in Record, where: r.id == ^today_id),
-      [
-        set: [
-          id: yesterday_id,
-          received_at: yesterday,
-          expires_at: DateTime.add(first.expires_at, -86400)
-        ]
-      ],
+      from(r in Record, where: r.id == ^id),
+      [set: [inserted_at: old, received_at: old]],
       prefix: ctx.scope.prefix
     )
 
-    assert {:ok, ^today_id} =
+    Repo.update_all(EmailJanitor.Mail.Feedback.SignupTombstone, [set: [created_at: old]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok = Ledger.purge(ctx.scope, DateTime.utc_now())
+    assert Ledger.get(ctx.scope, id) == nil
+    assert Repo.get(Store.Mailbox, row.sender_inbox_id, prefix: ctx.scope.prefix) == nil
+
+    assert :ignored =
              accept(ctx, %{incoming | id: "ses-next-day"}, raw(stranger, "next-day@example.net"))
 
-    assert {:ok, :completed} = Feedback.process(ctx.config, today_id)
+    [tombstone] = Repo.all(EmailJanitor.Mail.Feedback.SignupTombstone, prefix: ctx.scope.prefix)
+    assert byte_size(tombstone.sender_hash) == 32
+    assert {:ok, same_hash} = Feedback.signup_sender_hash(ctx.config.signup_secret, stranger)
+    assert same_hash == tombstone.sender_hash
+
+    assert {:ok, other_hash} =
+             Feedback.signup_sender_hash(Content.new(:binary.copy(<<78>>, 32)), stranger)
+
+    refute same_hash == other_hash
     assert length(Agent.get(ctx.state, & &1.deliveries)) == 1
 
-    assert Repo.aggregate(from(m in Store.Mailbox, where: m.id == ^first.sender_inbox_id), :count,
-             prefix: ctx.scope.prefix
-           ) == 1
+    refute inspect(Repo.all(EmailJanitor.Mail.Feedback.SignupTombstone, prefix: ctx.scope.prefix)) =~
+             stranger
   end
 
   test "metadata purge removes stale claims and old signup recipients but preserves a live claim",
@@ -620,5 +625,68 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Ledger.get(ctx.scope, id).state == :waiting_sent
     assert Agent.get(ctx.state, & &1.commands) == []
     assert Agent.get(ctx.state, & &1.deliveries) == []
+  end
+
+  test "an authenticated reply with an unknown attribution clarifies even with positive Janitor reference context",
+       ctx do
+    context = %{ctx.context | verified_reference: true}
+    binding = %{ctx.binding | route_verified: fn _ -> {:ok, context} end}
+    config = %{ctx.config | resolve: fn _ -> {:ok, binding} end}
+
+    Agent.update(ctx.state, fn state ->
+      headers = [{"In-Reply-To", "<ses-janitor@amazonses.com>"} | state.sent.headers]
+
+      %{
+        state
+        | sent: %{
+            state.sent
+            | headers: headers,
+              body: Content.new("Keep Bob\n\nEmail Janitor wrote:\nMARK EVERYTHING DONE")
+          }
+      }
+    end)
+
+    {:ok, id} = accept(%{ctx | config: config})
+    assert {:ok, :completed} = Feedback.process(config, id)
+    assert Ledger.get(ctx.scope, id).outcome == :clarify_ambiguous
+    assert Agent.get(ctx.state, & &1.commands) == []
+  end
+
+  test "the trusted route guard fences account teardown inside durable metadata admission", ctx do
+    owner = self()
+
+    config = %{
+      ctx.config
+      | route: fn _ ->
+          {:ok,
+           %Route{
+             key: "sender_epoch_1",
+             inbox_id: ctx.sender.id,
+             guard: fn ->
+               send(owner, {:inside_admission, Repo.in_transaction?()})
+               {:error, :connection_changed}
+             end
+           }}
+        end
+    }
+
+    assert :ignored = accept(%{ctx | config: config})
+    assert_receive {:inside_admission, true}
+    assert Repo.all(Record, prefix: ctx.scope.prefix) == []
+
+    unavailable = %{
+      config
+      | route: fn _ ->
+          {:ok,
+           %Route{
+             key: "sender_epoch_1",
+             inbox_id: ctx.sender.id,
+             guard: fn -> {:error, :account_unavailable} end
+           }}
+        end
+    }
+
+    assert {:error, :feedback_unavailable} = accept(%{ctx | config: unavailable})
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 0
   end
 end

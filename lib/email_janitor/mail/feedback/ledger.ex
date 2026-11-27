@@ -22,7 +22,7 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
 
   # These are abuse/resource ceilings for unverified SMTP hints, not product
   # suppression allowances. A failed DMARC verdict is rejected even earlier.
-  def admit(scope, %Record{kind: :feedback} = row) do
+  def admit(scope, %Record{kind: :feedback} = row, guard \\ nil) do
     case scope.repo.transaction(fn ->
            Ecto.Adapters.SQL.query!(
              scope.repo,
@@ -30,6 +30,12 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
              ["feedback-admission:" <> scope.prefix],
              log: false
            )
+
+           case admission_guard(guard) do
+             :ok -> :ok
+             {:error, :connection_changed} -> scope.repo.rollback(:feedback_connection_changed)
+             _ -> scope.repo.rollback(:feedback_unavailable)
+           end
 
            if get(scope, row.id) do
              insert(scope, row)
@@ -65,6 +71,10 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp admission_guard(nil), do: :ok
+  defp admission_guard(guard) when is_function(guard, 0), do: guard.()
+  defp admission_guard(_), do: {:error, :feedback_unavailable}
 
   def due(scope, now) do
     scope.repo.one(

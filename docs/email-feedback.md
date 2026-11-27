@@ -33,8 +33,8 @@ honestly explains that an answer is unavailable. Outbox controls delivery and
 never automatically resends ambiguous SES acceptance.
 
 Unknown human senders can receive a fixed signup link only with passing transport
-checks, aligned envelope sender, loop guards, one response per sender/UTC day and
-an atomic global100/day backstop. Their transport-only recipient record is not a
+checks, aligned envelope sender, loop guards, at most one response per sender and
+an atomic global100-new-senders/day backstop. Their transport-only recipient record is not a
 Google account, identity or cleanup binding.
 
 Native Elixir0.1.2 was evaluated (last Hex release2017). Maintained no-runtime-deps
@@ -61,3 +61,22 @@ hours after original receipt); expiration preserves the actual processed outcome
 Stale processing claims, old signup Outgoing rows and unused synthetic recipient
 mailboxes are removed by the seven-day bounded metadata purge. The original SES
 time and spool expiry derive from the same shared Spool processing duration.
+
+Unknown-sender signup attempts reserve a permanent HMAC sender tombstone, which
+contains no address or body and is not removed by seven-day receipt/outgoing/
+synthetic-recipient cleanup. The same original bounded delivery can finish after
+a retry, but future messages across days never create another signup response.
+Hosts enabling signup_url must supply a stable redacted signup_secret (32–128
+bytes); it should be derived from a long-lived host secret and preserved across
+restarts and ordinary session-key rotations.
+
+A host may provide Route.guard/0 to serialize final known-account receipt
+admission with teardown. It runs inside the short Ledger admission transaction;
+:connection_changed rejects/purges that input, while temporary account failures
+retry. The SaaS host uses its lifecycle Group lock so a stale initial route cannot
+insert transport metadata after deletion has durably blocked the account.
+
+Unsupported reply-shaped colon blocks with no recognized quote boundary clarify
+before any model call. This is a generic format ambiguity guard, with no sender
+names or spam heuristics. Known quote boundaries still permit normal authored
+lists, and plain quote-free replies remain accepted.

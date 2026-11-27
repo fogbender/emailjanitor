@@ -27,11 +27,21 @@ export function parse(input) {
       evidence:{sender,subject,body:original.body},evidence_omitted:false};
   }
   const author = leadingReply(input.body);
-  if (!author || !author.text) return clarify('reply_ambiguous');
+  if (!author || !author.text || unresolvedReplyBlock(input, author)) return clarify('reply_ambiguous');
   const evidence = author.quote && bounded(author.quote, 8000)
     ? {sender:'',subject:input.subject,body:author.quote} : null;
   return {status:'parsed',kind:author.quoted || input.reply_expected?'reply':'direct',authored:author.text,
     evidence,evidence_omitted:!!author.quote && !evidence};
+}
+
+// If a reply has an unrecognized block heading, the maintained parser has not
+// established which side of that boundary the following text belongs to. Do not
+// invent sender/locale-specific attribution rules or promote it into a command.
+function unresolvedReplyBlock(input, author) {
+  if (!input.reply_expected || author.quoted) return false;
+  const lines = author.text.split('\n');
+  const heading = lines.findIndex(line => line.trimEnd().endsWith(':'));
+  return heading >= 0 && lines.slice(heading + 1).some(line => line.trim());
 }
 
 function leadingReply(body) {
