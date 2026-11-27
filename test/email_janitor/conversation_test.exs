@@ -284,4 +284,23 @@ defmodule EmailJanitor.ConversationTest do
     assert Content.read(reply) == "The earlier action was confirmed."
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
+
+  test "a missing restore adapter reports unavailable without claiming an uncertain Gmail attempt",
+       t do
+    ctx = context(t.ctx, target: :none)
+
+    assert {:ok, _} =
+             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Mark it Done."))
+
+    ctx = context(ctx, operation: :restore, target: :none)
+    ctx = %{ctx | execution_options: [restore_adapter: EmailJanitor.MissingRestoreAdapter]}
+
+    assert {:ok, reply} =
+             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Undo that."))
+
+    assert Content.read(reply) =~ "could not finish processing"
+    refute Content.read(reply) =~ "uncertain"
+    refute Content.read(reply) =~ "returned"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
 end

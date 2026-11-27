@@ -216,7 +216,9 @@ defmodule EmailJanitor.Conversation do
 
             result =
               try do
-                with :ok <- ctx.guard.() do
+                with true <-
+                       Code.ensure_loaded?(restore) and function_exported?(restore, :apply, 7),
+                     :ok <- ctx.guard.() do
                   apply(restore, :apply, [
                     ctx.scope,
                     ctx.inbox,
@@ -226,6 +228,8 @@ defmodule EmailJanitor.Conversation do
                     ctx.gmail,
                     opts
                   ])
+                else
+                  _ -> {:error, :restore_unavailable}
                 end
               rescue
                 _ -> {:unresolved, effect_id}
