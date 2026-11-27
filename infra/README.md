@@ -134,6 +134,12 @@ model classification; SES verified identity/DKIM and permitted recipient sending
 one received feedback message through SES→S3→SQS; immediate spool deletion after
 success and bounded deletion after failure; a response delivered back to the test
 inbox. Infrastructure output `ready_for_processing` deliberately remains false.
+Also inspect Bedrock's account/region invocation-logging configuration before
+processing real inboxes: text invocation logging records full model input/output
+in S3 or CloudWatch. It is disabled by default; a preexisting shared-account
+setting must not be silently changed by this deployment. Use an account/region
+without text invocation logging for this service. See the
+[AWS logging documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html).
 The receiving worker must ignore/delete S3's `s3:TestEvent` notifications and SES's
 `AMAZON_SES_SETUP_NOTIFICATION` objects instead of treating setup probes as human
 feedback. Test those cases before declaring the transport ready.
