@@ -34,7 +34,10 @@ The host owns the UUID's metadata meaning and supplies a stable dedupe UUID per
 logical digest/response. `Outbox.deliver(scope, id, config, authorize, render)`
 requires an authorizer returning the currently connected `Inbox`. Its address
 must match the durable inbox row; no recipient from a model or renderer is used.
-Authorization is checked again after rendering/credential preparation.
+Authorization is checked again after rendering/credential preparation, under
+the scoped mailbox lock in the same transaction as the send fence. Authorizers
+must be DB-only: settlement/disconnect and dispatch use mailbox → public host
+group/inbox → outgoing state order. Providers and rendering stay outside SQL.
 
 The renderer receives the durable metadata row and returns `{:ok, Message}`.
 It regenerates digest sender/subject lines or assistant text in memory, never
@@ -43,8 +46,27 @@ The outbox commits `dispatching` before its single SES attempt. Success stores
 `sent` and the SES message ID. Timeout, failure or crash after dispatch remains
 `unresolved` or `dispatching`; those states are never resent automatically. A
 pre-dispatch rendering/credential failure leaves `pending` and can be retried.
+A proven deadline exhaustion before the SES closure runs also restores `pending`;
+it is distinct from ambiguous acceptance after a request may have started.
 This intentionally favors a missing email over a duplicate after ambiguous SES
 acceptance. Calling from an outer database transaction is rejected.
+
+Confirmed sends also record the actual sender and connected recipient alongside
+the returned bare SES MessageId. `Outbox.self_delivery?(scope, inbox_id, sender,
+headers)` accepts the shared list of `{name, value}` headers and returns
+`{:ok, boolean}` or `{:error, :self_mail_unavailable}` on storage failure. It
+requires exactly one current From and Message-ID, the exact configured sender,
+and same scoped inbox/sender/recipient `:sent` evidence. It never searches
+References/In-Reply-To or treats the Janitor domain as a trusted relay.
+`Mail.MessageID.provider_id/1` projects a strict single RFC822 ID under
+`amazonses.com` to its exact, case-sensitive provider local part; malformed,
+duplicate, unknown or unsupported IDs receive no exemption. SES replaces the
+[Message-ID header](https://docs.aws.amazon.com/ses/latest/dg/header-fields.html);
+AWS's [header example](https://repost.aws/knowledge-center/ses-email-headers)
+shows the returned provider ID as its local part. This is a conservative
+non-destructive Keep exemption, not authentication for conversational feedback.
+An unconfirmed/ambiguous send has no successful evidence and is never assumed
+to be self-mail merely from its From address.
 
 Remaining host integration: select the day's activity once, reserve its listing
 and outbox intent atomically in a host-owned workflow, schedule 21:00 in the
@@ -119,6 +141,9 @@ backup policies must exclude its temporary-spool tag. Completed receipt rows
 processing deadline. Durable workflow/effect deduplication belongs to the host's
 metadata ledger; it must not depend on keeping spool rows forever. Partial
 indexes keep the active cleanup scan independent of completed receipt history.
+A deadline sweep deletes the object even while a bounded handler finishes. Its
+same claim can still record the final outcome/workflow on the expired/deleted
+metadata row without reviving the object or extending the deadline.
 
 Feedback/prompt distillation remains a host integration: transient authenticated
 reply → stable workflow UUID → immediate guarded action + persisted instruction

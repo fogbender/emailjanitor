@@ -23,6 +23,8 @@ defmodule EmailJanitor.Mail.Outgoing do
     )
 
     field(:provider_id, :string)
+    field(:sender, :string)
+    field(:recipient, :string)
     timestamps(type: :utc_datetime_usec)
   end
 end

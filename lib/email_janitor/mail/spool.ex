@@ -78,35 +78,15 @@ defmodule EmailJanitor.Mail.Spool do
         row = scope.repo.get!(Incoming, id, prefix: scope.prefix)
 
         with {:ok, content} <- SDK.fetch(config, row.object_key),
-             {:ok, outcome, workflow} <- outcome(handler.(row, content)) do
-          scope.repo.update_all(
-            from(i in Incoming,
-              where: i.id == ^id and i.claim_id == ^token and i.state == :processing
-            ),
-            [
-              set: [
-                state: :purge,
-                outcome: outcome,
-                workflow_id: workflow,
-                updated_at: DateTime.utc_now()
-              ]
-            ],
-            prefix: scope.prefix
-          )
-
+             {:ok, outcome, workflow} <- outcome(handler.(row, content)),
+             :ok <- finish(scope, id, token, outcome, workflow) do
           purge(scope, row.id, config)
         else
           {:error, :mail_too_large} ->
-            scope.repo.update_all(
-              from(i in Incoming,
-                where: i.id == ^id and i.claim_id == ^token and i.state == :processing
-              ),
-              [set: [state: :purge, outcome: :too_large, updated_at: DateTime.utc_now()]],
-              prefix: scope.prefix
-            )
-
-            purge(scope, row.id, config)
-            {:error, :mail_too_large}
+            with :ok <- finish(scope, id, token, :too_large, nil) do
+              purge(scope, row.id, config)
+              {:error, :mail_too_large}
+            end
 
           _ ->
             {:error, :mail_processing_failed}
@@ -119,6 +99,35 @@ defmodule EmailJanitor.Mail.Spool do
           %Incoming{outcome: :too_large} -> {:error, :mail_too_large}
           _ -> result
         end
+    end
+  end
+
+  defp finish(scope, id, token, outcome, workflow) do
+    case scope.repo.transaction(fn ->
+           row =
+             scope.repo.one(
+               from(i in Incoming,
+                 where: i.id == ^id and i.claim_id == ^token,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix
+             )
+
+           if is_nil(row) or
+                not (row.state == :processing or
+                       (row.state in [:purge, :deleted] and row.outcome == :expired)),
+              do: scope.repo.rollback(:stale_spool_claim)
+
+           changes = %{outcome: outcome, workflow_id: workflow}
+
+           changes =
+             if row.state == :processing, do: Map.put(changes, :state, :purge), else: changes
+
+           scope.repo.update!(Ecto.Changeset.change(row, changes), prefix: scope.prefix)
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      _ -> {:error, :mail_processing_failed}
     end
   end
 
