@@ -189,3 +189,6 @@ Tests use synthetic maintained-SDK HTTP responses and a fresh local PostgreSQL.
 The live readiness gate remains consent/profile/refresh, new Gmail event, model
 privacy/classification evaluation, SES sandbox/identity/DKIM, verified recipient,
 actual inbound feedback round trip and immediate/failed-spool deletion.
+
+Reply messages can carry bounded canonical parent references through the
+maintained MIME and SES SDKs; see [email reply metadata](mail-threading.md).

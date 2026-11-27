@@ -1,6 +1,6 @@
 defmodule EmailJanitor.Mail.SDK do
   @moduledoc "Maintained SES/S3/SQS operations with explicit host credentials and fixed, body-free errors."
-  alias EmailJanitor.{Content, Inbox, TransportPrivacy}
+  alias EmailJanitor.{Address, Content, Inbox, TransportPrivacy}
   alias EmailJanitor.Mail.{Config, HTTP, Message, Prepared}
   @event [:email_janitor, :private_mail_sdk]
 
@@ -44,6 +44,33 @@ defmodule EmailJanitor.Mail.SDK do
   end
 
   def send(%Config{} = config, %Prepared{} = prepared, %Inbox{} = inbox, %Message{} = message) do
+    with {:ok, message} <- Message.validate(message),
+         :ok <- outgoing_addresses(config, inbox),
+         {:ok, operation} <- outgoing_operation(config, inbox, message) do
+      case request(operation, prepared) do
+        {:ok, %{body: %{message_id: id}}} when is_binary(id) and byte_size(id) in 1..256 ->
+          if Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, id),
+            do: {:ok, id},
+            else: {:error, :unresolved_delivery}
+
+        _ ->
+          {:error, :unresolved_delivery}
+      end
+    end
+  rescue
+    _ -> {:error, :invalid_outgoing_content}
+  catch
+    _, _ -> {:error, :invalid_outgoing_content}
+  end
+
+  defp outgoing_addresses(config, inbox) do
+    if Address.normalize(config.sender) == {:ok, config.sender} and
+         Address.normalize(inbox.address) == {:ok, inbox.address},
+       do: :ok,
+       else: {:error, :invalid_outgoing_content}
+  end
+
+  defp outgoing_operation(config, inbox, %{in_reply_to: nil} = message) do
     operation =
       ExAws.SES.send_email(
         %{to: [inbox.address]},
@@ -54,15 +81,33 @@ defmodule EmailJanitor.Mail.SDK do
         config.sender
       )
 
-    case request(operation, prepared) do
-      {:ok, %{body: %{message_id: id}}} when is_binary(id) and byte_size(id) in 1..256 ->
-        if Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, id),
-          do: {:ok, id},
-          else: {:error, :unresolved_delivery}
+    {:ok, operation}
+  end
 
-      _ ->
-        {:error, :unresolved_delivery}
-    end
+  defp outgoing_operation(config, inbox, message) do
+    headers = [
+      {"From", config.sender},
+      {"To", inbox.address},
+      {"Subject", Content.read(message.subject)},
+      {"In-Reply-To", "<" <> message.in_reply_to <> ">"},
+      {"References", Enum.map_join(message.references, " ", &("<" <> &1 <> ">"))},
+      {"Auto-Submitted", "auto-replied"},
+      {"X-Auto-Response-Suppress", "All"}
+    ]
+
+    raw =
+      quietly(fn ->
+        :mimemail.encode(
+          {"text", "plain", headers,
+           %{content_type_params: [{"charset", "UTF-8"}], disposition: "inline"},
+           Content.read(message.text)}
+        )
+      end)
+
+    if byte_size(raw) <= 1_000_000 and
+         Enum.all?(String.split(raw, "\r\n"), &(byte_size(&1) <= 998)),
+       do: {:ok, ExAws.SES.send_raw_email(raw, source: config.sender)},
+       else: {:error, :invalid_outgoing_content}
   end
 
   def poll(%Config{} = config) do
