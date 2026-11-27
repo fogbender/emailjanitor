@@ -133,7 +133,7 @@ defmodule EmailJanitor.Conversation.Plan do
       cond do
         body == "" -> true
         normalized == body -> false
-        kind == :header -> not copied_header?(normalized, raw)
+        kind in [:sender, :subject] -> not copied_header?(normalized, raw, kind)
         byte_size(body) < 12 -> true
         String.contains?(normalized, body) -> false
         true -> not copied_passage?(normalized, body)
@@ -164,22 +164,30 @@ defmodule EmailJanitor.Conversation.Plan do
         _, _ -> raw
       end
 
-    [{:header, raw}, {:header, decoded}] |> Enum.uniq()
+    [{kind, raw}, {kind, decoded}] |> Enum.uniq()
   end
 
-  defp copied_header?(instruction, raw) do
-    identifier =
-      raw
-      |> String.replace(~r/[^\s<>(),:;"@]+@[a-zA-Z0-9.-]+/u, " ")
-      |> String.replace(~r/[<>(),:;"]/u, " ")
-      |> normalize()
+  defp copied_header?(instruction, raw, kind) do
+    # Sender addresses are literal identifiers, including long aliases. Subject
+    # addresses are ordinary subject text and must remain in the comparison.
+    strip_address = fn text ->
+      if kind == :sender,
+        do: String.replace(text, ~r/[^\s<>(),:;"@]+@[a-zA-Z0-9.-]+/u, " "),
+        else: text
+    end
 
-    command = instruction |> String.replace(~r/[<>(),:;"]/u, " ") |> normalize()
-    # Names and short subject identifiers may legitimately appear in a new
-    # behavioral instruction. Reject an instruction copied wholesale from header
-    # text, or a long copied passage; do not reject ordinary "Keep mail from X".
-    (byte_size(command) >= 4 and String.contains?(identifier, command)) or
-      copied_passage?(command, identifier)
+    clean = fn text ->
+      text |> strip_address.() |> String.replace(~r/[<>(),:;"]/u, " ") |> normalize()
+    end
+
+    identifier = clean.(raw)
+    command = clean.(instruction)
+
+    (identifier != "" and identifier == command) or
+      identifier
+      |> String.graphemes()
+      |> Enum.chunk_every(32, 1, :discard)
+      |> Enum.any?(fn chunk -> String.contains?(command, Enum.join(chunk)) end)
   end
 
   defp copied_passage?(instruction, body) do
