@@ -29,8 +29,8 @@ in {
     users.users.emailjanitor = { isSystemUser = true; group = "emailjanitor"; };
     services.postgresql = {
       enable = true;
-      package = lib.mkDefault pkgs.postgresql_17;
       enableTCPIP = lib.mkDefault false;
+      settings.listen_addresses = lib.mkForce "";
       ensureDatabases = [ "emailjanitor" ];
       ensureUsers = [{ name = "emailjanitor"; ensureDBOwnership = true; }];
     };

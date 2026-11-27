@@ -26,8 +26,12 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert service.environment.ERL_CRASH_DUMP == "/dev/null";
    assert service.serviceConfig.LimitCORE == 0;
    assert host.config.services.postgresql.enableTCPIP == false;
+   assert host.config.services.postgresql.settings.listen_addresses == "";
    assert builtins.elem "multi-user.target" service.wantedBy;
    assert builtins.elem "postgresql.target" service.after;
    assert builtins.elem "postgresql.target" service.requires;
    assert builtins.all (a: a.assertion) host.config.assertions;
-   { valid = true; unit = service.serviceConfig.ExecStart; }
+   builtins.deepSeq {
+     app = host.config.systemd.units."emailjanitor.service".text;
+     postgres = host.config.systemd.units."postgresql.service".text;
+   } { valid = true; unit = service.serviceConfig.ExecStart; }
