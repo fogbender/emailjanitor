@@ -332,6 +332,63 @@ defmodule EmailJanitor.GoogleOAuthTest do
     refute log =~ "SENTINEL"
   end
 
+  test "only actual code-exchange invalid_grant is a definite no-issuance rejection", context do
+    owner = self()
+
+    for {status, error, expected} <- [
+          {400, "invalid_grant", :code_exchange_rejected},
+          {400, "invalid_client", :authorization_failed},
+          {503, "invalid_grant", :authorization_failed}
+        ] do
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert conn.method == "POST" and conn.host == "oauth2.googleapis.com"
+        send(owner, :code_exchange)
+
+        conn
+        |> Plug.Conn.put_status(status)
+        |> Req.Test.json(%{
+          "error" => error,
+          "error_description" => "PRIVATE_EXCHANGE_ERROR_SENTINEL"
+        })
+      end)
+
+      session = session(context.config, :connect)
+
+      log =
+        capture_log(fn ->
+          assert {:error, ^expected} =
+                   OAuth.callback(context.config, session, callback_params(session))
+        end)
+
+      assert_received :code_exchange
+      refute_received :code_exchange
+      refute log =~ "SENTINEL"
+    end
+  end
+
+  test "invalid_grant at JWKS after successful issuance remains uncertain", context do
+    owner = self()
+    session = session(context.config, :connect)
+    raw = token(context, session)
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(owner, {:method, conn.method})
+
+      if conn.method == "POST" do
+        Req.Test.json(conn, raw)
+      else
+        conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{"error" => "invalid_grant"})
+      end
+    end)
+
+    assert {:error, :authorization_failed} =
+             OAuth.callback(context.config, session, callback_params(session))
+
+    assert_received {:method, "POST"}
+    assert_received {:method, "GET"}
+    refute_received {:method, _}
+  end
+
   test "redirect token responses are not followed", context do
     owner = self()
 

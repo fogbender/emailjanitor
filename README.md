@@ -272,6 +272,10 @@ credential stores. The internal Config HTTP options accept only a trusted test
 plug, never options from a browser request.
 An expired/revoked refresh grant returns `:reauthorization_required`; outages,
 rate limits and malformed responses return `:refresh_failed` for host backoff.
+Only a token-endpoint HTTP 400 `invalid_grant` response makes `callback/3`
+return `:code_exchange_rejected`: that exchange did not issue credentials.
+Other callback failures remain `:authorization_failed`, including identity or
+JWKS failures after a successful exchange; hosts must preserve their uncertainty.
 
 Google/OAuth HTTP operations also fail closed when any Finch telemetry handler is
 registered: those events expose raw request headers and bodies independently of
