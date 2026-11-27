@@ -168,18 +168,12 @@ defmodule EmailJanitor.Conversation.Plan do
   end
 
   defp copied_header?(instruction, raw, kind) do
-    addresses =
-      if kind == :sender do
-        case EmailJanitor.Address.parse(raw) do
-          {:ok, values} -> values
-          _ -> []
-        end
-      else
-        []
-      end
+    addresses = if kind == :sender, do: sender_addresses(raw), else: []
 
     clean = fn text ->
-      Enum.reduce(addresses, text, fn address, value -> String.replace(value, address, " ") end)
+      Enum.reduce(addresses, String.downcase(text), fn address, value ->
+        String.replace(value, address, " ")
+      end)
       |> String.replace(~r/[<>(),:;"]/u, " ")
       |> normalize()
     end
@@ -195,6 +189,31 @@ defmodule EmailJanitor.Conversation.Plan do
       |> Enum.chunk_every(48, 1, :discard)
       |> Enum.any?(fn chunk -> String.contains?(command, Enum.join(chunk)) end)
   end
+
+  defp sender_addresses(raw) do
+    # The maintained To parser retains every mailbox; its From parser returns
+    # only the first one. This syntactic identifier check does not require a
+    # public suffix, so reserved fixture domains and local addresses are safe.
+    {"to", parsed} = Mail.Parsers.RFC2822.parse_header("To: " <> raw, [])
+
+    parsed
+    |> carrier_values()
+    |> Enum.filter(fn value ->
+      byte_size(value) <= 254 and Regex.match?(~r/\A[^@\s<>(),;"]+@[a-zA-Z0-9.-]+\z/u, value)
+    end)
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&byte_size/1, :desc)
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  defp carrier_values({_, address}), do: carrier_values(address)
+  defp carrier_values(values) when is_list(values), do: Enum.flat_map(values, &carrier_values/1)
+  defp carrier_values(value) when is_binary(value), do: [value]
+  defp carrier_values(_), do: []
 
   defp copied_passage?(instruction, body) do
     body
