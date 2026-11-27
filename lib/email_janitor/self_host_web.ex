@@ -14,7 +14,10 @@ defmodule EmailJanitor.SelfHost.Web do
     Application.put_env(:email_janitor, Endpoint,
       adapter: Bandit.PhoenixAdapter,
       server: true,
-      http: [ip: {127, 0, 0, 1}, port: port],
+      http: [
+        ip: if(uri.host == "::1", do: {0, 0, 0, 0, 0, 0, 0, 1}, else: {127, 0, 0, 1}),
+        port: port
+      ],
       url: [scheme: uri.scheme, host: uri.host, port: uri.port],
       check_origin: [config.public_url],
       secret_key_base: Content.read(config.web_secret),
