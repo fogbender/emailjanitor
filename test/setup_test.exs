@@ -124,6 +124,23 @@ defmodule EmailJanitor.SetupTest do
              Setup.doctor(env, database_probe: fn _ -> :ok end)
   end
 
+  test "doctor survives an absent database socket and reports unavailable without a crash trace",
+       ctx do
+    {:ok, _} = Setup.init(ctx.directory, "owner@example.com", "https://janitor.example.com")
+    {:ok, env} = Setup.load_settings(Path.join(ctx.directory, "settings.json"))
+    env = Map.put(env, "JANITOR_DATABASE_SOCKET", Path.join(ctx.parent, "nonexistent-socket"))
+    started = System.monotonic_time(:millisecond)
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{local_ready: false, checks: %{database: :unavailable}}} = Setup.doctor(env)
+        assert Process.alive?(self())
+      end)
+
+    assert System.monotonic_time(:millisecond) - started < 5_500
+    assert logs == ""
+  end
+
   @provider "projects/123456789012/locations/global/workloadIdentityPools/janitor-pool/providers/aws-provider"
   @account "janitor-service@emailjanitor-fixture.iam.gserviceaccount.com"
   defp external_account(provider \\ @provider),

@@ -216,13 +216,47 @@ defmodule EmailJanitor.Setup do
   end
 
   defp database_probe(options) do
+    caller = self()
+    tag = make_ref()
+
+    {worker, monitor} =
+      spawn_monitor(fn ->
+        Process.flag(:trap_exit, true)
+        Logger.put_process_level(self(), :none)
+        send(caller, {tag, probe_connection(options)})
+      end)
+
+    receive do
+      {^tag, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^worker, _} ->
+        :error
+    after
+      4_000 ->
+        Process.exit(worker, :kill)
+
+        receive do: ({:DOWN, ^monitor, :process, ^worker, _} -> :ok),
+                after: (1_000 -> Process.demonitor(monitor, [:flush]))
+
+        :error
+    end
+  end
+
+  defp probe_connection(options) do
     with {:ok, _} <- Application.ensure_all_started(:postgrex),
          {:ok, pid} <-
            Postgrex.start_link(
              Keyword.merge(Keyword.delete(options, :log),
-               backoff_type: :stop,
+               pool_size: 1,
+               backoff_type: :exp,
                connect_timeout: 1000,
-               timeout: 1000
+               timeout: 1000,
+               configure: fn configured ->
+                 Logger.put_process_level(self(), :none)
+                 configured
+               end
              )
            ) do
       try do
@@ -231,11 +265,19 @@ defmodule EmailJanitor.Setup do
           _ -> :error
         end
       after
-        GenServer.stop(pid)
+        try do
+          GenServer.stop(pid, :normal, 1000)
+        catch
+          _, _ -> :ok
+        end
       end
     else
       _ -> :error
     end
+  rescue
+    _ -> :error
+  catch
+    _, _ -> :error
   end
 
   defp valid_provider?(provider),
