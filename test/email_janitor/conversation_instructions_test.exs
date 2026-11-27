@@ -46,6 +46,11 @@ defmodule EmailJanitor.ConversationInstructionsTest do
 
     assert {:error, :invalid_instruction_edit} =
              Instructions.edit(Content.new("Local rule."), [all_id], Content.new(""))
+
+    assert {:ok, empty} =
+             Instructions.edit(Content.new("Local rule."), [local_id], Content.new(" \n\t "))
+
+    assert Content.read(empty) == ""
   end
 
   test "many short paragraphs remain within a bounded model reference budget" do
