@@ -97,6 +97,7 @@ defmodule EmailJanitor.SelfHost.Runtime do
     with true <- Code.ensure_loaded?(module),
          true <- Map.has_key?(struct(module), :policy_for_messages),
          {:ok, binding, inbox} <- Store.fetch_binding(ref),
+         ref = {binding.id, binding.epoch},
          {:ok, gmail} <- Adapters.gmail(ref),
          {:ok, model} <- Adapters.model(config),
          {:ok, mail} <- Adapters.mail(config),

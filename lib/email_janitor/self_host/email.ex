@@ -79,7 +79,7 @@ defmodule EmailJanitor.SelfHost.Email do
            ),
          {:ok, target_id, conversation} <- target(sender_ref, sent.thread_id, delivery),
          {:ok, target_ref} <- current_ref(target_id) do
-      build(sender_ref, target_ref, conversation)
+      build(sender_ref, target_ref, conversation, delivery != :none)
     else
       {:error, reason} when reason in [:unverified_reply_reference, :ambiguous_reply_reference] ->
         with {:ok, id, conversation} <- target(sender_ref, sent.thread_id, :none),
@@ -134,20 +134,29 @@ defmodule EmailJanitor.SelfHost.Email do
             "sender_epoch" => ^sender_epoch,
             "command" => id,
             "command_epoch" => epoch,
-            "conversation" => conversation
+            "conversation" => conversation,
+            "verified_reference" => verified_reference
           } = value} <- decode(key),
          true <-
            Enum.sort(Map.keys(value)) ==
-             ~w(command command_epoch conversation sender sender_epoch),
+             ~w(command command_epoch conversation sender sender_epoch verified_reference),
+         true <- is_boolean(verified_reference),
          true <- valid_ref?(id, epoch),
          {:ok, conversation} <- Ecto.UUID.cast(conversation) do
-      build(sender_ref, {id, epoch}, conversation)
+      build(sender_ref, {id, epoch}, conversation, verified_reference)
     else
       _ -> {:error, :feedback_connection_changed}
     end
   end
 
-  defp build({sender_id, sender_epoch} = sender_ref, {id, epoch} = target_ref, conversation) do
+  defp build(sender_ref, target_ref, conversation, verified_reference \\ false)
+
+  defp build(
+         {sender_id, sender_epoch} = sender_ref,
+         {id, epoch} = target_ref,
+         conversation,
+         verified_reference
+       ) do
     scope = SelfHost.scope()
 
     with %Owner{subject: owner} <- scope.repo.get(Owner, 1, prefix: scope.prefix, log: false),
@@ -165,7 +174,8 @@ defmodule EmailJanitor.SelfHost.Email do
           "sender_epoch" => sender_epoch,
           "command" => id,
           "command_epoch" => epoch,
-          "conversation" => conversation
+          "conversation" => conversation,
+          "verified_reference" => verified_reference
         })
 
       {:ok,
@@ -174,6 +184,7 @@ defmodule EmailJanitor.SelfHost.Email do
          scope: scope,
          inbox: inbox,
          conversation_id: conversation,
+         verified_reference: verified_reference,
          guard: guard,
          respond: fn request, authored, evidence ->
            with :ok <- guard.(),

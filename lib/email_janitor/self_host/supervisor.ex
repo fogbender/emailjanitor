@@ -47,7 +47,7 @@ defmodule EmailJanitor.SelfHost.Services do
               do: [
                 {EmailJanitor.Worker.Server,
                  name: SelfHost.CleanupServer,
-                 list: &Store.refs/0,
+                 list: &Store.worker_refs/0,
                  resolve: &SelfHost.Runtime.worker_config/1,
                  max_concurrency: 2}
               ],

@@ -289,6 +289,54 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     assert {:error, :transport_unavailable} = SelfHost.Transport.install(changed)
   end
 
+  test "the registered digest worker sends recorded Done at local21:00 exactly once", ctx do
+    alias EmailJanitor.Mail.{Outgoing, Feedback}
+    alias EmailJanitor.MailFixture, as: F
+
+    msg =
+      message(
+        id: "digest-m1",
+        headers: [{"From", "sales@vendor.com"}, {"Subject", "Daily subject"}],
+        body: "PRIVATE_DAILY_BODY"
+      )
+
+    {:ok, policy} = ActivityPolicy.for_messages(ctx.ref, ctx.box, [msg])
+    {:ok, proposal} = proposal([msg], ctx)
+    state = start_supervised!({Agent, fn -> %{messages: [msg], contacted: [], calls: []} end})
+
+    assert {:done, _} =
+             Executor.execute(ctx.scope, ctx.box, proposal, {TestGmail, [state: state]},
+               policy: policy
+             )
+
+    {:ok, feedback} = SelfHost.Email.config(ctx.config)
+    assert %Feedback.Config{} = feedback
+    {:ok, {_, children}} = SelfHost.Services.init({ctx.config, feedback})
+    spec = Enum.find(children, &(&1.id == Digest.Worker))
+    assert %{start: {Digest.Worker, :start_link, [opts]}} = spec
+    observer = self()
+
+    mail =
+      F.config(fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        fields = URI.decode_query(body)
+        assert fields["Destination.ToAddresses.member.1"] == ctx.box.address
+        assert fields["Message.Body.Text.Data"] =~ "Daily subject"
+        refute fields["Message.Body.Text.Data"] =~ "PRIVATE_DAILY_BODY"
+        send(observer, :digest_sent)
+        F.ses_response(conn)
+      end)
+
+    clock = DateTime.new!(Date.utc_today(), ~T[21:00:00], "Etc/UTC")
+    opts = opts |> Keyword.put(:mail, mail) |> Keyword.put(:clock, fn -> clock end)
+    worker = start_supervised!({Digest.Worker, opts})
+    assert_receive :digest_sent, 5_000
+    assert {:ok, %{idle: 1}} = Digest.Worker.run(worker)
+    refute_received :digest_sent
+    assert [%Outgoing{state: :sent, kind: :digest}] = Repo.all(Outgoing, prefix: ctx.scope.prefix)
+    assert Repo.aggregate(Digest.Snapshot, :count, prefix: ctx.scope.prefix) == 1
+  end
+
   test "exact partial retirement preserves the remaining arrival candidate's executable proof",
        ctx do
     alias EmailJanitor.Gmail.Ingestion
@@ -387,6 +435,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     sent = message(id: "sent-1", headers: [{"From", ctx.box.address}], body: "PRIVATE_SENT_BODY")
     assert {:ok, first} = binding.route_verified.(sent)
     assert first.inbox == ctx.box
+    refute first.verified_reference
     assert {:ok, again} = binding.route_verified.(%{sent | id: "sent-2"})
     assert first.conversation_id == again.conversation_id
     assert {:ok, restored} = binding.restore_context.(first.key)
@@ -446,10 +495,12 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
 
     assert {:ok, context} = sender.route_verified.(sent)
     assert context.inbox == renamed
+    assert context.verified_reference
     assert context.conversation_id == snapshot_id
     Repo.update_all(Outgoing, [set: [state: :unresolved]], prefix: ctx.scope.prefix)
     assert {:clarify, fallback} = sender.route_verified.(sent)
     assert fallback.inbox == ctx.box
+    refute fallback.verified_reference
   end
 
   test "intake acknowledges durable metadata then a restarted processor purges raw mail before Sent lookup",
