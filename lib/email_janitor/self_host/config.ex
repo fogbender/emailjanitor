@@ -28,10 +28,10 @@ defmodule EmailJanitor.SelfHost.Config do
          {:ok, google} <- google(env["JANITOR_GOOGLE_CLIENT_JSON_FILE"], public_url),
          {:ok, database} <- database(env),
          region when is_binary(region) <- Map.get(env, "AWS_REGION", "us-east-1"),
-         true <- Regex.match?(~r/\A[a-z]{2}-[a-z]+-[1-9]\z/, region),
+         true <- region == "us-east-1",
          model when is_binary(model) <-
            Map.get(env, "JANITOR_MODEL_ID", "amazon.nova-micro-v1:0"),
-         true <- byte_size(model) in 1..256 and Regex.match?(~r/\A[A-Za-z0-9._:\/-]+\z/, model),
+         {:ok, _} <- EmailJanitor.Models.Config.new(:bedrock, model, nil, region: region),
          true <- Map.get(env, "JANITOR_MODEL_PROVIDER", "bedrock") == "bedrock",
          web when web in ["0", "1"] <- Map.get(env, "JANITOR_ENABLE_SELF_HOST_WEB", "1") do
       {:ok,
@@ -64,8 +64,9 @@ defmodule EmailJanitor.SelfHost.Config do
   end
 
   defp public_url(value) when is_binary(value) do
-    case URI.parse(value) do
-      %URI{scheme: scheme, host: host, path: path, userinfo: nil, query: nil, fragment: nil}
+    case URI.new(value) do
+      {:ok,
+       %URI{scheme: scheme, host: host, path: path, userinfo: nil, query: nil, fragment: nil}}
       when is_binary(host) and host != "" and path in [nil, "/"] ->
         if scheme == "https" or (scheme == "http" and host in ["localhost", "127.0.0.1", "::1"]),
           do: {:ok, String.trim_trailing(value, "/")},
@@ -120,7 +121,9 @@ defmodule EmailJanitor.SelfHost.Config do
 
   defp secret(path, minimum, maximum) when is_binary(path) do
     with true <- Path.type(path) == :absolute and not String.starts_with?(path, "/nix/store/"),
-         {:ok, %{type: :regular, size: size}} when size in minimum..maximum <- File.stat(path),
+         {:ok, %{type: :regular, size: size, mode: mode}}
+         when size >= minimum and size <= maximum <- File.stat(path),
+         true <- Bitwise.band(mode, 0o027) == 0,
          {:ok, bytes} <-
            File.open(path, [:read, :binary], fn file -> IO.binread(file, maximum + 1) end),
          true <- is_binary(bytes) and byte_size(bytes) in minimum..maximum do

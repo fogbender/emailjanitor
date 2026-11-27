@@ -72,7 +72,7 @@ defmodule EmailJanitor.SelfHost.Store do
           on_conflict: :nothing
         )
 
-        mailbox = lock(scope, box.id)
+        mailbox = lock_mailbox(scope, box.id)
         if mailbox.address != box.address, do: scope.repo.rollback(:invalid_connection)
         binding = scope.repo.get(Binding, box.id, prefix: scope.prefix)
 
@@ -153,7 +153,7 @@ defmodule EmailJanitor.SelfHost.Store do
   def disconnect(subject, id) do
     if owner?(subject) do
       case transaction(fn scope ->
-             lock(scope, id)
+             lock_mailbox(scope, id)
 
              case scope.repo.get(Binding, id, prefix: scope.prefix) do
                nil ->
@@ -220,7 +220,7 @@ defmodule EmailJanitor.SelfHost.Store do
     do: "google-" <> Base.encode16(:crypto.hash(:sha256, subject), case: :lower)
 
   @doc false
-  def lock(scope, id) do
+  def lock_mailbox(scope, id) do
     scope.repo.one(from(m in Mailbox, where: m.id == ^id, lock: "FOR UPDATE"),
       prefix: scope.prefix
     ) ||

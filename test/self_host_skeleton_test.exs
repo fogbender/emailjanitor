@@ -93,7 +93,8 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
 
   test "multiple inbox credentials stay encrypted and disconnect fences prepared work", ctx do
     {:ok, owner} = SelfHost.authorize_owner(result())
-    assert {:ok, first} = SelfHost.connect(owner, result(), "America/Los_Angeles")
+    initial_result = result()
+    assert {:ok, first} = SelfHost.connect(owner, initial_result, "America/Los_Angeles")
 
     assert {:ok, second} =
              SelfHost.connect(owner, result("work-subject", "work@example.com"), "Etc/UTC")
@@ -107,7 +108,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     refute saved.token_ciphertext =~ "PRIVATE_GOOGLE"
     refute inspect(saved) =~ saved.token_ciphertext
     assert {:ok, token} = SelfHost.open("gmail-token", first.id, saved.token_ciphertext)
-    assert Content.read(token) == Content.read(result().token)
+    assert Content.read(token) == Content.read(initial_result.token)
     {:ok, before} = EmailJanitor.Store.instruction_version(scope, first.id)
     assert :ok = SelfHost.disconnect(owner, first.id)
     assert {:ok, after_version} = EmailJanitor.Store.instruction_version(scope, first.id)
@@ -166,6 +167,12 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
 
     assert {:error, :credential_open_failed} =
              SelfHost.open("browser-oauth", "id1", <<head + 1, tail::binary>>)
+
+    size = byte_size(first) - 1
+    <<prefix::binary-size(size), last>> = first
+
+    assert {:error, :credential_open_failed} =
+             SelfHost.open("browser-oauth", "id1", <<prefix::binary, Bitwise.bxor(last, 1)>>)
 
     assert {:error, :credential_seal_failed} =
              Cipher.seal(ctx.config.credential_key, "", "id1", content)
