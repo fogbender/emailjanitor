@@ -343,7 +343,15 @@ defmodule EmailJanitor.DigestTest do
 
     opts = [
       jobs: EmailJanitor.TestScheduler.jobs(),
-      inboxes: fn -> Agent.get(listings, & &1) end,
+      inboxes: fn ->
+        case Agent.get(listings, & &1) do
+          {:error, _} = error ->
+            EmailJanitor.SelfHost.Services.connected_inboxes(error, fn _ -> flunk("no lookup") end)
+
+          known ->
+            known
+        end
+      end,
       mail: F.config(fn _ -> flunk("no digest activity to send") end),
       clock: fn -> @due end,
       authorize: fn _, _ -> {:ok, ctx.inbox} end

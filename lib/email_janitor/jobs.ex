@@ -3,6 +3,14 @@ defmodule EmailJanitor.Jobs do
   Oban-backed background cadence. Only opaque task keys and continuation markers
   enter PostgreSQL; callbacks and provider configuration stay in the host runtime.
   Gmail/SES effect ledgers remain authoritative when a job is retried or rescued.
+
+  A task may supply `metadata_guard: (marker -> {:ok, marker_or_nil})`, a trusted
+  DB-only callback executed inside the checkpoint transaction after locking the
+  job row. For deletion safety the host must lock ALL relevant cursor job rows
+  with SELECT FOR UPDATE (not only those currently holding the deleted ID), then
+  clear matching metadata and delete the host record in that SAME transaction.
+  Without that deletion-side lock the callback does not prevent a late cursor
+  write. The callback must not perform network calls or external effects.
   """
   use Supervisor
   import Ecto.Query

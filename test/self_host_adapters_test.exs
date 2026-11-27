@@ -421,6 +421,42 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     assert Repo.aggregate(Candidate, :count, prefix: ctx.scope.prefix) == 0
   end
 
+  test "host digest discovery preserves uncertainty and skips only definitely unavailable bindings",
+       ctx do
+    alias EmailJanitor.SelfHost.Services
+
+    assert {:error, :digest_worker_unavailable} =
+             Services.connected_inboxes({:error, :database_unavailable}, fn _ ->
+               flunk("no lookup")
+             end)
+
+    assert {:error, :digest_worker_unavailable} =
+             Services.connected_inboxes({:ok, [:bad]}, fn :bad ->
+               {:error, :self_host_unavailable}
+             end)
+
+    assert [] =
+             Services.connected_inboxes({:ok, [:missing]}, fn :missing ->
+               {:error, :inbox_unavailable}
+             end)
+
+    assert [] =
+             Services.connected_inboxes({:ok, [:pending]}, fn :pending ->
+               {:ok, %{state: :pending}, ctx.box}
+             end)
+
+    assert [{ctx.scope, ctx.box.id}] ==
+             Services.connected_inboxes({:ok, [:active]}, fn :active ->
+               {:ok, %{state: :active}, ctx.box}
+             end)
+
+    assert {:error, :digest_worker_unavailable} =
+             Services.connected_inboxes({:ok, [:active, :bad]}, fn
+               :active -> {:ok, %{state: :active}, ctx.box}
+               :bad -> {:error, :self_host_unavailable}
+             end)
+  end
+
   test "the registered digest worker sends recorded Done at local21:00 exactly once", ctx do
     alias EmailJanitor.Mail.{Outgoing, Feedback}
     alias EmailJanitor.MailFixture, as: F

@@ -117,31 +117,32 @@ defmodule EmailJanitor.SelfHost.Services do
     Supervisor.init(children, strategy: :rest_for_one)
   end
 
-  defp active_inboxes do
-    with {:ok, refs} <- Store.refs() do
-      Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, inboxes} ->
-        case Store.fetch_binding(ref) do
-          {:ok, %{state: :active}, inbox} ->
-            {:cont, {:ok, [{SelfHost.scope(), inbox.id} | inboxes]}}
+  defp active_inboxes, do: connected_inboxes(Store.refs(), &Store.fetch_binding/1)
 
-          {:ok, _, _} ->
-            {:cont, {:ok, inboxes}}
+  @doc false
+  def connected_inboxes({:ok, refs}, fetch_binding) when is_function(fetch_binding, 1) do
+    Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, inboxes} ->
+      case fetch_binding.(ref) do
+        {:ok, %{state: :active}, inbox} ->
+          {:cont, {:ok, [{SelfHost.scope(), inbox.id} | inboxes]}}
 
-          {:error, :inbox_unavailable} ->
-            {:cont, {:ok, inboxes}}
+        {:ok, _, _} ->
+          {:cont, {:ok, inboxes}}
 
-          _ ->
-            {:halt, {:error, :digest_worker_unavailable}}
-        end
-      end)
-      |> case do
-        {:ok, inboxes} -> inboxes
-        error -> error
+        {:error, :inbox_unavailable} ->
+          {:cont, {:ok, inboxes}}
+
+        _ ->
+          {:halt, {:error, :digest_worker_unavailable}}
       end
-    else
-      _ -> {:error, :digest_worker_unavailable}
+    end)
+    |> case do
+      {:ok, inboxes} -> inboxes
+      error -> error
     end
   end
+
+  def connected_inboxes(_, _), do: {:error, :digest_worker_unavailable}
 
   defp authorize(scope, id) do
     with true <- scope == SelfHost.scope(),
