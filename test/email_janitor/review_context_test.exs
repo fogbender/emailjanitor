@@ -186,4 +186,46 @@ defmodule EmailJanitor.ReviewContextTest do
                context_factory: fn _ -> flunk("foreign thread") end
              )
   end
+
+  test "bad legacy options remain a fixed error rather than crashing the caller", t do
+    assert {:error, :executor_unavailable} =
+             Executor.review(
+               t.scope,
+               t.box,
+               "thread-1",
+               t.gmail,
+               {TestClassifier, []},
+               "",
+               1,
+               :bad
+             )
+  end
+
+  test "a refusing factory preserves pending candidates without retiring through the base policy",
+       t do
+    assert {:ok, proposal} =
+             Executor.review(t.scope, t.box, "thread-1", t.gmail, {TestClassifier, []}, "", 1)
+
+    assert {:blocked, :upgrade_required} =
+             Executor.execute(t.scope, t.box, proposal, t.gmail,
+               policy: policy(t, "OLD", block: true)
+             )
+
+    assert_receive {:reserved, "OLD", _}
+    [candidate] = TestRepo.all(EmailJanitor.Store.Candidate, prefix: t.scope.prefix)
+
+    keep =
+      {TestClassifier,
+       [result: %{"action" => "keep", "confidence" => "high", "category" => "legitimate"}]}
+
+    assert {{:error, :policy_unavailable}, nil} =
+             Executor.review_with_context(t.scope, t.box, "thread-1", t.gmail, keep, "", 1,
+               policy: policy(t, "BASE"),
+               context_factory: fn _ -> {:error, :unavailable} end
+             )
+
+    assert [^candidate] = TestRepo.all(EmailJanitor.Store.Candidate, prefix: t.scope.prefix)
+    refute_receive {:retired, "BASE", _}
+    assert Agent.get(t.state, & &1.calls) == []
+  end
 end

@@ -41,7 +41,7 @@ defmodule EmailJanitor.Executor do
         classifier,
         instructions,
         version,
-        Keyword.delete(opts, :context_factory)
+        if(is_list(opts), do: Keyword.delete(opts, :context_factory), else: opts)
       )
 
     result
