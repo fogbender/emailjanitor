@@ -66,7 +66,9 @@ defmodule EmailJanitor.TestGmail do
     Agent.update(opts[:state], fn state ->
       messages =
         Enum.map(state.messages, fn m ->
-          if m.id in ids, do: %{m | labels: List.delete(m.labels, "INBOX")}, else: m
+          if m.id in ids and opts[:mode] != :error_without_apply,
+            do: %{m | labels: List.delete(m.labels, "INBOX")},
+            else: m
         end)
 
       %{state | messages: messages, calls: state.calls ++ [ids]}
@@ -75,6 +77,9 @@ defmodule EmailJanitor.TestGmail do
     case opts[:mode] do
       :timeout_after_apply -> {:error, :timeout}
       :raise_after_apply -> raise "PRIVATE_BODY_SENTINEL"
+      :throw_after_apply -> throw("PRIVATE_BODY_SENTINEL")
+      :exit_after_apply -> exit(:synthetic_transport_exit)
+      :error_without_apply -> {:error, :rejected}
       _ -> :ok
     end
   end

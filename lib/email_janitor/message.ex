@@ -2,6 +2,7 @@ defmodule EmailJanitor.Message do
   @moduledoc "Transient Gmail message; content is never part of a durable action record."
   alias EmailJanitor.Content
   @enforce_keys [:id, :thread_id, :headers, :labels]
+  @derive {Inspect, only: [:id, :thread_id, :labels]}
   defstruct [:id, :thread_id, :headers, :labels, :received_at, body: nil]
   @type t :: %__MODULE__{}
 

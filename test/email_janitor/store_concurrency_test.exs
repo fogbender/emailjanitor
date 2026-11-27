@@ -6,7 +6,7 @@ defmodule EmailJanitor.StoreConcurrencyTest do
 
   test "independent database connections create exactly one durable intent" do
     # Unlike the transaction-sandbox tests this commits in a throwaway schema,
-    # exercising the real unique constraint with separate concurrent connections.
+    # exercising reservations across different reviews on independent connections.
     {:ok, scope} = Scope.new(TestRepo, "ej_concurrency")
     box = inbox()
 
@@ -19,9 +19,9 @@ defmodule EmailJanitor.StoreConcurrencyTest do
     results =
       1..24
       |> Task.async_stream(
-        fn _ ->
+        fn n ->
           Ecto.Adapters.SQL.Sandbox.unboxed_run(TestRepo, fn ->
-            Store.intent(scope, box.id, proposal, "100")
+            Store.intent(scope, box.id, %{proposal | fingerprint: "review-#{n}"}, "100")
           end)
         end,
         max_concurrency: 8,

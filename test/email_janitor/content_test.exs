@@ -12,6 +12,29 @@ defmodule EmailJanitor.ContentTest do
     refute Jason.encode!(%{email: body}) =~ "PRIVATE_BODY_SENTINEL"
   end
 
+  test "message inspection hides header values as well as body text" do
+    value =
+      message(
+        headers: [{"From", "PRIVATE_HEADER_SENTINEL"}, {"Subject", "PRIVATE_SUBJECT_SENTINEL"}],
+        body: "PRIVATE_BODY_SENTINEL"
+      )
+
+    for marker <- ["PRIVATE_HEADER_SENTINEL", "PRIVATE_SUBJECT_SENTINEL", "PRIVATE_BODY_SENTINEL"] do
+      refute inspect(value) =~ marker
+    end
+  end
+
+  test "contradictory high-confidence Done classifications are rejected" do
+    for category <- ["legitimate", "uncertain"] do
+      assert {:error, :invalid_decision} =
+               Decision.parse(%{
+                 "action" => "done",
+                 "confidence" => "high",
+                 "category" => category
+               })
+    end
+  end
+
   test "provider failures, exceptions and throws expose only fixed error categories" do
     logs =
       capture_log(fn ->

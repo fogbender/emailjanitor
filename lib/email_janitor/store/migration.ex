@@ -25,7 +25,7 @@ defmodule EmailJanitor.Store.Migration do
       timestamps(type: :utc_datetime_usec)
     end
 
-    create(unique_index(:actions, [:inbox_id, :fingerprint, :instruction_version]))
+    create(index(:actions, [:inbox_id, :state]))
 
     create(
       constraint(:actions, :valid_action_state,

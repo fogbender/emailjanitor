@@ -58,8 +58,20 @@ defmodule EmailJanitor.Reconciliation do
       end
     end)
     |> case do
-      {:ok, ordered} -> {:ok, Enum.sort_by(ordered, & &1.number)}
-      error -> error
+      {:ok, ordered} ->
+        conflicting =
+          ordered
+          |> Enum.group_by(&{&1.number, &1.message_id})
+          |> Enum.any?(fn {_, events} ->
+            events |> Enum.map(& &1.event) |> Enum.uniq() |> length() > 1
+          end)
+
+        if conflicting,
+          do: {:error, :ambiguous_history},
+          else: {:ok, Enum.sort_by(Enum.reverse(ordered), & &1.number)}
+
+      error ->
+        error
     end
   end
 
