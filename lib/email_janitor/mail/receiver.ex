@@ -1,10 +1,10 @@
-defmodule EmailJanitor.SelfHost.MailJobs do
+defmodule EmailJanitor.Mail.Receiver do
   @moduledoc "Independent receipt intake, body disposal, authenticated feedback and TTL cleanup jobs."
   import Ecto.Query
   alias EmailJanitor.Mail.{Feedback, Incoming, Receipt, SDK, Spool}
-  alias EmailJanitor.SelfHost.Periodic
+  alias EmailJanitor.Mail.Job
 
-  def children(config) do
+  def children(%Feedback.Config{} = config) do
     [
       job(:receipt_intake, fn _ -> receive_once(config) end, 45_000),
       job(:incoming_processing, fn _ -> process_once(config) end, 40_000),
@@ -15,7 +15,7 @@ defmodule EmailJanitor.SelfHost.MailJobs do
   end
 
   defp job(name, run, timeout) do
-    Supervisor.child_spec({Periodic, run: run, timeout_ms: timeout}, id: name)
+    Supervisor.child_spec({Job, run: run, timeout_ms: timeout}, id: name)
   end
 
   @doc false

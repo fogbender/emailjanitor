@@ -1,12 +1,12 @@
-defmodule EmailJanitor.SelfHostPeriodicTest do
+defmodule EmailJanitor.MailJobTest do
   use ExUnit.Case, async: false
-  alias EmailJanitor.SelfHost.Periodic
+  alias EmailJanitor.Mail.Job
 
   test "a continuation drains promptly and killing its server kills the in-flight task" do
     observer = self()
 
     {:ok, server} =
-      Periodic.start_link(
+      Job.start_link(
         timeout_ms: 5_000,
         run: fn
           nil ->
@@ -33,7 +33,7 @@ defmodule EmailJanitor.SelfHostPeriodicTest do
     observer = self()
 
     {:ok, server} =
-      Periodic.start_link(
+      Job.start_link(
         timeout_ms: 500,
         run: fn _ ->
           send(observer, {:running, self()})

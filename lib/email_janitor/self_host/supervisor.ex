@@ -82,7 +82,7 @@ defmodule EmailJanitor.SelfHost.Services do
           children
       end
 
-    children = children ++ SelfHost.MailJobs.children(feedback)
+    children = children ++ EmailJanitor.Mail.Receiver.children(feedback)
     Supervisor.init(children, strategy: :one_for_one)
   end
 

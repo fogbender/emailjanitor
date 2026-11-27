@@ -1,5 +1,5 @@
-defmodule EmailJanitor.SelfHost.Periodic do
-  @moduledoc "One bounded task per persistent host job; state contains only a continuation marker."
+defmodule EmailJanitor.Mail.Job do
+  @moduledoc "One bounded task per persistent mail job; state contains only a continuation marker."
   use GenServer
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))

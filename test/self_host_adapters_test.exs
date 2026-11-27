@@ -418,7 +418,8 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
 
   test "intake acknowledges durable metadata then a restarted processor purges raw mail before Sent lookup",
        ctx do
-    alias EmailJanitor.SelfHost.{Email, MailJobs, Transport}
+    alias EmailJanitor.SelfHost.{Email, Transport}
+    alias EmailJanitor.Mail.Receiver, as: MailJobs
     alias EmailJanitor.Mail.{Incoming, Spool}
     alias EmailJanitor.Mail.Feedback.Record
     alias EmailJanitor.MailFixture, as: F
