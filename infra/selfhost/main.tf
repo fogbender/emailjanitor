@@ -34,7 +34,7 @@ variable "mail_domain" { type = string }
 variable "google_project_id" { type = string }
 variable "nixos_ami" {
   type        = string
-  description = "Your prebuilt NixOS AMI containing the supplied release and nix/module.nix configuration."
+  description = "Your prebuilt NixOS AMI containing the configured release and service module."
   validation {
     condition     = can(regex("^ami-[0-9a-f]{8}([0-9a-f]{9})?$", var.nixos_ami))
     error_message = "Provide a NixOS AMI ID for the selected region. No disk conversion or image is built by apply."
