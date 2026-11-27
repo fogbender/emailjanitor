@@ -6,7 +6,9 @@ minute worker; the host supplies identity, live connections, hypothetical/quota
 decisions, credentials and optional branding/upgrade footer. It has not sent real
 mail or been deployed. Gmail cleanup throughput and plan limits are separate.
 
-Install core, mail migration 4, then `Digest.install(scope)` (migration 5). After
+Install `Store.install(scope)`, optional `Preferences.install(scope)` (3),
+`Mail.Store.install(scope)` (4), then `Digest.install(scope)` (5), all in the
+trusted `ej_*` schema prefix; see the [registry](migrations.md). After
 connecting an inbox, call `Digest.configure(scope, inbox_id, browser_timezone, now)`.
 The IANA timezone is validated with pinned tzdata 1.2.2; its auto-update is disabled
 in this application so startup/tests need no timezone network service. Include
