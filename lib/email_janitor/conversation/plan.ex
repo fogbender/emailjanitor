@@ -133,7 +133,7 @@ defmodule EmailJanitor.Conversation.Plan do
       cond do
         body == "" -> true
         normalized == body -> false
-        kind == :header -> not copied_header?(normalized, raw)
+        kind in [:sender, :subject] -> not copied_header?(normalized, raw, kind)
         byte_size(body) < 12 -> true
         String.contains?(normalized, body) -> false
         true -> not copied_passage?(normalized, body)
@@ -164,23 +164,61 @@ defmodule EmailJanitor.Conversation.Plan do
         _, _ -> raw
       end
 
-    [{:header, raw}, {:header, decoded}] |> Enum.uniq()
+    [{kind, raw}, {kind, decoded}] |> Enum.uniq()
   end
 
-  defp copied_header?(instruction, raw) do
-    identifier =
-      raw
-      |> String.replace(~r/[^\s<>(),:;"@]+@[a-zA-Z0-9.-]+/u, " ")
+  defp copied_header?(instruction, raw, kind) do
+    addresses = if kind == :sender, do: sender_addresses(raw), else: []
+
+    clean = fn text ->
+      Enum.reduce(addresses, String.downcase(text), fn address, value ->
+        String.replace(value, address, " ")
+      end)
       |> String.replace(~r/[<>(),:;"]/u, " ")
       |> normalize()
+    end
 
-    command = instruction |> String.replace(~r/[<>(),:;"]/u, " ") |> normalize()
-    # Names and short subject identifiers may legitimately appear in a new
-    # behavioral instruction. Reject an instruction copied wholesale from header
-    # text, or a long copied passage; do not reject ordinary "Keep mail from X".
-    (byte_size(command) >= 4 and String.contains?(identifier, command)) or
-      copied_passage?(command, identifier)
+    identifier = clean.(raw)
+    command = clean.(instruction)
+    # Preserve ordinary names and subject identifiers. Longer verbatim header
+    # phrases stay out of instructions; the teacher uses a canonical address or
+    # a concise semantic description instead.
+    (identifier != "" and identifier == command) or
+      identifier
+      |> String.graphemes()
+      |> Enum.chunk_every(48, 1, :discard)
+      |> Enum.any?(fn chunk -> String.contains?(command, Enum.join(chunk)) end)
   end
+
+  defp sender_addresses(raw) do
+    # The parser retains ordinary mailboxes, while the syntactic scan also
+    # catches carriers folded into display names by malformed quoting/groups.
+    # Neither path depends on the domain having a public suffix.
+    scanned = Regex.scan(~r/[^@\s<>(),:;"\x{0000}-\x{001F}]+@[a-zA-Z0-9.-]+/u, raw)
+
+    parsed =
+      try do
+        {"to", values} = Mail.Parsers.RFC2822.parse_header("To: " <> raw, [])
+        carrier_values(values)
+      rescue
+        _ -> []
+      catch
+        _, _ -> []
+      end
+
+    (parsed ++ List.flatten(scanned))
+    |> Enum.filter(fn value ->
+      byte_size(value) <= 254 and Regex.match?(~r/\A[^@\s<>(),:;"]+@[a-zA-Z0-9.-]+\z/u, value)
+    end)
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&byte_size/1, :desc)
+  end
+
+  defp carrier_values({_, address}), do: carrier_values(address)
+  defp carrier_values(values) when is_list(values), do: Enum.flat_map(values, &carrier_values/1)
+  defp carrier_values(value) when is_binary(value), do: [value]
+  defp carrier_values(_), do: []
 
   defp copied_passage?(instruction, body) do
     body
