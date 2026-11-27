@@ -1,6 +1,7 @@
 defmodule EmailJanitor.Executor do
   @moduledoc "Recheck a proposal, persist an intent, and mutate exact IDs once. Ambiguity never causes a retry."
   alias EmailJanitor.{
+    Gmail,
     Identity,
     Inbox,
     Message,
@@ -168,10 +169,12 @@ defmodule EmailJanitor.Executor do
     with true <- Message.fingerprint(current) == proposal.fingerprint,
          true <- exact_inbox_ids(current) == Enum.sort(proposal.message_ids),
          {:ok, history_id} <- safe(fn -> gmail.history_id(inbox.id, options) end),
+         {:ok, mutation} <- Gmail.prepare(gmail, inbox.id, proposal.message_ids, options),
+         :ok <- Owner.dispatch_window(),
          {:ok, {status, action}} <- Store.intent(scope, inbox.id, proposal, history_id, opts) do
       case status do
         :existing -> existing(scope, inbox, action, opts)
-        :created -> apply_intent(scope, inbox, action, gmail, options, opts)
+        :created -> apply_intent(scope, inbox, action, mutation, opts)
         :blocked -> {:blocked, action}
       end
     else
@@ -181,25 +184,37 @@ defmodule EmailJanitor.Executor do
     end
   end
 
-  defp apply_intent(scope, inbox, action, gmail, options, opts) do
+  defp apply_intent(scope, inbox, action, mutation, opts) do
     # Any error after sending is ambiguous: retain the intent for history-based
     # reconciliation. Repeating execute cannot issue the mutation a second time.
-    Owner.bounded(fn ->
-      case Store.begin_dispatch(scope, inbox.id, action.id, action.owner_token) do
-        :ok ->
-          dispatch(scope, inbox, action, gmail, options, opts)
+    result =
+      Owner.bounded(fn ->
+        case Store.begin_dispatch(scope, inbox.id, action.id, action.owner_token) do
+          :ok ->
+            dispatch(scope, inbox, action, mutation, opts)
 
-        {:error, _} = error ->
-          case Store.cancel_prepared(scope, inbox.id, action.id, action.owner_token) do
-            :ok -> settle(scope, inbox, action.id, error, opts)
-            _ -> error
-          end
-      end
-    end)
+          {:error, _} = error ->
+            case Store.cancel_prepared(scope, inbox.id, action.id, action.owner_token) do
+              :ok -> settle(scope, inbox, action.id, error, opts)
+              _ -> error
+            end
+        end
+      end)
+
+    case result do
+      {:error, :dispatch_window_exhausted} = error ->
+        case Store.cancel_prepared(scope, inbox.id, action.id, action.owner_token) do
+          :ok -> settle(scope, inbox, action.id, error, opts)
+          _ -> error
+        end
+
+      other ->
+        other
+    end
   end
 
-  defp dispatch(scope, inbox, action, gmail, options, opts) do
-    case safe(fn -> gmail.remove_inbox(inbox.id, action.message_ids, options) end) do
+  defp dispatch(scope, inbox, action, mutation, opts) do
+    case safe(mutation) do
       :ok ->
         :ok = Store.transition(scope, inbox.id, action.id, :intent, :done)
         settle(scope, inbox, action.id, {:done, action.id}, opts)

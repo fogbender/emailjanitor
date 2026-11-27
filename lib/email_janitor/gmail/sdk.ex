@@ -129,10 +129,40 @@ defmodule EmailJanitor.Gmail.SDK do
   @impl true
   def remove_inbox(inbox_id, ids, opts) do
     guarded(fn ->
+      with {:ok, dispatch} <- prepare_remove_inbox(inbox_id, ids, opts), do: dispatch.()
+    end)
+  end
+
+  @doc """
+  Verify/freeze credentials, mailbox and exact IDs before the durable dispatch marker.
+  The returned transient closure sends only batchModify with a 15-second default
+  transport budget. Never persist the closure or inspect its captured environment.
+  The host resolver must return a token valid for at least 60 seconds, refreshing
+  early so admission and dispatch cannot consume the token's remaining lifetime.
+  """
+  @impl true
+  def prepare_remove_inbox(inbox_id, ids, opts) do
+    guarded(fn ->
       with true <-
              is_list(ids) and length(ids) in 1..1000 and Enum.all?(ids, &Parser.valid_id?/1),
            true <- length(Enum.uniq(ids)) == length(ids),
-           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, connection, _} <- verified(inbox_id, opts) do
+        config = Keyword.fetch!(opts, :config)
+
+        prepared =
+          Tesla.client(Tesla.Client.middleware(connection), Config.mutation_transport(config))
+
+        {:ok, fn -> dispatch_remove(prepared, ids) end}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_message_ids}
+      end
+    end)
+  end
+
+  defp dispatch_remove(connection, ids) do
+    guarded(fn ->
+      with :ok <- EmailJanitor.TransportPrivacy.check(),
            {:ok, _} <-
              call(fn ->
                Users.gmail_users_messages_batch_modify(connection, "me",
@@ -141,8 +171,9 @@ defmodule EmailJanitor.Gmail.SDK do
              end) do
         :ok
       else
+        {:error, :unsafe_http_observers} -> {:error, :gmail_unavailable}
         {:error, _} = error -> error
-        _ -> {:error, :invalid_message_ids}
+        _ -> {:error, :gmail_unavailable}
       end
     end)
   end
@@ -370,7 +401,8 @@ defmodule EmailJanitor.Gmail.SDK do
 
   defp history_records(records) when is_list(records) do
     Enum.reduce_while(records, {:ok, [], [], []}, fn record, {:ok, acc, new, gone} ->
-      with true <- history_id?(record.id),
+      with %Model.History{} <- record,
+           true <- history_id?(record.id),
            {:ok, additions} <- changes(record.labelsAdded || [], record.id, :inbox_added),
            {:ok, removals} <- changes(record.labelsRemoved || [], record.id, :inbox_removed),
            {:ok, added_ids} <- message_ids(record.messagesAdded || []),
@@ -382,14 +414,17 @@ defmodule EmailJanitor.Gmail.SDK do
     end)
   end
 
+  defp history_records(_), do: {:error, :invalid_history}
+
   defp changes(values, history_id, event) when is_list(values) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
-      with true <- is_list(value.labelIds),
-           true <- Parser.valid_id?(value.message.id) do
-        if "INBOX" in value.labelIds,
+      with %{labelIds: labels, message: %Model.Message{id: message_id}} <- value,
+           true <- is_list(labels) and Enum.all?(labels, &is_binary/1),
+           true <- Parser.valid_id?(message_id) do
+        if "INBOX" in labels,
           do:
             {:cont,
-             {:ok, [%{history_id: history_id, message_id: value.message.id, event: event} | acc]}},
+             {:ok, [%{history_id: history_id, message_id: message_id, event: event} | acc]}},
           else: {:cont, {:ok, acc}}
       else
         _ -> {:halt, {:error, :invalid_history}}
@@ -397,13 +432,20 @@ defmodule EmailJanitor.Gmail.SDK do
     end)
   end
 
+  defp changes(_, _, _), do: {:error, :invalid_history}
+
   defp message_ids(values) when is_list(values) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
-      if Parser.valid_id?(value.message.id),
-        do: {:cont, {:ok, [value.message.id | acc]}},
-        else: {:halt, {:error, :invalid_history}}
+      with %{message: %Model.Message{id: message_id}} <- value,
+           true <- Parser.valid_id?(message_id) do
+        {:cont, {:ok, [message_id | acc]}}
+      else
+        _ -> {:halt, {:error, :invalid_history}}
+      end
     end)
   end
+
+  defp message_ids(_), do: {:error, :invalid_history}
 
   defp incomplete(reason),
     do:
@@ -439,6 +481,10 @@ defmodule EmailJanitor.Gmail.SDK do
       {:error, %Tesla.Env{status: 429}} -> {:error, :rate_limited}
       _ -> {:error, :gmail_unavailable}
     end
+  rescue
+    _ -> {:error, :gmail_unavailable}
+  catch
+    _, _ -> {:error, :gmail_unavailable}
   end
 
   defp forbidden_reason(body) when is_binary(body) do
