@@ -432,6 +432,42 @@ defmodule EmailJanitor.GoogleOAuthTest do
     refute_received :unexpected_invalid_refresh_http
   end
 
+  test "refresh distinguishes expired grants from outages and never exposes provider errors",
+       context do
+    owner = self()
+
+    for {status, code, expected} <- [
+          {400, "invalid_grant", :reauthorization_required},
+          {400, "invalid_client", :refresh_failed},
+          {503, "invalid_grant", :refresh_failed},
+          {429, "rate_limit", :refresh_failed}
+        ] do
+      Req.Test.stub(__MODULE__, fn conn ->
+        send(owner, :refresh_request)
+        assert conn.host == "oauth2.googleapis.com" and conn.request_path == "/token"
+
+        conn
+        |> Plug.Conn.put_status(status)
+        |> Req.Test.json(%{
+          "error" => code,
+          "error_description" => "PRIVATE_REFRESH_ERROR_SENTINEL"
+        })
+      end)
+
+      log =
+        capture_log(fn ->
+          assert {:error, ^expected} = OAuth.refresh(context.config, old_token())
+        end)
+
+      assert_received :refresh_request
+      refute_received :refresh_request
+      refute log =~ "SENTINEL"
+    end
+
+    Req.Test.stub(__MODULE__, &Req.Test.transport_error(&1, :econnrefused))
+    assert {:error, :refresh_failed} = OAuth.refresh(context.config, old_token())
+  end
+
   defp fixture(context, raw, check_form \\ fn _ -> :ok end) do
     Req.Test.stub(__MODULE__, fn conn ->
       case {conn.method, conn.host, conn.request_path} do

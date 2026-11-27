@@ -77,6 +77,8 @@ callback parameters cannot set SDK options. Provider requests disable redirects,
 retries and logging. This module performs no durable storage and reads no machine
 credential stores. The internal Config HTTP options accept only a trusted test
 plug, never options from a browser request.
+An expired/revoked refresh grant returns `:reauthorization_required`; outages,
+rate limits and malformed responses return `:refresh_failed` for host backoff.
 
 `EmailJanitor.Gmail.SDK` uses Google's generated `google_api_gmail` client. Supply
 an `EmailJanitor.Gmail.Config` with the connected `Inbox` and a zero-argument

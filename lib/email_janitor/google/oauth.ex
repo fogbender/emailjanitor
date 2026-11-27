@@ -141,7 +141,7 @@ defmodule EmailJanitor.Google.OAuth do
            {:ok, old} when is_map(old) <- Jason.decode(Content.read(content)),
            true <- valid_credential?(old["refresh_token"]),
            {:ok, raw} <-
-             OAuth2.refresh_access_token(settings(config), Map.take(old, ["refresh_token"])),
+             refresh_access_token(settings(config), Map.take(old, ["refresh_token"])),
            raw =
              raw
              |> Map.put_new("refresh_token", old["refresh_token"])
@@ -149,12 +149,32 @@ defmodule EmailJanitor.Google.OAuth do
            {:ok, token} <- sanitize_token(raw) do
         {:ok, Content.new(Jason.encode!(token))}
       else
+        {:error, :reauthorization_required} = error -> error
         _ -> {:error, :refresh_failed}
       end
     end)
   end
 
   def refresh(_, _), do: {:error, :refresh_failed}
+
+  defp refresh_access_token(settings, previous) do
+    case OAuth2.refresh_access_token(settings, previous) do
+      {:ok, _} = result ->
+        result
+
+      {:error,
+       %Assent.HTTPAdapter.InvalidResponseError{
+         response: %Assent.HTTPAdapter.HTTPResponse{
+           status: 400,
+           body: %{"error" => "invalid_grant"}
+         }
+       }} ->
+        {:error, :reauthorization_required}
+
+      _ ->
+        {:error, :refresh_failed}
+    end
+  end
 
   def dump_session(%Session{} = session) do
     if valid_session?(session) do
@@ -278,6 +298,7 @@ defmodule EmailJanitor.Google.OAuth do
   defp protect(reason, operation) do
     case operation.() do
       {:ok, _} = value -> value
+      {:error, :reauthorization_required} = value when reason == :refresh_failed -> value
       _ -> {:error, reason}
     end
   rescue
