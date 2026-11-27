@@ -516,6 +516,53 @@ defmodule EmailJanitor.WorkerTest do
     assert read(ctx.state).mutations == []
   end
 
+  test "typed thread deletion on the review fetch after eligibility retires the arrival", ctx do
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, full_thread_error_at: 2]}}
+    assert {:ok, %{status: :skipped}} = Worker.step(config)
+    assert {:ok, []} = pending(ctx)
+    assert read(ctx.state).full_thread_count == 2
+    assert read(ctx.state).mutations == []
+  end
+
+  test "profile failure on the review fetch after eligibility preserves the arrival", ctx do
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail, [state: ctx.state, full_thread_error_at: 2, full_thread_late_error: :not_found]}
+    }
+
+    assert {:ok, %{status: :gmail_unavailable}} = Worker.step(config)
+    assert {:ok, [_]} = pending(ctx)
+    assert read(ctx.state).mutations == []
+  end
+
+  for {reason, expected, requested} <- [
+        {:thread_not_found, :skipped, false},
+        {:not_found, :gmail_unavailable, true}
+      ] do
+    test "recheck execute fetch #{reason} retains precise terminal versus retry semantics", ctx do
+      Agent.update(ctx.quota, &%{&1 | block: :cap})
+      assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+      assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+      Agent.update(ctx.state, &Map.put(&1, :full_thread_count, 0))
+
+      config = %{
+        ctx.config
+        | gmail:
+            {Gmail,
+             [state: ctx.state, full_thread_error_at: 2, full_thread_late_error: unquote(reason)]}
+      }
+
+      assert {:ok, %{status: unquote(expected)}} = Worker.step(config)
+
+      assert [%Candidate{requested: unquote(requested)}] =
+               Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+      assert read(ctx.state).full_thread_count == 2
+      assert read(ctx.state).mutations == []
+    end
+  end
+
   test "at most five targets are admitted per step and remaining arrivals continue", ctx do
     messages = Enum.map(1..7, &Fixtures.message(id: "arrival-#{&1}"))
 
