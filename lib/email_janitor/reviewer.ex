@@ -13,7 +13,7 @@ defmodule EmailJanitor.Reviewer do
       ) do
     with {:classify, _} <- Safeguards.evaluate(messages, inbox, contacted_keys, restored),
          {:ok, %Decision{action: :done, confidence: :high} = decision} <-
-           Classifier.propose(classifier, messages, instructions) do
+           Classifier.propose(classifier, messages, instructions, inbox) do
       ids = messages |> Enum.filter(&Message.in_inbox?/1) |> Enum.map(& &1.id) |> Enum.sort()
 
       case {Enum.uniq(Enum.map(messages, & &1.thread_id)), ids} do

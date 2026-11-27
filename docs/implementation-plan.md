@@ -25,7 +25,9 @@ Google means Gmail and Google Workspace for v1. Both deployments need a Google
 Cloud project/API credentials; GCP hosts Gmail notification resources, not the
 application. Janitor's own email transport is AWS SES, not a Gmail mailbox.
 
-Self-hosters use their own AI credentials and select supported provider adapters.
+Self-hosters use AWS Bedrock through their VM instance role. SaaS uses Azure AI.
+These are the two supported AI deployment paths; no direct OpenAI/Anthropic API
+adapters or additional self-hosting clouds are planned for v1.
 Use established SDKs/clients; do not reimplement provider authentication or agent
 protocols. Customers of the SaaS need no AI credentials or CLI subscription.
 
@@ -269,9 +271,9 @@ From/header alone. They never consume cleanup quota.
 
 ### Models and assistant actions
 
-Start with one small Azure deployment for SaaS and the same adapter path for the
-self-hosted reference installation. Add at least one direct OpenAI or Anthropic
-API adapter before the AWS self-host release, so it does not require Azure.
+Use one small Azure deployment for SaaS and AWS Bedrock for the AWS self-hosted
+reference installation. Keep a single AWS reference setup; do not add direct
+OpenAI/Anthropic adapters or broaden self-hosting to other clouds.
 Use existing SDKs. Inspect actual Elixir ecosystem support before choosing a
 package; don't claim an unofficial client is official. If a required official SDK
 is only available in another runtime, use a narrowly scoped SDK bridge only when
@@ -402,7 +404,8 @@ loss neither skips post-baseline mail nor reprocesses manual restores.
 - Extend the isolated dev OpenTofu stack with an SES test receiving subdomain,
   SSE-KMS spool and queue, test recipient verification and a real round-trip.
   Build the standalone chat UI against the now-implemented conversation workflow.
-- Add and evaluate the first direct OpenAI/Anthropic API adapter before Phase 4.
+- Evaluate AWS Bedrock Nova for the self-hosted reference before Phase 4; evaluate
+  the separate Azure model deployment for SaaS.
 - Keep digest simple; no per-email assistant surface, live email cache, or rule builder.
 
 Gate: exercise digest reply, forwarded pitch, website correction, undo,

@@ -37,7 +37,10 @@ defmodule EmailJanitor.MixProject do
       {:google_api_pub_sub, "~> 0.42.0"},
       {:assent, "~> 0.4.0"},
       {:plug, "~> 1.20", only: :test},
-      {:stream_data, "~> 1.4", only: :test}
+      {:stream_data, "~> 1.4", only: :test},
+      {:req_llm, "~> 1.31.0"},
+      {:ex_aws, "~> 2.8"},
+      {:ex_aws_auth, "~> 1.6"}
     ]
   end
 end
