@@ -18,7 +18,7 @@ defmodule EmailJanitor.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger, :crypto, :inets, :ssl]]
+    [extra_applications: [:logger, :crypto, :inets, :ssl], mod: {EmailJanitor.Application, []}]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
