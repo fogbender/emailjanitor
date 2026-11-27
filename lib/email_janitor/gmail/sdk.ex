@@ -267,7 +267,7 @@ defmodule EmailJanitor.Gmail.SDK do
         :ok
       else
         {:error, :unsafe_http_observers} ->
-          {:error, :gmail_unavailable}
+          {:rejected, :unsafe_http_observers}
 
         {:error, reason} when reason in [:authorization_required, :forbidden, :rate_limited] ->
           {:rejected, reason}
@@ -711,7 +711,7 @@ defmodule EmailJanitor.Gmail.SDK do
         result
 
       {:rejected, reason} = proof
-      when reason in [:authorization_required, :forbidden, :rate_limited] ->
+      when reason in [:authorization_required, :forbidden, :rate_limited, :unsafe_http_observers] ->
         proof
 
       {:error, _} = error ->

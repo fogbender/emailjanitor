@@ -619,6 +619,8 @@ Only authoritative 401/403/429 responses from the generated SDK's single
 batch-modify call produce an unapplied rejection proof. Those receipts cancel
 and permit a fresh explicit request UUID after repair. Transport failures remain
 ambiguous and never automatically repeat the Gmail mutation.
+An observer-privacy refusal detected locally before HTTP is also a no-wire proof;
+it cancels that effect instead of leaving a permanent ambiguous reservation.
 
 A successful restore durably records `Effect.applied_at` and the exact original
 action's `restored_message_ids` before reporting settlement. The bounded DB-only

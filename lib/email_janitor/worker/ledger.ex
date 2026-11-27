@@ -256,30 +256,38 @@ defmodule EmailJanitor.Worker.Ledger do
   end
 
   def retire_candidate(scope, inbox, id, ids) do
-    case scope.repo.get_by(Candidate, [inbox_id: inbox.id, candidate_id: id],
-           prefix: scope.prefix,
-           log: false
-         ) do
-      nil ->
-        :ok
+    case scope.repo.transaction(fn ->
+           candidate =
+             scope.repo.one(
+               from(c in Candidate,
+                 where: c.inbox_id == ^inbox.id and c.candidate_id == ^id,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix,
+               log: false
+             )
 
-      candidate ->
-        remaining = candidate.message_ids -- ids
+           if candidate do
+             remaining = candidate.message_ids -- ids
 
-        if remaining != candidate.message_ids do
-          scope.repo.update!(
-            Ecto.Changeset.change(candidate,
-              message_ids: remaining,
-              status: if(remaining == [], do: :retired, else: :pending),
-              requested: remaining != [] and candidate.requested,
-              request_version: candidate.request_version + 1
-            ),
-            prefix: scope.prefix,
-            log: false
-          )
-        end
+             if remaining != candidate.message_ids do
+               scope.repo.update!(
+                 Ecto.Changeset.change(candidate,
+                   message_ids: remaining,
+                   status: if(remaining == [], do: :retired, else: :pending),
+                   requested: remaining != [] and candidate.requested,
+                   request_version: candidate.request_version + 1
+                 ),
+                 prefix: scope.prefix,
+                 log: false
+               )
+             end
+           end
 
-        :ok
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      _ -> {:error, :policy_unavailable}
     end
   end
 

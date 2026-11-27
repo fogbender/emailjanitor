@@ -32,7 +32,8 @@ defmodule EmailJanitor.Restore do
     :outer_transaction,
     :ownership_lost,
     :restore_settlement_pending,
-    :unconfirmed_restoration
+    :unconfirmed_restoration,
+    :unsafe_http_observers
   ]
 
   def install(scope), do: normalize_install(Store.install(scope))
@@ -307,7 +308,7 @@ defmodule EmailJanitor.Restore do
         end
 
       {:wire_result, {:rejected, reason}}
-      when reason in [:authorization_required, :forbidden, :rate_limited] ->
+      when reason in [:authorization_required, :forbidden, :rate_limited, :unsafe_http_observers] ->
         case finish(scope, effect, :cancelled) do
           :ok -> {:error, reason}
           _ -> {:unresolved, effect.id}
@@ -530,7 +531,9 @@ defmodule EmailJanitor.Restore do
         )
       end
 
-      :ok
+      if current && not is_nil(current.dispatch_started_at),
+        do: {:unresolved, effect.id},
+        else: :ok
     end)
   end
 
@@ -605,8 +608,10 @@ defmodule EmailJanitor.Restore do
             {:unresolved, id}
 
           true ->
-            cancel_prepared(scope, inbox, effect)
-            error
+            case cancel_prepared(scope, inbox, effect) do
+              {:ok, {:unresolved, ^id}} -> {:unresolved, id}
+              _ -> error
+            end
         end
 
       _ ->

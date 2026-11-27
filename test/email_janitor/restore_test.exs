@@ -361,6 +361,55 @@ defmodule EmailJanitor.RestoreTest do
     assert read(ctx).restores == [["message-1"]]
   end
 
+  test "recovery reports a marker committed after its initial unlocked snapshot", ctx do
+    counter = start_supervised!({Agent, fn -> 0 end}, id: :late_marker_guard)
+    id = {__MODULE__, :late_marker, make_ref()}
+
+    event =
+      (Repo.config()[:telemetry_prefix] || [:email_janitor, :restore_test, :repo]) ++ [:query]
+
+    :ok =
+      :telemetry.attach(id, event, &__MODULE__.late_marker/4, %{id: id, caller: self(), ctx: ctx})
+
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    authorize = fn ->
+      value = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+      if value == 3, do: Process.exit(self(), :kill), else: :ok
+    end
+
+    assert {:unresolved, effect_id} = restore(ctx, authorize: authorize)
+    assert_received :late_marker_committed
+    assert effect_id == ctx.effect_id
+    assert {:unresolved, ^effect_id} = Restore.outcome(ctx.scope, ctx.box, effect_id)
+    assert read(ctx).restores == []
+  end
+
+  def late_marker(_, _, metadata, %{id: id, caller: caller, ctx: ctx}) do
+    result = Map.get(metadata, :result)
+    nonempty = match?({:ok, %Postgrex.Result{rows: [_ | _]}}, result)
+
+    if self() == caller and nonempty and
+         String.contains?(metadata.query, ~s|FROM "#{ctx.scope.prefix}"."restore_effects"|) do
+      :telemetry.detach(id)
+      # Model a delayed COMMIT becoming visible between the unlocked snapshot
+      # and the cancellation fence. No Gmail request was made by the dead owner.
+      Task.async(fn ->
+        import Ecto.Query
+
+        Repo.update_all(
+          from(e in Effect, where: e.id == ^ctx.effect_id),
+          [set: [dispatch_started_at: DateTime.utc_now()]],
+          prefix: ctx.scope.prefix,
+          log: false
+        )
+      end)
+      |> Task.await()
+
+      send(caller, :late_marker_committed)
+    end
+  end
+
   test "metadata outcomes distinguish absent, cancelled, positive and permanent ambiguous effects",
        ctx do
     assert :none = Restore.outcome(ctx.scope, ctx.box, ctx.effect_id)
@@ -571,8 +620,8 @@ defmodule EmailJanitor.RestoreTest do
              Restore.settle(ctx.scope, ctx.box, "not-a-uuid", trusted_options())
   end
 
-  for reason <- [:authorization_required, :forbidden, :rate_limited] do
-    test "authoritative #{reason} rejection permits a fresh explicit request", ctx do
+  for reason <- [:authorization_required, :forbidden, :rate_limited, :unsafe_http_observers] do
+    test "proven unapplied #{reason} rejection permits a fresh explicit request", ctx do
       reason = unquote(reason)
       Agent.update(ctx.state, &%{&1 | mode: {:rejected, reason}})
       assert {:error, ^reason} = restore(ctx)
@@ -969,6 +1018,73 @@ defmodule EmailJanitor.RestoreTest do
     assert :ok = EmailJanitor.Worker.queue_recheck(ctx.scope, ctx.box, candidate.id)
 
     assert [%EmailJanitor.Worker.Candidate{message_ids: ["message-3"], requested: true}] =
+             Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "retirement serializes its version with a concurrent bulk backlog request", ctx do
+    :ok = EmailJanitor.Worker.install(ctx.scope)
+    candidate = seed_candidate(ctx, ["message-1", "message-3"], -60)
+
+    Repo.insert!(
+      %EmailJanitor.Worker.Candidate{
+        inbox_id: ctx.box.id,
+        candidate_id: candidate.id,
+        generation: Ecto.UUID.generate(),
+        thread_id: "thread-1",
+        message_ids: candidate.message_ids,
+        inserted_at: candidate.inserted_at,
+        updated_at: candidate.updated_at
+      },
+      prefix: ctx.scope.prefix
+    )
+
+    parent = self()
+
+    backlog =
+      Task.async(fn ->
+        Repo.transaction(fn ->
+          Ecto.Adapters.SQL.query!(
+            Repo,
+            ~s|SELECT candidate_id FROM "#{ctx.scope.prefix}".janitor_worker_candidates WHERE candidate_id = $1 FOR UPDATE|,
+            [Ecto.UUID.dump!(candidate.id)],
+            log: false
+          )
+
+          assert {:ok, 1} = EmailJanitor.Worker.queue_backlog(ctx.scope, ctx.box)
+          send(parent, :bulk_request_uncommitted)
+          receive do: (:commit -> :ok)
+        end)
+      end)
+
+    assert_receive :bulk_request_uncommitted, 2_000
+
+    retirement =
+      Task.async(fn ->
+        Repo.checkout(fn ->
+          %{rows: [[backend]]} =
+            Ecto.Adapters.SQL.query!(Repo, "SELECT pg_backend_pid()", [], log: false)
+
+          send(parent, {:retirement_backend, backend})
+
+          EmailJanitor.Worker.Ledger.retire_candidate(ctx.scope, ctx.box, candidate.id, [
+            "message-1"
+          ])
+        end)
+      end)
+
+    assert_receive {:retirement_backend, backend}, 2_000
+    await_blocked(backend, 200)
+    send(backlog.pid, :commit)
+    assert {:ok, :ok} = Task.await(backlog)
+    assert :ok = Task.await(retirement)
+
+    assert [
+             %EmailJanitor.Worker.Candidate{
+               message_ids: ["message-3"],
+               request_version: 3,
+               requested: true
+             }
+           ] =
              Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
   end
 
