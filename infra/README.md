@@ -38,6 +38,9 @@ federation restricted to the AWS runtime role, without service account key files
 The setup CLI must generate the non-secret external-account credential
 configuration from the provider/service-account outputs for the runtime SDK. OAuth audience must support the intended Google accounts. An External
 Testing app can expire Gmail refresh tokens after seven days.
+The external-account configuration must enable IMDSv2 (for example,
+`gcloud iam workload-identity-pools create-cred-config ... --aws --enable-imdsv2`),
+because the EC2 instance rejects tokenless metadata access.
 
 ## DNS and account boundaries
 
@@ -92,7 +95,8 @@ credentials, private domain names or company resource groups embedded in it.
 
 Supply `name`, `mail_domain`, `google_project_id`,
 `nixos_ami`, `ssh_key_name`, and a restricted
-`ssh_source_cidr`. Do not put OAuth tokens into OpenTofu variables
+`ssh_source_cidr` (canonical /24–/32; normally your operator IP /32).
+Do not put OAuth tokens into OpenTofu variables
 or user-data: those would persist in state and instance metadata.
 
 ## NixOS runtime and secrets
@@ -130,6 +134,9 @@ model classification; SES verified identity/DKIM and permitted recipient sending
 one received feedback message through SES→S3→SQS; immediate spool deletion after
 success and bounded deletion after failure; a response delivered back to the test
 inbox. Infrastructure output `ready_for_processing` deliberately remains false.
+The receiving worker must ignore/delete S3's `s3:TestEvent` notifications and SES's
+`AMAZON_SES_SETUP_NOTIFICATION` objects instead of treating setup probes as human
+feedback. Test those cases before declaring the transport ready.
 
 Back up PostgreSQL state (instructions, actions, restore protections and cursors),
 runtime token encryption keys, and SOPS recovery material using encrypted backups.

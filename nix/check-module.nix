@@ -27,5 +27,7 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert service.serviceConfig.LimitCORE == 0;
    assert host.config.services.postgresql.enableTCPIP == false;
    assert builtins.elem "multi-user.target" service.wantedBy;
+   assert builtins.elem "postgresql.target" service.after;
+   assert builtins.elem "postgresql.target" service.requires;
    assert builtins.all (a: a.assertion) host.config.assertions;
    { valid = true; unit = service.serviceConfig.ExecStart; }

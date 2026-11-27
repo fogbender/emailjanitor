@@ -41,8 +41,10 @@ variable "ssh_key_name" { type = string }
 variable "ssh_source_cidr" {
   type = string
   validation {
-    condition     = can(cidrnetmask(var.ssh_source_cidr)) && var.ssh_source_cidr != "0.0.0.0/0"
-    error_message = "Provide a restricted IPv4 CIDR for operator SSH, not the whole internet."
+    condition = try(can(cidrnetmask(var.ssh_source_cidr)) &&
+      tonumber(split("/", var.ssh_source_cidr)[1]) >= 24 &&
+    cidrhost(var.ssh_source_cidr, 0) == split("/", var.ssh_source_cidr)[0], false)
+    error_message = "Provide a canonical operator IPv4 CIDR between /24 and /32."
   }
 }
 variable "activate_receiving" {
@@ -65,6 +67,7 @@ resource "aws_subnet" "service" {
   cidr_block              = "10.73.0.0/26"
   availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
+  lifecycle { ignore_changes = [availability_zone] }
 }
 resource "aws_route_table" "service" {
   vpc_id = aws_vpc.service.id

@@ -37,9 +37,9 @@ in {
     systemd.services.emailjanitor = {
       description = "Single-user Email Janitor";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" "postgresql.service" ];
+      after = [ "network-online.target" "postgresql.target" ];
       wants = [ "network-online.target" ];
-      requires = [ "postgresql.service" ];
+      requires = [ "postgresql.target" ];
       environment = {
         JANITOR_DATABASE_SOCKET = "/run/postgresql";
         JANITOR_DATABASE_NAME = "emailjanitor";
@@ -64,6 +64,14 @@ in {
         RestartSec = 5;
         LimitCORE = 0;
         NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
+        LockPersonality = true;
+        ProtectClock = true;
+        ProtectKernelLogs = true;
+        ProtectHostname = true;
+        RestrictRealtime = true;
+        SystemCallArchitectures = "native";
+        ProtectProc = "invisible";
         PrivateTmp = true;
         PrivateDevices = true;
         ProtectHome = true;

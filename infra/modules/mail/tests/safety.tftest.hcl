@@ -52,6 +52,10 @@ run "safe_transport_defaults" {
     condition     = aws_route53_record.mx.zone_id == aws_route53_zone.mail.zone_id && length(aws_route53_record.dkim) == 3
     error_message = "MX and DKIM belong only to the dedicated new mail zone."
   }
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Resource == aws_ses_domain_identity.mail.arn && jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Condition.StringEquals["ses:FromAddress"] == "janitor@janitor.example.com"
+    error_message = "Sending must remain scoped to the Janitor domain identity and exact From address."
+  }
 }
 
 run "explicit_receiving_activation" {

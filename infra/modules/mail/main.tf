@@ -247,6 +247,9 @@ resource "aws_iam_role_policy" "runtime_mail" {
       { Effect = "Allow", Action = ["kms:Decrypt"], Resource = aws_kms_key.spool.arn },
       { Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"],
       Resource = [aws_sqs_queue.mail.arn, aws_sqs_queue.failed.arn] },
+      # SES Resource restricts sending identities, not the sandbox's recipient
+      # verification. Keep this sender-domain grant narrow; verify destinations
+      # separately during readiness (AWS SES guide: control-user-access.html).
       { Effect = "Allow", Action = ["ses:SendEmail", "ses:SendRawEmail"], Resource = aws_ses_domain_identity.mail.arn,
       Condition = { StringEquals = { "ses:FromAddress" = local.sender } } }
     ]
@@ -258,4 +261,4 @@ output "sender" { value = local.sender }
 output "spool_bucket" { value = aws_s3_bucket.spool.id }
 output "queue_url" { value = aws_sqs_queue.mail.url }
 output "kms_key_arn" { value = aws_kms_key.spool.arn }
-output "receiving_activated" { value = var.activate_receiving }
+output "receiving_activated" { value = length(aws_ses_active_receipt_rule_set.mail) > 0 }

@@ -66,6 +66,24 @@ run "reject_public_ssh" {
   expect_failures = [var.ssh_source_cidr]
 }
 
+run "reject_broad_ssh" {
+  command = plan
+  variables { ssh_source_cidr = "0.0.0.0/1" }
+  expect_failures = [var.ssh_source_cidr]
+}
+
+run "reject_noncanonical_ssh" {
+  command = plan
+  variables { ssh_source_cidr = "203.0.113.1/24" }
+  expect_failures = [var.ssh_source_cidr]
+}
+
+run "reject_wildcard_model" {
+  command = plan
+  variables { bedrock_model_id = "*" }
+  expect_failures = [var.bedrock_model_id]
+}
+
 run "receiving_requires_explicit_opt_in" {
   command = plan
   variables { activate_receiving = true }
