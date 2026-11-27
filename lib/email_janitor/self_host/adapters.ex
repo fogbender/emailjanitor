@@ -3,7 +3,7 @@ defmodule EmailJanitor.SelfHost.Adapters do
   import Ecto.Query
   alias EmailJanitor.{Gmail, Inbox, Preferences, SelfHost}
   alias EmailJanitor.Google.{PubSub, ServiceToken}
-  alias EmailJanitor.Mail.{Config, Outbox}
+  alias EmailJanitor.Mail.Config
   alias EmailJanitor.Models
   alias EmailJanitor.SelfHost.{Binding, Credentials, Store}
   alias EmailJanitor.Store.Mailbox
@@ -61,8 +61,7 @@ defmodule EmailJanitor.SelfHost.Adapters do
   end
 
   def self_mail(sender) do
-    scope = SelfHost.scope()
-    fn inbox, headers -> Outbox.self_delivery?(scope, inbox.id, sender, headers) end
+    fn inbox, headers -> Store.self_delivery?(inbox.id, sender, headers) end
   end
 
   @doc "DB-only routing; a deliberately disconnected account may be acknowledged without body access."
