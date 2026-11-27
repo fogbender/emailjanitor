@@ -469,6 +469,14 @@ repair or upgrade uses `wake/2` with a host-derived reference to reset that one
 inbox's backoff; new references must still appear in the trusted list callback.
 Host references are opaque binaries of 1–256 bytes, independent of Gmail IDs.
 
+A positively typed deleted-thread result retires the current pending recheck's
+exact core, host and worker metadata, without a quota refund. The worker captures
+a database timestamp before provider reads and revalidates connection generation,
+instruction version, host authorization and the request version under database
+locks. Newer review fences and unrelated selected-message siblings survive.
+Profile 404s, unreadable content and temporary failures retain retry provenance;
+unsupported partial host retirement pauses instead of withdrawing a wider grant.
+
 The host's `authorize` callback is checked again inside admission. It must use
 bounded local database checks, and explicit disconnect/binding changes must lock
 the core mailbox and increment its instruction version in the same transaction.

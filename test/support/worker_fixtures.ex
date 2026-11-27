@@ -57,6 +57,8 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   end
 
   def thread_snapshot(_, thread, options) do
+    if hook = options[:snapshot_hook], do: hook.()
+
     Agent.get_and_update(options[:state], fn state ->
       result =
         cond do

@@ -536,11 +536,81 @@ defmodule EmailJanitor.Worker.Ledger do
           c.inbox_id == ^inbox.id and c.status == :pending and c.requested and
             (is_nil(c.next_attempt_at) or c.next_attempt_at <= ^now),
         order_by: [asc_nulls_first: c.next_attempt_at, asc: c.updated_at, asc: c.candidate_id],
-        limit: 1
+        limit: 1,
+        select_merge: %{read_started_at: type(fragment("clock_timestamp()"), :utc_datetime_usec)}
       ),
       prefix: scope.prefix,
       log: false
     )
+  end
+
+  # Only an authenticated typed thread deletion may call this after the provider
+  # read. The timestamp came from the DB candidate fetch before that read.
+  def retire_deleted(scope, inbox, source, generation, version, policy, authorize) do
+    case scope.repo.transaction(fn ->
+           mailbox =
+             scope.repo.one(from(m in Mailbox, where: m.id == ^inbox.id, lock: "FOR UPDATE"),
+               prefix: scope.prefix,
+               log: false
+             )
+
+           unless mailbox && mailbox.address == inbox.address &&
+                    mailbox.instruction_version == version,
+                  do: scope.repo.rollback(:ineligible_recheck)
+
+           current =
+             scope.repo.one(
+               from(c in Candidate,
+                 where: c.inbox_id == ^inbox.id and c.candidate_id == ^source.candidate_id,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix,
+               log: false
+             )
+
+           unless match?(%DateTime{}, source.read_started_at) && current &&
+                    current.request_version == source.request_version &&
+                    current.message_ids == source.message_ids,
+                  do: scope.repo.rollback(:ineligible_recheck)
+
+           with :ok <- candidate_available?(scope, inbox, source, generation),
+                :ok <- authorize.(),
+                {:ok, :retired} <-
+                  EmailJanitor.Store.retire_ineligible(
+                    scope,
+                    inbox.id,
+                    source.thread_id,
+                    version,
+                    source.read_started_at,
+                    policy: policy,
+                    evaluated_message_ids: source.message_ids,
+                    retire_only_ids: source.message_ids
+                  ) do
+             if pending_source?(scope, inbox, current), do: scope.repo.rollback(:proposal_changed)
+             :ok = retire_candidate(scope, inbox, source.candidate_id, source.message_ids)
+             :retired
+           else
+             {:error, reason} when is_atom(reason) -> scope.repo.rollback(reason)
+             _ -> scope.repo.rollback(:ineligible_recheck)
+           end
+         end) do
+      {:ok, :retired} ->
+        :ok
+
+      {:error, reason}
+      when reason in [
+             :ineligible_recheck,
+             :proposal_changed,
+             :partial_retirement_unsupported,
+             :manual_recheck_unsupported,
+             :manual_authorization_changed,
+             :connection_changed
+           ] ->
+        {:error, reason}
+
+      _ ->
+        {:error, :policy_unavailable}
+    end
   end
 
   def candidate_available?(scope, inbox, candidate, generation) do
