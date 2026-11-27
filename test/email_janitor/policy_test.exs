@@ -1,3 +1,7 @@
+defmodule EmailJanitor.UnsupportedExactRetirement do
+  def retire_candidate_messages(_, _, _, _), do: {:error, :partial_retirement_unsupported}
+end
+
 defmodule EmailJanitor.TestPolicy do
   @behaviour EmailJanitor.Policy
 
@@ -49,6 +53,23 @@ defmodule EmailJanitor.TestPolicy do
         context.scope.repo,
         "DELETE FROM #{context.scope.prefix}.policy_events WHERE action_id=$1 AND kind='reserve'",
         [id],
+        log: false
+      )
+
+      :ok
+    end
+  end
+
+  def retire_candidate_messages(context, _inbox, id, ids) do
+    if context.mode == :retire_error do
+      {:error, :unavailable}
+    else
+      record(context, id, "retire", ids)
+
+      Ecto.Adapters.SQL.query!(
+        context.scope.repo,
+        "UPDATE #{context.scope.prefix}.policy_events SET message_ids=ARRAY(SELECT v FROM unnest(message_ids) v WHERE NOT v=ANY($2::text[])) WHERE action_id=$1 AND kind='reserve'",
+        [id, ids],
         log: false
       )
 
@@ -312,7 +333,7 @@ defmodule EmailJanitor.PolicyTest do
                Store.intent(ctx.scope, ctx.inbox.id, newer, "101", policy: scoped_policy)
     end
 
-    assert {:keep, :classifier_kept} =
+    assert {:error, :proposal_changed} =
              Executor.review(
                ctx.scope,
                ctx.inbox,
@@ -591,5 +612,15 @@ defmodule EmailJanitor.PolicyTest do
                  log: false
                )
     end
+  end
+
+  test "exact retirement preserves a nested adapter's unsupported capability reason" do
+    assert {:error, :partial_retirement_unsupported} =
+             Policy.retire_candidate_messages(
+               %Policy{adapter: EmailJanitor.UnsupportedExactRetirement, context: nil},
+               "inbox-1",
+               Ecto.UUID.generate(),
+               ["message-1"]
+             )
   end
 end
