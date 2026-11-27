@@ -50,10 +50,12 @@ defmodule EmailJanitor.Executor do
                   classifier,
                   instructions,
                   version,
-                  restored
+                  restored,
+                  context.opts
                 )
 
           case result do
+            {:keep, :unreadable_content} -> result
             {:keep, reason} -> retire_keep(context, reason)
             result -> result
           end
@@ -68,6 +70,19 @@ defmodule EmailJanitor.Executor do
          {:ok, current} <- safe(fn -> gmail.thread(inbox.id, thread_id, options) end),
          true <-
            is_list(current) and Enum.all?(current, &match?(%Message{thread_id: ^thread_id}, &1)) do
+      inbox_ids = exact_inbox_ids(current)
+
+      opts =
+        opts
+        |> Keyword.put(:inbox_message_ids, inbox_ids)
+        |> Keyword.put(
+          :evaluated_message_ids,
+          case Keyword.fetch(opts, :cleanup_target_ids) do
+            {:ok, ids} when is_list(ids) -> Enum.filter(ids, &(&1 in inbox_ids))
+            _ -> inbox_ids
+          end
+        )
+
       {:ok,
        {%{
           scope: scope,
@@ -119,6 +134,8 @@ defmodule EmailJanitor.Executor do
   end
 
   defp do_execute(scope, inbox, proposal, gmail, options, opts) do
+    opts = Keyword.put(opts, :cleanup_target_ids, Proposal.evaluated_ids(proposal))
+
     with {:ok, {context, current}} <-
            fetch_review(
              scope,
@@ -167,7 +184,8 @@ defmodule EmailJanitor.Executor do
 
   defp execute_current(scope, inbox, proposal, current, gmail, options, opts) do
     with true <- Message.fingerprint(current) == proposal.fingerprint,
-         true <- exact_inbox_ids(current) == Enum.sort(proposal.message_ids),
+         true <- valid_proposal_ids?(proposal),
+         true <- exact_inbox_ids(current) == Enum.sort(Proposal.inbox_ids(proposal)),
          {:ok, history_id} <- safe(fn -> gmail.history_id(inbox.id, options) end),
          {:ok, mutation} <- Gmail.prepare(gmail, inbox.id, proposal.message_ids, options),
          :ok <- Owner.dispatch_window(),
@@ -182,6 +200,17 @@ defmodule EmailJanitor.Executor do
       {:error, reason} when is_atom(reason) -> {:error, reason}
       _ -> {:error, :gmail_unavailable}
     end
+  end
+
+  defp valid_proposal_ids?(proposal) do
+    done = proposal.message_ids
+    evaluated = Proposal.evaluated_ids(proposal)
+    inbox = Proposal.inbox_ids(proposal)
+
+    Enum.all?([done, evaluated, inbox], fn ids ->
+      is_list(ids) and ids != [] and length(ids) == length(Enum.uniq(ids)) and
+        Enum.all?(ids, &is_binary/1)
+    end) and Enum.all?(done, &(&1 in evaluated)) and Enum.all?(evaluated, &(&1 in inbox))
   end
 
   defp apply_intent(scope, inbox, action, mutation, opts) do
