@@ -105,6 +105,11 @@
             fi
             test "$janitor_setup_doctor_status" -eq 2
             jq -e '.checks.database == "unavailable" and .local_ready == false and .processing_ready == false' doctor.json
+            emailjanitor-setup wif-config \
+              --provider projects/123456789012/locations/global/workloadIdentityPools/janitor-pool/providers/aws-provider \
+              --service-account janitor-service@emailjanitor-fixture.iam.gserviceaccount.com \
+              --output "$TMPDIR/aws-google.json" > wif.json
+            jq -e '.credential_source.environment_id == "aws1" and .credential_source.imdsv2_session_token_url == "http://169.254.169.254/latest/api/token"' "$TMPDIR/aws-google.json"
             if emailjanitor-setup init --directory "$TMPDIR/private" \
               --owner owner@example.com --public-url https://janitor.example.com; then
               exit 1
