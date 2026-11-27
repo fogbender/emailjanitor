@@ -6,30 +6,37 @@ defmodule EmailJanitor.Gmail.NotificationWorker do
   and Inbox. It must never derive scopes from request/model parameters. Unknown
   routes, uninitialized connections and failed commits remain unacknowledged.
   A successful durable signal may be redelivered; recording and ack are idempotent.
+  Store the complete pull before one batched acknowledgement; never perform an
+  acknowledgement round trip for every delivery inside the subscription deadline.
   Periodic Ingestion.catch_up calls remain mandatory when notifications are quiet.
   """
   alias EmailJanitor.{Inbox, Gmail.Ingestion, Google.PubSub.Delivery, Store.Scope}
 
   def poll_once({pubsub, config}, router) when is_function(router, 1) do
     try do
-      with {:ok, deliveries} when is_list(deliveries) <- pubsub.pull(config) do
-        counts =
-          Enum.reduce(deliveries, %{recorded: 0, acknowledged: 0, failed: 0}, fn delivery,
-                                                                                 counts ->
+      with {:ok, deliveries} when is_list(deliveries) <- pubsub.pull(config),
+           true <- length(deliveries) <= 100 do
+        {stored, failed} =
+          Enum.reduce(deliveries, {[], 0}, fn delivery, {stored, failed} ->
             case record(delivery, router) do
-              :ok ->
-                counts = Map.update!(counts, :recorded, &(&1 + 1))
-
-                if acknowledge(pubsub, config, delivery) == :ok,
-                  do: Map.update!(counts, :acknowledged, &(&1 + 1)),
-                  else: Map.update!(counts, :failed, &(&1 + 1))
-
-              _ ->
-                Map.update!(counts, :failed, &(&1 + 1))
+              :ok -> {[delivery | stored], failed}
+              _ -> {stored, failed + 1}
             end
           end)
 
-        {:ok, counts}
+        recorded = length(stored)
+
+        acknowledged =
+          if stored != [] and acknowledge(pubsub, config, Enum.reverse(stored)) == :ok,
+            do: recorded,
+            else: 0
+
+        {:ok,
+         %{
+           recorded: recorded,
+           acknowledged: acknowledged,
+           failed: failed + recorded - acknowledged
+         }}
       else
         _ -> {:error, :notification_unavailable}
       end
@@ -57,8 +64,8 @@ defmodule EmailJanitor.Gmail.NotificationWorker do
 
   defp record(_, _), do: {:error, :signal_not_stored}
 
-  defp acknowledge(pubsub, config, delivery) do
-    case pubsub.acknowledge(config, [delivery]) do
+  defp acknowledge(pubsub, config, deliveries) do
+    case pubsub.acknowledge(config, deliveries) do
       :ok -> :ok
       _ -> {:error, :acknowledgement_failed}
     end
