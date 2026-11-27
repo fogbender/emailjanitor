@@ -637,8 +637,7 @@ supply current DB-only guards and `respond(request_uuid, authored, evidence)` /
 and canonical RFC ID. A reply interrupted after execution can be rebuilt from
 durable effect metadata; an unretained read-only answer gets an honest fixed
 fallback. Ambiguous SES dispatch is terminal, with no automatic resend. Unknown
-human senders can receive a configured signup link, limited to one sender/day
-and a global 100/day abuse backstop, with no Gmail inbox provisioned for Janitor.
+human senders can receive a configured signup link, limited to once per sender, plus a global 100-new-senders/day abuse backstop, with no Gmail inbox provisioned for Janitor.
 
 This is library plumbing tested with isolated PostgreSQL and synthetic HTTP.
 It is not activated, and real Google/SES delivery and threaded replies still

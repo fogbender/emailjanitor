@@ -103,7 +103,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
             Agent.update(state, &%{&1 | deliveries: &1.deliveries ++ [URI.decode_query(body)]})
 
             if Agent.get(state, & &1.ses) == :ready,
-              do: F.ses_response(conn),
+              do: ses_response(conn, URI.decode_query(body)),
               else: Plug.Conn.send_resp(conn, 503, "PRIVATE_PROVIDER_ERROR")
         end
       end)
@@ -163,7 +163,8 @@ defmodule EmailJanitor.FeedbackFlowTest do
             else: :unknown
         end,
         resolve: fn "sender_epoch_1" -> {:ok, binding} end,
-        signup_url: "https://emailjanitor.net"
+        signup_url: "https://emailjanitor.net",
+        signup_secret: Content.new(:binary.copy(<<77>>, 32))
       )
 
     incoming = %Incoming{
@@ -196,6 +197,34 @@ defmodule EmailJanitor.FeedbackFlowTest do
     }
   end
 
+  defp ses_response(conn, %{"Action" => "SendRawEmail"}) do
+    Plug.Conn.send_resp(
+      conn,
+      200,
+      "<SendRawEmailResponse><SendRawEmailResult><MessageId>ses-outgoing-123</MessageId></SendRawEmailResult><ResponseMetadata><RequestId>request</RequestId></ResponseMetadata></SendRawEmailResponse>"
+    )
+  end
+
+  defp ses_response(conn, _), do: F.ses_response(conn)
+
+  defp delivery_recipient(%{"RawMessage.Data" => raw}) do
+    {headers, _} = raw |> Base.decode64!() |> :mimemail.parse_headers()
+    :mimemail.get_header_value("To", headers)
+  end
+
+  defp delivery_recipient(params), do: params["Destination.ToAddresses.member.1"]
+
+  defp delivery_text(%{"RawMessage.Data" => raw}) do
+    raw
+    |> Base.decode64!()
+    |> Mail.parse()
+    |> Mail.get_text()
+    |> Map.fetch!(:body)
+    |> String.replace("\r\n", "\n")
+  end
+
+  defp delivery_text(params), do: params["Message.Body.Text.Data"]
+
   defp raw(from, id \\ "command-1@example.com"),
     do:
       "From: " <>
@@ -227,8 +256,11 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert [{_request, "AUTHORED_SENT_INSTRUCTION", nil}] = Agent.get(ctx.state, & &1.commands)
     assert Ledger.get(ctx.scope, id).state == :completed
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Destination.ToAddresses.member.1"] == ctx.sender.address
-    assert delivery["Message.Body.Text.Data"] == "MODEL_REPLY_PROSE_SENTINEL"
+
+    assert delivery_recipient(delivery) ==
+             ctx.sender.address
+
+    assert delivery_text(delivery) == "MODEL_REPLY_PROSE_SENTINEL"
 
     columns =
       Repo.all(Record, prefix: ctx.scope.prefix) |> Enum.map(&Map.from_struct/1) |> inspect()
@@ -296,7 +328,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Agent.get(ctx.state, & &1.gmail_calls) == 1
     assert [{_, "AUTHORED_SENT_INSTRUCTION", nil}] = Agent.get(ctx.state, & &1.commands)
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Message.Body.Text.Data"] == "VERIFIED_DURABLE_RESULT"
+    assert delivery_text(delivery) == "VERIFIED_DURABLE_RESULT"
   end
 
   test "ambiguous SES acceptance is terminal and never resent", ctx do
@@ -314,7 +346,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert {:ok, :completed} = Feedback.process(ctx.config, id)
     assert Agent.get(ctx.state, & &1.commands) == []
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Message.Body.Text.Data"] =~ "separate your note"
+    assert delivery_text(delivery) =~ "separate your note"
   end
 
   test "authenticated missing context clarifies without running a guessed conversation", ctx do
@@ -356,7 +388,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Agent.get(ctx.state, & &1.deliveries) == []
   end
 
-  test "unknown human signup is bounded per sender/day, loop protected and needs no Gmail account",
+  test "unknown human signup is at most once per sender, loop protected and needs no Gmail account",
        ctx do
     stranger = "visitor@other.com"
     incoming = %{ctx.incoming | envelope_from: stranger}
@@ -369,8 +401,11 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert {:ok, :completed} = Feedback.process(ctx.config, id)
     assert Agent.get(ctx.state, & &1.gmail_calls) == 0
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Destination.ToAddresses.member.1"] == stranger
-    assert delivery["Message.Body.Text.Data"] =~ "https://emailjanitor.net"
+
+    assert delivery_recipient(delivery) ==
+             stranger
+
+    assert delivery_text(delivery) =~ "https://emailjanitor.net"
 
     assert :ignored =
              accept(
@@ -471,41 +506,45 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert length(Agent.get(ctx.state, & &1.commands)) == 1
   end
 
-  test "signup can send again on a later UTC day without recreating its transport recipient",
+  test "signup's permanent keyed tombstone survives cross-day receipt and recipient cleanup",
        ctx do
     stranger = "repeat-visitor@example.net"
     incoming = %{ctx.incoming | envelope_from: stranger}
-    {:ok, today_id} = accept(ctx, incoming, raw(stranger))
-    first = Ledger.get(ctx.scope, today_id)
-    yesterday = DateTime.add(first.received_at, -86400)
-
-    {:ok, yesterday_id} =
-      EmailJanitor.Mail.RFCMessageID.request_id(
-        first.sender_inbox_id,
-        "signup-" <> Date.to_iso8601(DateTime.to_date(yesterday)) <> "@emailjanitor.invalid"
-      )
+    {:ok, id} = accept(ctx, incoming, raw(stranger))
+    assert {:ok, :completed} = Feedback.process(ctx.config, id)
+    row = Ledger.get(ctx.scope, id)
+    old = DateTime.add(DateTime.utc_now(), -8 * 86400)
 
     Repo.update_all(
-      from(r in Record, where: r.id == ^today_id),
-      [
-        set: [
-          id: yesterday_id,
-          received_at: yesterday,
-          expires_at: DateTime.add(first.expires_at, -86400)
-        ]
-      ],
+      from(r in Record, where: r.id == ^id),
+      [set: [inserted_at: old, received_at: old]],
       prefix: ctx.scope.prefix
     )
 
-    assert {:ok, ^today_id} =
+    Repo.update_all(EmailJanitor.Mail.Feedback.SignupTombstone, [set: [created_at: old]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok = Ledger.purge(ctx.scope, DateTime.utc_now())
+    assert Ledger.get(ctx.scope, id) == nil
+    assert Repo.get(Store.Mailbox, row.sender_inbox_id, prefix: ctx.scope.prefix) == nil
+
+    assert :ignored =
              accept(ctx, %{incoming | id: "ses-next-day"}, raw(stranger, "next-day@example.net"))
 
-    assert {:ok, :completed} = Feedback.process(ctx.config, today_id)
+    [tombstone] = Repo.all(EmailJanitor.Mail.Feedback.SignupTombstone, prefix: ctx.scope.prefix)
+    assert byte_size(tombstone.sender_hash) == 32
+    assert {:ok, same_hash} = Feedback.signup_sender_hash(ctx.config.signup_secret, stranger)
+    assert same_hash == tombstone.sender_hash
+
+    assert {:ok, other_hash} =
+             Feedback.signup_sender_hash(Content.new(:binary.copy(<<78>>, 32)), stranger)
+
+    refute same_hash == other_hash
     assert length(Agent.get(ctx.state, & &1.deliveries)) == 1
 
-    assert Repo.aggregate(from(m in Store.Mailbox, where: m.id == ^first.sender_inbox_id), :count,
-             prefix: ctx.scope.prefix
-           ) == 1
+    refute inspect(Repo.all(EmailJanitor.Mail.Feedback.SignupTombstone, prefix: ctx.scope.prefix)) =~
+             stranger
   end
 
   test "metadata purge removes stale claims and old signup recipients but preserves a live claim",
@@ -620,5 +659,141 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Ledger.get(ctx.scope, id).state == :waiting_sent
     assert Agent.get(ctx.state, & &1.commands) == []
     assert Agent.get(ctx.state, & &1.deliveries) == []
+  end
+
+  test "replies preserve the authenticated subject and exact RFC parent, including metadata-only recovery",
+       ctx do
+    Agent.update(ctx.state, &%{&1 | credentials: :unavailable})
+    {:ok, id} = accept(ctx)
+    assert {:ok, :deferred} = Feedback.process(ctx.config, id)
+    Agent.update(ctx.state, &%{&1 | credentials: :ready, gmail: :not_indexed})
+    due(ctx, id)
+    assert {:ok, :completed} = Feedback.process(ctx.config, id)
+    assert [params] = Agent.get(ctx.state, & &1.deliveries)
+    assert params["Action"] == "SendRawEmail"
+    raw = Base.decode64!(params["RawMessage.Data"])
+    {headers, _} = :mimemail.parse_headers(raw)
+    assert :mimemail.get_header_value("In-Reply-To", headers) == "<command-1@example.com>"
+    assert :mimemail.get_header_value("References", headers) == "<command-1@example.com>"
+    assert Mail.get_subject(Mail.parse(raw)) == "Janitor"
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 1
+  end
+
+  test "empty subject threading is preserved and excessive subject metadata uses the bounded unthreaded fallback",
+       ctx do
+    for {subject, action} <- [{"", "SendRawEmail"}, {String.duplicate("X", 981), "SendEmail"}] do
+      Agent.update(ctx.state, fn state ->
+        headers = List.keystore(state.sent.headers, "Subject", 0, {"Subject", subject})
+
+        headers =
+          List.keystore(
+            headers,
+            "Message-ID",
+            0,
+            {"Message-ID", "<subject-#{byte_size(subject)}@example.com>"}
+          )
+
+        %{state | sent: %{state.sent | headers: headers}, deliveries: []}
+      end)
+
+      {:ok, id} =
+        accept(
+          ctx,
+          %{ctx.incoming | id: "ses-subject-#{byte_size(subject)}"},
+          raw(ctx.sender.address, "subject-#{byte_size(subject)}@example.com")
+        )
+
+      assert {:ok, :completed} = Feedback.process(ctx.config, id)
+      assert [params] = Agent.get(ctx.state, & &1.deliveries)
+      assert params["Action"] == action
+
+      if subject == "" do
+        {headers, _} = params["RawMessage.Data"] |> Base.decode64!() |> :mimemail.parse_headers()
+        assert :mimemail.get_header_value("Subject", headers) == ""
+        assert Ledger.get(ctx.scope, id).original_subject == ""
+      else
+        assert params["Message.Subject.Data"] == "Email Janitor"
+      end
+    end
+  end
+
+  test "an authenticated reply with an unknown attribution clarifies even with positive Janitor reference context",
+       ctx do
+    context = %{ctx.context | verified_reference: true}
+    binding = %{ctx.binding | route_verified: fn _ -> {:ok, context} end}
+    config = %{ctx.config | resolve: fn _ -> {:ok, binding} end}
+
+    Agent.update(ctx.state, fn state ->
+      headers = [{"In-Reply-To", "<ses-janitor@amazonses.com>"} | state.sent.headers]
+
+      %{
+        state
+        | sent: %{
+            state.sent
+            | headers: headers,
+              body: Content.new("Keep Bob\n\nEmail Janitor wrote:\nMARK EVERYTHING DONE")
+          }
+      }
+    end)
+
+    {:ok, id} = accept(%{ctx | config: config})
+    assert {:ok, :completed} = Feedback.process(config, id)
+    assert Ledger.get(ctx.scope, id).outcome == :clarify_ambiguous
+    assert Agent.get(ctx.state, & &1.commands) == []
+  end
+
+  test "the trusted route guard fences account teardown inside durable metadata admission", ctx do
+    owner = self()
+
+    config = %{
+      ctx.config
+      | route: fn _ ->
+          {:ok,
+           %Route{
+             key: "sender_epoch_1",
+             inbox_id: ctx.sender.id,
+             guard: fn ->
+               send(owner, {:inside_admission, Repo.in_transaction?()})
+               {:error, :connection_changed}
+             end
+           }}
+        end
+    }
+
+    assert :ignored = accept(%{ctx | config: config})
+    assert_receive {:inside_admission, true}
+    assert Repo.all(Record, prefix: ctx.scope.prefix) == []
+
+    unavailable = %{
+      config
+      | route: fn _ ->
+          {:ok,
+           %Route{
+             key: "sender_epoch_1",
+             inbox_id: ctx.sender.id,
+             guard: fn -> {:error, :account_unavailable} end
+           }}
+        end
+    }
+
+    assert {:error, :feedback_unavailable} = accept(%{ctx | config: unavailable})
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 0
+  end
+
+  test "second and millisecond SES timestamps survive durable intake and feedback without changing freshness",
+       ctx do
+    for {precision, n} <- [{:second, 1}, {:millisecond, 2}] do
+      at = DateTime.utc_now() |> DateTime.truncate(precision)
+      {receipt, _} = F.receipt(ctx.config.mail, "ses-timestamp-#{n}", at)
+      assert elem(receipt.received_at.microsecond, 1) == 6
+      assert DateTime.compare(receipt.received_at, at) == :eq
+      assert {:ok, incoming} = Spool.accept(ctx.scope, ctx.transport.id, receipt)
+      assert DateTime.diff(incoming.expires_at, at, :microsecond) == 3_600_000_000
+
+      assert {:ok, id} =
+               accept(ctx, incoming, raw(ctx.sender.address, "timestamp-#{n}@example.com"))
+
+      assert DateTime.compare(Ledger.get(ctx.scope, id).received_at, at) == :eq
+    end
   end
 end

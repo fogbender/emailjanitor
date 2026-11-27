@@ -33,7 +33,7 @@ defmodule EmailJanitor.Mail.Receipt do
        %__MODULE__{
          id: id,
          key: object_key,
-         received_at: at,
+         received_at: %{at | microsecond: {elem(at.microsecond, 0), 6}},
          envelope_from: source,
          recipients: recipients,
          verdicts: verdicts
