@@ -42,6 +42,9 @@ defmodule EmailJanitor.Models.SDK do
     # a host trust boundary: fail closed if ANY Finch handlers are installed.
     [] = :telemetry.list_handlers([:finch])
 
+    payload = messages |> selected_messages() |> Enum.map(&payload/1) |> Jason.encode!()
+    if byte_size(payload) > 96_000, do: throw(:invalid_content)
+
     context = [
       ReqLLM.Context.system(
         @prompt <>
@@ -49,9 +52,7 @@ defmodule EmailJanitor.Models.SDK do
           Jason.encode!(%{address: inbox.address, relay_addresses: inbox.relay_addresses}) <>
           "\nUSER_PREFERENCES:\n" <> instructions
       ),
-      ReqLLM.Context.user(
-        "UNTRUSTED_EMAIL_JSON:\n" <> Jason.encode!(Enum.map(Enum.take(messages, -5), &payload/1))
-      )
+      ReqLLM.Context.user("UNTRUSTED_EMAIL_JSON:\n" <> payload)
     ]
 
     options =
@@ -89,8 +90,11 @@ defmodule EmailJanitor.Models.SDK do
   rescue
     _ -> {:error, :model_unavailable}
   catch
-    :throw, :invalid_html -> {:keep, :unreadable_content}
-    _, _ -> {:error, :model_unavailable}
+    :throw, reason when reason in [:invalid_html, :invalid_content] ->
+      {:keep, :unreadable_content}
+
+    _, _ ->
+      {:error, :model_unavailable}
   end
 
   # ReqLLM 1.31 emits raw request-bearing exceptions even with payloads:none.
@@ -143,30 +147,77 @@ defmodule EmailJanitor.Models.SDK do
 
   defp payload(message) do
     %{
-      "from" => Message.header(message, "from"),
-      "reply_to" => Message.header(message, "reply-to"),
-      "to" => Message.header(message, "to"),
-      "cc" => Message.header(message, "cc"),
-      "delivered_to" => Message.header(message, "delivered-to"),
-      "subject" => Message.header(message, "subject"),
-      "original_sender" => Message.header(message, "x-original-sender"),
-      "original_from" => Message.header(message, "x-original-from"),
+      "in_inbox" => Message.in_inbox?(message),
+      "from" => header(message, "from"),
+      "reply_to" => header(message, "reply-to"),
+      "to" => header(message, "to"),
+      "cc" => header(message, "cc"),
+      "delivered_to" => header(message, "delivered-to"),
+      "subject" => header(message, "subject"),
+      "original_sender" => header(message, "x-original-sender"),
+      "original_from" => header(message, "x-original-from"),
       "text" => text(message)
     }
+  end
+
+  defp selected_messages(messages) do
+    {actionable, context} =
+      messages
+      |> Enum.with_index()
+      |> Enum.split_with(fn {message, _index} -> Message.in_inbox?(message) end)
+
+    if length(actionable) > 5, do: throw(:invalid_content)
+
+    (actionable ++ Enum.take(context, -(5 - length(actionable))))
+    |> Enum.sort_by(&elem(&1, 1))
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp header(message, name) do
+    case Message.header(message, name) do
+      nil -> nil
+      value when is_binary(value) -> bounded(value, 4096)
+      _ -> throw(:invalid_content)
+    end
+  end
+
+  defp bounded(value, bytes) do
+    prefix = binary_part(value, 0, min(byte_size(value), bytes))
+
+    case :unicode.characters_to_binary(prefix, :utf8, :utf8) do
+      valid when is_binary(valid) -> valid
+      {:incomplete, valid, _} -> valid
+      _ -> throw(:invalid_content)
+    end
   end
 
   defp text(%Message{body: nil}), do: ""
 
   defp text(%Message{body: %Content{} = body} = message) do
-    type = Message.header(message, "content-type")
+    type =
+      case Message.header(message, "content-type") do
+        nil ->
+          "text/plain"
 
-    if is_binary(type) and String.starts_with?(String.downcase(type), "text/html") do
-      case HTML.readable(body) do
-        {:ok, text} -> Content.read(text)
-        _ -> throw(:invalid_html)
+        value when is_binary(value) and byte_size(value) <= 4096 ->
+          value |> String.split(";", parts: 2) |> hd() |> String.trim() |> String.downcase()
+
+        _ ->
+          throw(:invalid_content)
       end
-    else
-      String.slice(Content.read(body), 0, 16_000)
+
+    case type do
+      "text/html" ->
+        case HTML.readable(body) do
+          {:ok, text} -> bounded(Content.read(text), 16_000)
+          _ -> throw(:invalid_html)
+        end
+
+      "text/plain" ->
+        bounded(Content.read(body), 16_000)
+
+      _ ->
+        throw(:invalid_content)
     end
   end
 

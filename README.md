@@ -77,3 +77,10 @@ fixed during calls. Only the metadata-only Janitor event above is supported.
 Oversized or structurally excessive HTML is kept as `:unreadable_content` rather
 than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
 normal callers should use `Reviewer.review` to include safeguards and context.
+
+Every actionable INBOX message is included in model context, with recent
+already-done messages filling remaining context slots. More than five actionable
+messages keeps the entire thread. Each header is capped at 4096 bytes and each
+readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
+MIME and encoded email context above 96000 bytes keep the conversation rather
+than submitting an incomplete or oversized review.

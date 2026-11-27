@@ -277,7 +277,7 @@ defmodule EmailJanitor.ModelsTest do
     end
   end
 
-  test "HTML cleanup is case-insensitive and includes only the last five messages" do
+  test "HTML cleanup is case-insensitive and drops older already-done context" do
     Req.Test.stub(__MODULE__, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       refute body =~ "OLD_BODY_SENTINEL"
@@ -298,8 +298,96 @@ defmodule EmailJanitor.ModelsTest do
               body: "<script>SCRIPT_SENTINEL</script><p>Visible pitch</p>"
             )
 
-    messages = [message(body: "OLD_BODY_SENTINEL") | recent]
+    messages = [message(body: "OLD_BODY_SENTINEL", labels: []) | recent]
     assert {:ok, %Decision{}} = run(:azure, messages)
+  end
+
+  test "headers and plain text are byte bounded even for one very long Unicode grapheme" do
+    huge = "VISIBLE_START" <> String.duplicate("\u0301", 100_000) <> "HIDDEN_TAIL_SENTINEL"
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert byte_size(body) < 96_000
+      assert body =~ "VISIBLE_START"
+      refute body =~ "HIDDEN_TAIL_SENTINEL"
+      assert String.valid?(body)
+      azure_response(conn, @decision)
+    end)
+
+    headers = [
+      {"From", "sales@vendor.com"}
+      | for(
+          name <-
+            [
+              "Subject",
+              "To",
+              "Cc",
+              "Delivered-To",
+              "Reply-To",
+              "X-Original-From",
+              "X-Original-Sender"
+            ],
+          do: {name, huge}
+        )
+    ]
+
+    assert {:ok, %Decision{}} = run(:azure, [message(headers: headers, body: huge)])
+  end
+
+  test "ambiguous or unsupported MIME does not reach the provider as raw markup" do
+    requester = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(requester, :invalid_mime_dispatched)
+      azure_response(conn, @decision)
+    end)
+
+    for headers <- [
+          [{"Content-Type", "text/html"}, {"content-type", "text/plain"}],
+          [{"Content-Type", "not a MIME type"}],
+          [{"Content-Type", "text/htmlx"}],
+          [{"Content-Type", "application/octet-stream"}]
+        ] do
+      value =
+        message(
+          headers: [{"From", "sales@vendor.com"} | headers],
+          body: "<script>HIDDEN</script><p>Visible pitch</p>"
+        )
+
+      assert {:keep, :unreadable_content} = run(:azure, [value])
+      refute_receive :invalid_mime_dispatched, 0
+    end
+  end
+
+  test "every actionable message is included even when older than recent context" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert body =~ "OLDER_ACTIONABLE_SENTINEL"
+      assert body =~ "CONTEXT_6"
+      refute body =~ "CONTEXT_1"
+      refute body =~ "CONTEXT_2"
+      azure_response(conn, @decision)
+    end)
+
+    messages = [
+      message(id: "old", body: "OLDER_ACTIONABLE_SENTINEL")
+      | for(n <- 1..6, do: message(id: "context#{n}", labels: [], body: "CONTEXT_#{n}"))
+    ]
+
+    assert {:ok, %Decision{}} = run(:azure, messages)
+  end
+
+  test "more than five actionable messages keeps the whole conversation without dispatch" do
+    requester = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(requester, :unreviewed_targets_dispatched)
+      azure_response(conn, @decision)
+    end)
+
+    messages = for n <- 1..6, do: message(id: "m#{n}")
+    assert {:keep, :unreadable_content} = run(:azure, messages)
+    refute_receive :unreviewed_targets_dispatched, 0
   end
 
   test "contradictory model decisions fail closed" do
