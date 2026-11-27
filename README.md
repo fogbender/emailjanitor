@@ -592,7 +592,7 @@ UUIDs bind the action and exact selection; duplicate or ambiguous effects never
 auto-dispatch again. Proven dead owners with no dispatch marker may be cancelled,
 allowing a fresh explicit request UUID. Overlapping unresolved effects stay blocked.
 
-Hosts pass `authorize: fn -> :ok | {:error, atom} end` and the current
+Hosts must pass `authorize: fn -> :ok | {:error, atom} end` and the current
 `expected_instruction_version:`. Authorization is bounded DB-only work and runs
 again under the final mailbox fence; disconnect must atomically increment that
 mailbox version. An Inbox UUID must retain one immutable Google subject: address
@@ -602,3 +602,27 @@ are frozen and verified before durable admission. Callers must not persist the
 prepared closure. Forget/delete workflows remove manual_restore_protections
 and restore_effects before actions/inboxes. No bodies, search text or tokens
 enter either restoration table.
+
+The source action records the full fresh observed thread IDs. Admission and
+the final dispatch fence both check restoration protections under the mailbox
+lock; a sibling cannot slip through a concurrent restore. Pre-migration prepared
+intents without observed context must cancel and obtain a fresh review.
+
+Only authoritative 401/403/429 responses from the generated SDK's single
+batch-modify call produce an unapplied rejection proof. Those receipts cancel
+and permit a fresh explicit request UUID after repair. Transport failures remain
+ambiguous and never automatically repeat the Gmail mutation.
+
+A successful restore durably records `Effect.applied_at` and the exact original
+action's `restored_message_ids` before reporting settlement. The bounded DB-only
+`on_restored(action_id, exact_ids)` callback can withdraw pending digest activity;
+hosts with digests must wire it. Callback failure preserves positive wire proof.
+`Restore.pending_settlements/3`, `Restore.settle/4` and duplicate-UUID calls retry
+only DB settlement, without Gmail. Requested protections are not positive wire
+evidence; historical action IDs keep an old restore from withdrawing newer work.
+Restoration settlement uses the trusted `policy:` option for exact retirement of
+older pending/cancelled metadata, without charging or refunding quota. It uses
+the positive effect timestamp and per-ID review fences, preserves unrelated IDs
+and newer accepted requests, and never constructs an invented review snapshot.
+Explicit rechecks and changed manual selections atomically fence older reviews;
+ordinary scheduler discovery does not refresh that authority.

@@ -6,6 +6,7 @@ defmodule EmailJanitor.Store.Action do
     field(:inbox_id, :string)
     field(:thread_id, :string)
     field(:message_ids, {:array, :string})
+    field(:observed_message_ids, {:array, :string})
     field(:message_categories, :map, default: %{})
     field(:remaining_metadata_ids, {:array, :string})
     field(:applied_message_ids, {:array, :string}, default: [])

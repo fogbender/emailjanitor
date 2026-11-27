@@ -3,6 +3,11 @@ defmodule EmailJanitor.Restore.Migration do
   use Ecto.Migration
 
   def change do
+    # Nil on old prepared actions: they cannot dispatch without fresh observation.
+    alter table(:actions) do
+      add(:observed_message_ids, {:array, :text})
+    end
+
     create table(:restore_effects, primary_key: false) do
       add(:id, :uuid, primary_key: true)
       add(:inbox_id, references(:inboxes, type: :text), null: false)
@@ -19,6 +24,7 @@ defmodule EmailJanitor.Restore.Migration do
       add(:owner_beam_pid, :binary, null: false)
       add(:lease_expires_at, :utc_datetime_usec, null: false)
       add(:dispatch_started_at, :utc_datetime_usec)
+      add(:applied_at, :utc_datetime_usec)
       timestamps(type: :utc_datetime_usec)
     end
 
@@ -27,7 +33,7 @@ defmodule EmailJanitor.Restore.Migration do
     create(
       constraint(:restore_effects, :valid_restore_state,
         check:
-          "state IN ('intent', 'done', 'cancelled', 'unresolved') AND cardinality(message_ids) BETWEEN 1 AND 5 AND instruction_version > 0"
+          "state IN ('intent', 'done', 'cancelled', 'unresolved') AND cardinality(message_ids) BETWEEN 1 AND 5 AND instruction_version > 0 AND (state != 'done' OR applied_at IS NOT NULL) AND (applied_at IS NULL OR dispatch_started_at IS NOT NULL)"
       )
     )
 
@@ -59,6 +65,7 @@ defmodule EmailJanitor.Restore.Effect do
     field(:owner_beam_pid, :binary)
     field(:lease_expires_at, :utc_datetime_usec)
     field(:dispatch_started_at, :utc_datetime_usec)
+    field(:applied_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
   end
 end

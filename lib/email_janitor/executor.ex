@@ -179,7 +179,7 @@ defmodule EmailJanitor.Executor do
             current,
             gmail,
             options,
-            Keyword.put(opts, :review_started_at, context.started_at)
+            Keyword.put(context.opts, :review_started_at, context.started_at)
           )
       end
     else

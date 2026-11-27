@@ -10,7 +10,7 @@ defmodule EmailJanitor.Restore do
   current `expected_instruction_version`; disconnect must bump that version.
   """
   import Ecto.Query
-  alias EmailJanitor.{Inbox, Owner, Store}
+  alias EmailJanitor.{Inbox, Owner, Store, Policy}
   alias EmailJanitor.Gmail.Parser
   alias EmailJanitor.Store.{Action, Mailbox}
   alias EmailJanitor.Restore.{Effect, Protection}
@@ -30,7 +30,9 @@ defmodule EmailJanitor.Restore do
     :restore_unsupported,
     :dispatch_window_exhausted,
     :outer_transaction,
-    :ownership_lost
+    :ownership_lost,
+    :restore_settlement_pending,
+    :unconfirmed_restoration
   ]
 
   def install(scope), do: normalize_install(Store.install(scope))
@@ -49,13 +51,14 @@ defmodule EmailJanitor.Restore do
     else
       result =
         safe(fn ->
-          with {:ok, effect_id} <- Ecto.UUID.cast(effect_id),
+          with {:ok, authorize} <- authorization_option(options),
+               {:ok, on_restored} <- settlement_option(options),
+               %Policy{} = policy <- Keyword.get(options, :policy, Policy.unlimited()),
+               {:ok, version} <- version(options),
+               {:ok, effect_id} <- Ecto.UUID.cast(effect_id),
                {:ok, action_id} <- Ecto.UUID.cast(action_id),
                true <- valid_ids?(ids),
-               authorize when is_function(authorize, 0) <-
-                 Keyword.get(options, :authorize, fn -> :ok end),
-               :ok <- authorized(authorize),
-               {:ok, version} <- version(scope, inbox, options) do
+               :ok <- authorized(authorize) do
             ids = Enum.sort(ids)
 
             case existing(scope, inbox, effect_id, action_id, ids) do
@@ -65,10 +68,22 @@ defmodule EmailJanitor.Restore do
                        :ok <- Owner.dispatch_window(),
                        {:ok, effect} <-
                          intent(scope, inbox, effect_id, action_id, ids, version, authorize) do
-                    dispatch(scope, inbox, effect, mutation, authorize)
+                    dispatch(scope, inbox, effect, mutation, authorize, on_restored, policy)
                   end
                 end)
                 |> recover_result(scope, inbox, effect_id, action_id, ids)
+
+              {:existing, :unresolved, id} = existing ->
+                case scope.repo.get(Effect, id, prefix: scope.prefix, log: false) do
+                  %Effect{applied_at: %DateTime{}} ->
+                    case settle_effect(scope, inbox, id, authorize, on_restored, policy) do
+                      {:done, ^id} -> {:existing, :done, id}
+                      _ -> existing
+                    end
+
+                  _ ->
+                    existing
+                end
 
               existing ->
                 existing
@@ -81,6 +96,48 @@ defmodule EmailJanitor.Restore do
 
       result
     end
+  end
+
+  @doc "Retry only DB settlement of a positively applied restoration. Never contacts Gmail."
+  def settle(scope, %Inbox{} = inbox, id, options) do
+    if scope.repo.in_transaction?() do
+      {:error, :outer_transaction}
+    else
+      safe(fn ->
+        with {:ok, authorize} <- authorization_option(options),
+             {:ok, on_restored} <- settlement_option(options),
+             %Policy{} = policy <- Keyword.get(options, :policy, Policy.unlimited()),
+             {:ok, id} <- Ecto.UUID.cast(id),
+             :ok <- authorized(authorize) do
+          settle_effect(scope, inbox, id, authorize, on_restored, policy)
+        else
+          {:error, reason} when reason in @errors -> {:error, reason}
+          _ -> {:error, :invalid_restore_selection}
+        end
+      end)
+    end
+  end
+
+  @doc "Bounded metadata-only IDs awaiting DB settlement of positive restore evidence."
+  def pending_settlements(scope, %Inbox{} = inbox, limit \\ 10) do
+    safe(fn ->
+      if is_integer(limit) and limit in 1..100 do
+        {:ok,
+         scope.repo.all(
+           from(e in Effect,
+             where:
+               e.inbox_id == ^inbox.id and e.state == :unresolved and not is_nil(e.applied_at),
+             order_by: [asc: e.updated_at, asc: e.id],
+             limit: ^limit,
+             select: e.id
+           ),
+           prefix: scope.prefix,
+           log: false
+         )}
+      else
+        {:error, :invalid_restore_selection}
+      end
+    end)
   end
 
   defp intent(scope, inbox, id, action_id, ids, version, authorize) do
@@ -160,15 +217,22 @@ defmodule EmailJanitor.Restore do
     end)
   end
 
-  defp dispatch(scope, inbox, effect, mutation, authorize) do
+  defp dispatch(scope, inbox, effect, mutation, authorize, on_restored, policy) do
     result =
       Owner.bounded(fn ->
         case begin_dispatch(scope, inbox, effect, authorize) do
           :ok ->
             case safe(mutation) do
               :ok ->
-                case finish(scope, effect, :done) do
-                  :ok -> {:done, effect.id}
+                case record_applied(scope, inbox, effect) do
+                  :ok -> settle_effect(scope, inbox, effect.id, authorize, on_restored, policy)
+                  _ -> {:unresolved, effect.id}
+                end
+
+              {:rejected, reason}
+              when reason in [:authorization_required, :forbidden, :rate_limited] ->
+                case finish(scope, effect, :cancelled) do
+                  :ok -> {:error, reason}
                   _ -> {:unresolved, effect.id}
                 end
 
@@ -190,6 +254,130 @@ defmodule EmailJanitor.Restore do
 
       result ->
         result
+    end
+  end
+
+  defp record_applied(scope, inbox, effect) do
+    case transaction(scope, fn ->
+           lock_mailbox(scope, inbox)
+
+           action =
+             scope.repo.one!(
+               from(a in Action,
+                 where:
+                   a.id == ^effect.action_id and
+                     a.inbox_id == ^inbox.id,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix,
+               log: false
+             )
+
+           current =
+             scope.repo.one!(
+               from(e in Effect,
+                 where:
+                   e.id == ^effect.id and
+                     e.inbox_id == ^inbox.id,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix,
+               log: false
+             )
+
+           unless current.state == :intent && current.owner_token == effect.owner_token &&
+                    Owner.owns?(current) &&
+                    not is_nil(current.dispatch_started_at),
+                  do: scope.repo.rollback(:ownership_lost)
+
+           applied_at = clock(scope)
+           :ok = Store.fence_restoration(scope, inbox.id, effect.message_ids, applied_at)
+
+           scope.repo.update!(
+             Ecto.Changeset.change(action,
+               restored_message_ids: Enum.uniq(action.restored_message_ids ++ effect.message_ids)
+             ),
+             prefix: scope.prefix,
+             log: false
+           )
+
+           scope.repo.update!(
+             Ecto.Changeset.change(current, applied_at: applied_at, state: :unresolved),
+             prefix: scope.prefix,
+             log: false
+           )
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      error -> error
+    end
+  end
+
+  defp settle_effect(scope, inbox, id, authorize, on_restored, policy) do
+    result =
+      transaction(scope, fn ->
+        lock_mailbox(scope, inbox)
+
+        snapshot =
+          scope.repo.get_by(Effect, [id: id, inbox_id: inbox.id],
+            prefix: scope.prefix,
+            log: false
+          )
+
+        unless snapshot, do: scope.repo.rollback(:unconfirmed_restoration)
+
+        source =
+          scope.repo.one(
+            from(a in Action,
+              where: a.id == ^snapshot.action_id and a.inbox_id == ^inbox.id,
+              lock: "FOR UPDATE"
+            ),
+            prefix: scope.prefix,
+            log: false
+          )
+
+        effect =
+          scope.repo.one(
+            from(e in Effect,
+              where: e.id == ^id and e.inbox_id == ^inbox.id,
+              lock: "FOR UPDATE"
+            ),
+            prefix: scope.prefix,
+            log: false
+          )
+
+        require_authorized!(scope, authorize)
+
+        case effect do
+          %Effect{state: :done} ->
+            :done
+
+          %Effect{state: :unresolved, applied_at: %DateTime{}} ->
+            unless source && Enum.all?(effect.message_ids, &(&1 in source.restored_message_ids)),
+              do: scope.repo.rollback(:unconfirmed_restoration)
+
+            :ok = Store.retire_restored(scope, inbox.id, effect.id, policy)
+
+            unless safe(fn -> on_restored.(effect.action_id, effect.message_ids) end) == :ok,
+              do: scope.repo.rollback(:restore_settlement_pending)
+
+            scope.repo.update!(Ecto.Changeset.change(effect, state: :done),
+              prefix: scope.prefix,
+              log: false
+            )
+
+            :done
+
+          _ ->
+            scope.repo.rollback(:unconfirmed_restoration)
+        end
+      end)
+
+    case result do
+      {:ok, :done} -> {:done, id}
+      {:error, :unconfirmed_restoration} = error -> error
+      _ -> {:unresolved, id}
     end
   end
 
@@ -339,6 +527,9 @@ defmodule EmailJanitor.Restore do
           effect.state == :done ->
             {:done, id}
 
+          effect.state == :cancelled ->
+            error
+
           not is_nil(effect.dispatch_started_at) ->
             {:unresolved, id}
 
@@ -396,10 +587,23 @@ defmodule EmailJanitor.Restore do
     end
   end
 
-  defp version(scope, inbox, options) do
+  defp settlement_option(options) do
+    case Keyword.get(options, :on_restored, fn _, _ -> :ok end) do
+      callback when is_function(callback, 2) -> {:ok, callback}
+      _ -> {:error, :invalid_restore_selection}
+    end
+  end
+
+  defp authorization_option(options) do
+    case Keyword.fetch(options, :authorize) do
+      {:ok, authorize} when is_function(authorize, 0) -> {:ok, authorize}
+      _ -> {:error, :authorization_required}
+    end
+  end
+
+  defp version(options) do
     case Keyword.fetch(options, :expected_instruction_version) do
       {:ok, version} when is_integer(version) and version > 0 -> {:ok, version}
-      :error -> Store.instruction_version(scope, inbox.id)
       _ -> {:error, :invalid_restore_selection}
     end
   end

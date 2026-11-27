@@ -78,9 +78,10 @@ defmodule EmailJanitor.RestoreTest do
         ctx.action_id,
         ["message-1"],
         ctx.gmail,
-        [expected_instruction_version: 1] ++ options
+        Keyword.merge(trusted_options(), options)
       )
 
+  defp trusted_options, do: [authorize: fn -> :ok end, expected_instruction_version: 1]
   defp effects(ctx), do: Repo.all(Effect, prefix: ctx.scope.prefix)
   defp read(ctx), do: Agent.get(ctx.state, & &1)
 
@@ -107,7 +108,7 @@ defmodule EmailJanitor.RestoreTest do
     assert Enum.sort(first.labels) == ["IMPORTANT", "INBOX", "UNREAD"]
     assert second.labels == ["UNREAD", "IMPORTANT"]
     assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).state == :done
-    assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).restored_message_ids == []
+    assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).restored_message_ids == ["message-1"]
 
     assert Repo.all(Protection, prefix: ctx.scope.prefix) |> Enum.map(& &1.message_id) == [
              "message-1"
@@ -125,7 +126,8 @@ defmodule EmailJanitor.RestoreTest do
                ctx.effect_id,
                ctx.action_id,
                ["message-1", "message-1"],
-               ctx.gmail
+               ctx.gmail,
+               trusted_options()
              )
 
     assert {:error, :unconfirmed_suppression} =
@@ -135,7 +137,8 @@ defmodule EmailJanitor.RestoreTest do
                ctx.effect_id,
                ctx.action_id,
                ["not-janitor-applied"],
-               ctx.gmail
+               ctx.gmail,
+               trusted_options()
              )
 
     assert effects(ctx) == [] and read(ctx).restores == []
@@ -148,7 +151,8 @@ defmodule EmailJanitor.RestoreTest do
                ctx.effect_id,
                ctx.action_id,
                ["message-2"],
-               ctx.gmail
+               ctx.gmail,
+               trusted_options()
              )
 
     assert read(ctx).restores == [["message-1"]]
@@ -164,7 +168,8 @@ defmodule EmailJanitor.RestoreTest do
                ctx.effect_id,
                ctx.action_id,
                ["message-1"],
-               ctx.gmail
+               ctx.gmail,
+               trusted_options()
              )
 
     assert {:error, :connection_changed} =
@@ -232,7 +237,8 @@ defmodule EmailJanitor.RestoreTest do
                second.effect_id,
                second.action_id,
                ["message-2"],
-               second.gmail
+               second.gmail,
+               trusted_options()
              )
 
     assert {:existing, :unresolved, ^dead_id} =
@@ -242,7 +248,8 @@ defmodule EmailJanitor.RestoreTest do
                second.effect_id,
                second.action_id,
                ["message-2"],
-               second.gmail
+               second.gmail,
+               trusted_options()
              )
 
     assert Enum.sort(MapSet.to_list(Store.restored_ids(ctx.scope, ctx.box.id))) == [
@@ -342,7 +349,8 @@ defmodule EmailJanitor.RestoreTest do
                ctx.effect_id,
                ctx.action_id,
                ["message-1"],
-               ctx.gmail
+               ctx.gmail,
+               trusted_options()
              )
 
     assert {:done, _} = restore(ctx)
@@ -429,6 +437,305 @@ defmodule EmailJanitor.RestoreTest do
         )
   end
 
+  test "missing host guards fail before provider work", ctx do
+    gmail = {__MODULE__.Gmail, [state: ctx.state, on_prepare: fn -> flunk("no credentials") end]}
+
+    assert {:error, :authorization_required} =
+             Restore.apply(ctx.scope, ctx.box, ctx.effect_id, ctx.action_id, ["message-1"], gmail)
+
+    assert {:error, :invalid_restore_selection} =
+             Restore.apply(ctx.scope, ctx.box, ctx.effect_id, ctx.action_id, ["message-1"], gmail,
+               authorize: fn -> flunk("missing version checked first") end
+             )
+
+    assert effects(ctx) == [] and read(ctx).restores == []
+
+    assert {:error, :authorization_required} =
+             Restore.settle(ctx.scope, ctx.box, ctx.effect_id, [])
+
+    assert {:error, :invalid_restore_selection} =
+             Restore.settle(ctx.scope, ctx.box, "not-a-uuid", trusted_options())
+  end
+
+  for reason <- [:authorization_required, :forbidden, :rate_limited] do
+    test "authoritative #{reason} rejection permits a fresh explicit request", ctx do
+      reason = unquote(reason)
+      Agent.update(ctx.state, &%{&1 | mode: {:rejected, reason}})
+      assert {:error, ^reason} = restore(ctx)
+
+      assert [%Effect{state: :cancelled, applied_at: nil, dispatch_started_at: %DateTime{}}] =
+               effects(ctx)
+
+      assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).restored_message_ids == []
+      assert {:existing, :cancelled, _} = restore(ctx)
+      assert read(ctx).restores == [["message-1"]]
+      refute "INBOX" in hd(read(ctx).messages).labels
+      Agent.update(ctx.state, &%{&1 | mode: :ok})
+      assert {:done, _} = restore(%{ctx | effect_id: Ecto.UUID.generate()})
+      assert read(ctx).restores == [["message-1"], ["message-1"]]
+    end
+  end
+
+  test "positive wire proof survives callback failure and DB-only retry never resends", ctx do
+    parent = self()
+
+    failure = fn action, ids ->
+      send(parent, {:settling, action, ids})
+      assert Store.get(ctx.scope, ctx.box.id, action).restored_message_ids == ["message-1"]
+      {:error, :synthetic_callback_failure}
+    end
+
+    assert {:unresolved, id} = restore(ctx, on_restored: failure)
+    assert_receive {:settling, action, ["message-1"]}
+    assert action == ctx.action_id
+    assert [%Effect{state: :unresolved, applied_at: %DateTime{}}] = effects(ctx)
+    assert {:ok, [^id]} = Restore.pending_settlements(ctx.scope, ctx.box)
+    assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).state == :done
+
+    assert {:existing, :done, ^id} =
+             restore(ctx,
+               on_restored: fn action, ids ->
+                 assert action == ctx.action_id and ids == ["message-1"]
+                 :ok
+               end
+             )
+
+    assert read(ctx).restores == [["message-1"]]
+    assert {:ok, []} = Restore.pending_settlements(ctx.scope, ctx.box)
+    assert {:done, ^id} = Restore.settle(ctx.scope, ctx.box, id, trusted_options())
+    assert read(ctx).restores == [["message-1"]]
+  end
+
+  test "DB-only settle retries a persisted positive result after its owner exits", ctx do
+    assert {:unresolved, id} =
+             restore(ctx, on_restored: fn _, _ -> raise "PRIVATE_CALLBACK_FAILURE" end)
+
+    assert {:done, ^id} = Restore.settle(ctx.scope, ctx.box, id, trusted_options())
+    assert read(ctx).restores == [["message-1"]]
+    assert [%Effect{state: :done, applied_at: %DateTime{}}] = effects(ctx)
+  end
+
+  test "restoration between safeguard read and admission fences a newly arrived sibling", ctx do
+    Agent.update(ctx.state, &%{&1 | messages: &1.messages ++ [Fixtures.message(id: "message-3")]})
+    gmail = {EmailJanitor.TestGmail, [state: ctx.state]}
+
+    assert {:ok, proposal} =
+             Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               gmail,
+               {EmailJanitor.TestClassifier, []},
+               "Synthetic instructions",
+               1
+             )
+
+    assert proposal.message_ids == ["message-3"]
+    parent = self()
+
+    history_hook = fn ->
+      task = Task.async(fn -> restore(ctx) end)
+      assert {:done, _} = Task.await(task, 5_000)
+      send(parent, :restored_after_safeguards)
+    end
+
+    result =
+      Executor.execute(
+        ctx.scope,
+        ctx.box,
+        proposal,
+        {EmailJanitor.TestGmail, [state: ctx.state, history_hook: history_hook]}
+      )
+
+    assert result in [{:error, :proposal_changed}, {:skip, :proposal_changed}]
+    assert_received :restored_after_safeguards
+    assert length(Repo.all(EmailJanitor.Store.Action, prefix: ctx.scope.prefix)) == 1
+    assert "INBOX" in Enum.find(read(ctx).messages, &(&1.id == "message-3")).labels
+    assert read(ctx).calls == [["message-1", "message-2"]]
+  end
+
+  test "a concurrent restoration after intent defeats the final dispatch fence", ctx do
+    Agent.update(ctx.state, &%{&1 | messages: &1.messages ++ [Fixtures.message(id: "message-3")]})
+    gmail = {EmailJanitor.TestGmail, [state: ctx.state]}
+
+    assert {:ok, proposal} =
+             Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               gmail,
+               {EmailJanitor.TestClassifier, []},
+               "Synthetic instructions",
+               1
+             )
+
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        EmailJanitor.Owner.run(fn ->
+          assert {:ok, {:created, action}} =
+                   Store.intent(ctx.scope, ctx.box.id, proposal, "100",
+                     observed_message_ids: ["message-1", "message-2", "message-3"]
+                   )
+
+          send(parent, {:intent, self(), action.id})
+
+          receive do
+            :dispatch -> :ok
+          after
+            5_000 -> flunk("dispatch not released")
+          end
+
+          assert {:error, :proposal_changed} =
+                   Store.begin_dispatch(ctx.scope, ctx.box.id, action.id, action.owner_token)
+
+          assert :ok = Store.cancel_prepared(ctx.scope, ctx.box.id, action.id, action.owner_token)
+          :ok
+        end)
+      end)
+
+    assert_receive {:intent, owner, action_id}, 2_000
+
+    assert Store.get(ctx.scope, ctx.box.id, action_id).observed_message_ids == [
+             "message-1",
+             "message-2",
+             "message-3"
+           ]
+
+    assert {:done, _} = restore(ctx)
+    send(owner, :dispatch)
+    assert :ok = Task.await(task, 5_000)
+    assert Store.get(ctx.scope, ctx.box.id, action_id).dispatch_started_at == nil
+    assert "INBOX" in Enum.find(read(ctx).messages, &(&1.id == "message-3")).labels
+  end
+
+  test "unobserved pre-M7 prepared intents cannot dispatch even without restoration", ctx do
+    Agent.update(ctx.state, &%{&1 | messages: &1.messages ++ [Fixtures.message(id: "message-3")]})
+
+    assert {:ok, proposal} =
+             Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               {EmailJanitor.TestGmail, [state: ctx.state]},
+               {EmailJanitor.TestClassifier, []},
+               "Synthetic instructions",
+               1
+             )
+
+    assert :ok =
+             EmailJanitor.Owner.run(fn ->
+               assert {:ok, {:created, action}} =
+                        Store.intent(ctx.scope, ctx.box.id, proposal, "100")
+
+               Repo.update!(Ecto.Changeset.change(action, observed_message_ids: nil),
+                 prefix: ctx.scope.prefix
+               )
+
+               assert {:error, :proposal_changed} =
+                        Store.begin_dispatch(ctx.scope, ctx.box.id, action.id, action.owner_token)
+
+               :ok
+             end)
+
+    assert "INBOX" in Enum.find(read(ctx).messages, &(&1.id == "message-3")).labels
+  end
+
+  test "settlement retires only older exact candidate metadata and preserves newer reviews",
+       ctx do
+    old = seed_candidate(ctx, ["message-1", "message-3"], -60)
+    policy = %EmailJanitor.Policy{adapter: __MODULE__.Policy, context: self()}
+
+    assert {:unresolved, effect_id} =
+             restore(ctx,
+               policy: policy,
+               on_restored: fn _, _ -> {:error, :retry_later} end
+             )
+
+    # Reporting failure rolls back metadata retirement but not the positive wire proof.
+    assert Repo.get!(EmailJanitor.Store.Candidate, old.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["message-1", "message-3"]
+
+    assert_received {:retired, :exact, old_id, ["message-1"]}
+    assert old_id == old.id
+    newer = seed_candidate(ctx, ["message-1", "message-4"], 0)
+    [effect] = effects(ctx)
+    assert DateTime.compare(newer.updated_at, effect.applied_at) == :gt
+
+    assert {:done, ^effect_id} =
+             Restore.settle(
+               ctx.scope,
+               ctx.box,
+               effect_id,
+               Keyword.put(trusted_options(), :policy, policy)
+             )
+
+    assert_received {:retired, :exact, ^old_id, ["message-1"]}
+    newer_id = newer.id
+    refute_received {:retired, _, ^newer_id, _}
+
+    assert Repo.get!(EmailJanitor.Store.Candidate, old.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["message-3"]
+
+    assert Repo.get!(EmailJanitor.Store.Candidate, newer.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["message-1", "message-4"]
+
+    assert read(ctx).restores == [["message-1"]]
+  end
+
+  test "a trusted requeue after applied_at survives a delayed old restoration settlement", ctx do
+    :ok = EmailJanitor.Worker.install(ctx.scope)
+    candidate = seed_candidate(ctx, ["message-1", "message-3"], -60)
+
+    Repo.insert!(
+      %EmailJanitor.Worker.Candidate{
+        inbox_id: ctx.box.id,
+        candidate_id: candidate.id,
+        generation: Ecto.UUID.generate(),
+        thread_id: "thread-1",
+        message_ids: candidate.message_ids,
+        inserted_at: candidate.inserted_at,
+        updated_at: candidate.updated_at
+      },
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:unresolved, effect_id} =
+             restore(ctx, on_restored: fn _, _ -> {:error, :retry_later} end)
+
+    assert :ok = EmailJanitor.Worker.queue_recheck(ctx.scope, ctx.box, candidate.id)
+    assert {:done, ^effect_id} = Restore.settle(ctx.scope, ctx.box, effect_id, trusted_options())
+
+    assert Repo.get!(EmailJanitor.Store.Candidate, candidate.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["message-1", "message-3"]
+
+    assert [%EmailJanitor.Worker.Candidate{requested: true, request_version: 2}] =
+             Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx).restores == [["message-1"]]
+  end
+
+  defp seed_candidate(ctx, ids, seconds) do
+    %{rows: [[now]]} = Ecto.Adapters.SQL.query!(Repo, "SELECT clock_timestamp()", [], log: false)
+    at = DateTime.add(now, seconds)
+    ids = Enum.sort(ids)
+
+    Repo.insert!(
+      %EmailJanitor.Store.Candidate{
+        inbox_id: ctx.box.id,
+        thread_id: "thread-1",
+        message_ids: ids,
+        remaining_message_ids: ids,
+        evaluated_message_ids: ids,
+        message_key: :crypto.hash(:sha256, :erlang.term_to_binary(ids)),
+        inserted_at: at,
+        updated_at: at
+      },
+      prefix: ctx.scope.prefix
+    )
+  end
+
   test "errors and ordinary inspection expose no transient contents or raw provider failures",
        ctx do
     import ExUnit.CaptureLog
@@ -447,6 +754,19 @@ defmodule EmailJanitor.RestoreTest do
   end
 end
 
+defmodule EmailJanitor.RestoreTest.Policy do
+  @behaviour EmailJanitor.Policy
+  def reserve(_, _, _, _, _), do: :ok
+  def settle(_, _, _, _), do: :ok
+  def retire_candidate(owner, _, id, ids), do: retire(owner, :whole, id, ids)
+  def retire_candidate_messages(owner, _, id, ids), do: retire(owner, :exact, id, ids)
+
+  defp retire(owner, mode, id, ids) do
+    send(owner, {:retired, mode, id, ids})
+    :ok
+  end
+end
+
 defmodule EmailJanitor.RestoreTest.Repo do
   use Ecto.Repo, otp_app: :email_janitor, adapter: Ecto.Adapters.Postgres
 end
@@ -460,14 +780,22 @@ defmodule EmailJanitor.RestoreTest.Gmail do
        if callback = opts[:before_wire], do: callback.()
 
        Agent.get_and_update(opts[:state], fn state ->
+         rejected? = match?({:rejected, _}, state.mode)
+
          messages =
            Enum.map(state.messages, fn message ->
-             if message.id in ids,
+             if message.id in ids and not rejected?,
                do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
                else: message
            end)
 
-         result = if state.mode == :timeout, do: {:error, :timeout}, else: :ok
+         result =
+           case state.mode do
+             :timeout -> {:error, :timeout}
+             {:rejected, _} = rejected -> rejected
+             _ -> :ok
+           end
+
          {result, %{state | messages: messages, restores: state.restores ++ [ids]}}
        end)
      end}

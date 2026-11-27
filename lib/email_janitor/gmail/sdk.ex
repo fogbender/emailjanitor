@@ -266,9 +266,17 @@ defmodule EmailJanitor.Gmail.SDK do
              end) do
         :ok
       else
-        {:error, :unsafe_http_observers} -> {:error, :gmail_unavailable}
-        {:error, _} = error -> error
-        _ -> {:error, :gmail_unavailable}
+        {:error, :unsafe_http_observers} ->
+          {:error, :gmail_unavailable}
+
+        {:error, reason} when reason in [:authorization_required, :forbidden, :rate_limited] ->
+          {:rejected, reason}
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          {:error, :gmail_unavailable}
       end
     end)
   end
@@ -696,10 +704,21 @@ defmodule EmailJanitor.Gmail.SDK do
 
   defp guarded(fun) do
     case fun.() do
-      :ok -> :ok
-      {:ok, _} = result -> result
-      {:error, _} = error -> error
-      _ -> {:error, :gmail_unavailable}
+      :ok ->
+        :ok
+
+      {:ok, _} = result ->
+        result
+
+      {:rejected, reason} = proof
+      when reason in [:authorization_required, :forbidden, :rate_limited] ->
+        proof
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :gmail_unavailable}
     end
   rescue
     _ -> {:error, :gmail_unavailable}

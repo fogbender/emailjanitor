@@ -169,6 +169,22 @@ defmodule EmailJanitor.GmailSDKTest do
              SDK.prepare_add_inbox("inbox-1", ["message-1", "message-1"], options())
   end
 
+  test "only authoritative SDK HTTP rejections prove restoration unapplied" do
+    for {status, reason} <- [
+          {401, :authorization_required},
+          {403, :forbidden},
+          {429, :rate_limited}
+        ] do
+      mock(fn env ->
+        assert String.ends_with?(env.url, "/messages/batchModify")
+        Tesla.Mock.json(%{"error" => %{"message" => "PRIVATE_REJECTION_BODY"}}, status: status)
+      end)
+
+      assert {:ok, dispatch} = SDK.prepare_add_inbox("inbox-1", ["message-1"], options())
+      assert {:rejected, ^reason} = dispatch.()
+    end
+  end
+
   test "configured inbox ID mismatch never resolves tokens or contacts Google" do
     resolver = fn -> flunk("wrong inbox must not resolve credentials") end
     {:ok, config} = Config.new(inbox(), resolver, adapter: Tesla.Mock)

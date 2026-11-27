@@ -1532,7 +1532,9 @@ defmodule EmailJanitor.WorkerTest do
                Repo.all(Candidate, prefix: ctx.scope.prefix)
 
       assert "message-2" in ids
-      if unquote(mode == :keep), do: assert(ids == ["message-2"])
+      # The newer explicit selection fences the old Keep itself, as well as
+      # its stale worker completion; both IDs await the fresh request.
+      assert Enum.sort(ids) == ["message-1", "message-2"]
       Agent.update(ctx.state, &%{&1 | model: :done})
       Agent.update(ctx.quota, &%{&1 | block: nil})
       assert {:ok, %{status: :done}} = Worker.step(%{config | classifier: ctx.config.classifier})
