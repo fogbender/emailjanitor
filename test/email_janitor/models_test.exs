@@ -26,7 +26,8 @@ defmodule EmailJanitor.ModelsTest do
          provider,
          messages \\ [message(body: "PRIVATE_BODY_SENTINEL")],
          box \\ inbox(),
-         instructions \\ "Keep requested customer conversations."
+         instructions \\ "Keep requested customer conversations.",
+         targets? \\ false
        ) do
     credentials = fn "us-east-1" ->
       {:ok,
@@ -38,7 +39,9 @@ defmodule EmailJanitor.ModelsTest do
        ]}
     end
 
-    Classifier.propose(
+    classify = if targets?, do: &Classifier.propose_targets/4, else: &Classifier.propose/4
+
+    classify.(
       {SDK,
        [
          config: config(provider),
@@ -78,6 +81,98 @@ defmodule EmailJanitor.ModelsTest do
     })
   end
 
+  test "one Azure request classifies explicit targets and treats other INBOX messages as context" do
+    requester = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(requester, :target_model_request)
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+      [_, user] = request["messages"]
+
+      payload =
+        user["content"] |> String.replace_prefix("UNTRUSTED_EMAIL_JSON:\n", "") |> Jason.decode!()
+
+      assert Enum.find(payload, &(&1["message_id"] == "old-context"))["in_inbox"]
+      refute Enum.find(payload, &(&1["message_id"] == "old-context"))["cleanup_target"]
+      assert Enum.find(payload, &(&1["message_id"] == "pitch"))["cleanup_target"]
+
+      azure_response(conn, %{
+        "decisions" => [
+          Map.put(@decision, "message_id", "pitch"),
+          %{
+            "message_id" => "keep",
+            "action" => "keep",
+            "confidence" => "high",
+            "category" => "legitimate"
+          }
+        ]
+      })
+    end)
+
+    messages = [
+      %{message(id: "old-context") | cleanup_target: false},
+      %{message(id: "pitch") | cleanup_target: true},
+      %{message(id: "keep") | cleanup_target: true}
+    ]
+
+    assert {:ok, %{"pitch" => %Decision{action: :done}, "keep" => %Decision{action: :keep}}} =
+             run(:azure, messages, inbox(), "", true)
+
+    assert_receive :target_model_request
+    refute_receive :target_model_request, 0
+  end
+
+  test "context-only INBOX volume cannot crowd an eligible target out of the bounded model input" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert body =~ "ELIGIBLE_TARGET_BODY"
+      refute body =~ "DROPPED_CONTEXT_BODY"
+      azure_response(conn, %{"decisions" => [Map.put(@decision, "message_id", "target")]})
+    end)
+
+    messages = [
+      %{message(id: "target", body: "ELIGIBLE_TARGET_BODY") | cleanup_target: true},
+      %{message(id: "old-context", body: "DROPPED_CONTEXT_BODY") | cleanup_target: false}
+      | for(n <- 1..4, do: %{message(id: "context-#{n}") | cleanup_target: false})
+    ]
+
+    assert {:ok, %{"target" => %Decision{action: :done}}} =
+             run(:azure, messages, inbox(), "", true)
+  end
+
+  test "Bedrock gets the explicit per-target output schema without executable tools" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+      assert request["toolConfig"] in [nil, %{}]
+      assert body =~ "OUTPUT_SCHEMA_JSON"
+      assert body =~ "decisions"
+
+      Req.Test.json(conn, %{
+        output: %{
+          message: %{
+            role: "assistant",
+            content: [
+              %{
+                text:
+                  Jason.encode!(%{"decisions" => [Map.put(@decision, "message_id", "target")]})
+              }
+            ]
+          }
+        },
+        stopReason: "end_turn",
+        usage: %{inputTokens: 100, outputTokens: 30, totalTokens: 130},
+        metrics: %{latencyMs: 1}
+      })
+    end)
+
+    messages = [%{message(id: "target") | cleanup_target: true}]
+
+    assert {:ok, %{"target" => %Decision{action: :done}}} =
+             run(:bedrock, messages, inbox(), "", true)
+  end
+
   test "Azure SDK routes through configured deployment and keeps body transient" do
     Req.Test.stub(__MODULE__, fn conn ->
       assert conn.host == "janitor-test.openai.azure.com"
@@ -86,6 +181,13 @@ defmodule EmailJanitor.ModelsTest do
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       assert body =~ "PRIVATE_BODY_SENTINEL"
       request = Jason.decode!(body)
+      system = hd(request["messages"])["content"]
+
+      assert system =~
+               "USER_PREFERENCES:\nKeep requested customer conversations.\nOUTPUT_SCHEMA_JSON:"
+
+      assert system =~ "SELECTED_INBOX_JSON:"
+
       assert request["store"] in [nil, false]
       assert get_in(request, ["tool_choice", "function", "name"]) == "structured_output"
       assert [tool] = request["tools"]

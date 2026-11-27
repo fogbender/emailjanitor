@@ -12,6 +12,19 @@ defmodule EmailJanitor.Decision do
     "user_instruction" => :user_instruction
   }
 
+  def schema do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ["action", "confidence", "category"],
+      "properties" => %{
+        "action" => %{"type" => "string", "enum" => Map.keys(@actions)},
+        "confidence" => %{"type" => "string", "enum" => Map.keys(@confidence)},
+        "category" => %{"type" => "string", "enum" => Map.keys(@categories)}
+      }
+    }
+  end
+
   def parse(json) when is_binary(json) and byte_size(json) <= 2048 do
     with {:ok, value} <- Jason.decode(json) do
       parse(value)
