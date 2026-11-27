@@ -29,6 +29,40 @@
             beam = pkgs.beam.packages.erlang_28;
             src = ./.;
           };
+          reply-parser = pkgs.buildNpmPackage {
+            pname = "emailjanitor-reply-parser";
+            version = "0.1.0";
+            src = ./bridge/reply-parser;
+            nodejs = pkgs.nodejs_22;
+            npmDepsHash = "sha256-mhHUA91Z6UddfoicT5omZRB7CG5S3kCJfnIASuFnC1M=";
+            npmFlags = [ "--ignore-scripts" ];
+            dontNpmBuild = true;
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+            doCheck = true;
+            checkPhase = "npm test";
+            postInstall = ''
+              rm "$out/bin/emailjanitor-reply-parser"
+              makeBinaryWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-reply-parser" \
+                --add-flags "-i ${pkgs.nodejs_22}/bin/node --max-old-space-size=64 $out/lib/node_modules/@emailjanitor/reply-parser/cli.mjs"
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              printf 'exit 90\n' >parser.bash-env
+              printf '%s\n' '{"body":"Mark Bob Done","subject":"Janitor","reply_expected":false}' | \
+                NODE_OPTIONS='--require=/nonexistent-emailjanitor-module' \
+                BASH_ENV="$PWD/parser.bash-env" NODE_DEBUG='*' \
+                "$out/bin/emailjanitor-reply-parser" >parser.stdout 2>parser.stderr
+              test ! -s parser.stderr
+              grep -q '"authored":"Mark Bob Done"' parser.stdout
+              runHook postInstallCheck
+            '';
+            meta = {
+              description = "Bounded stdin/stdout-only maintained email reply and forward parser";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "emailjanitor-reply-parser";
+            };
+          };
           google-auth-bridge = pkgs.buildNpmPackage {
             pname = "emailjanitor-google-token";
             version = "0.1.0";
@@ -112,6 +146,7 @@
               git
               jq
               nodejs_22
+              (self.packages.${system}.reply-parser)
               opentofu
               sops
             ];
