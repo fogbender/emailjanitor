@@ -14,7 +14,7 @@ inside an optional module.
 | 5 | Daily digest metadata | `Digest.install/1` |
 | 6 | Target categories, remaining candidate/cancelled metadata and review fences | `Store.install/1` |
 | 7 | Restoration intent metadata | Restoration installer (in development) |
-| 8 | Conversation effect receipts and latest references | Conversation installer (in development) |
+| 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
 | 9 | Conversation execution ownership | Conversation installer (in development) |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
