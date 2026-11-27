@@ -7,7 +7,7 @@ process.on('unhandledRejection',fail);
 process.stdin.on('data', chunk => {
   if (finished) return;
   input = Buffer.concat([input, chunk]);
-  if (input.length > 3_000_000) { fail(); process.stdin.destroy(); return; }
+  if (input.length > 512_000) { fail(); process.stdin.destroy(); return; }
   const newline=input.indexOf(10);
   if (newline < 0) return;
   if (newline !== input.length-1) { fail(); process.stdin.destroy(); return; }

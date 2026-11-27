@@ -275,6 +275,94 @@ defmodule EmailJanitor.WorkerTest do
     assert read(ctx.state).model_inputs == [["message-1"]]
   end
 
+  for scenario <- [:sent, :draft, :own_domain, :contacted] do
+    sender = if scenario == :own_domain, do: "janitor@acme.com", else: "janitor@emailjanitor.net"
+
+    labels =
+      if scenario in [:sent, :draft],
+        do: ["INBOX", String.upcase(Atom.to_string(scenario))],
+        else: ["INBOX"]
+
+    contacts = if scenario == :contacted, do: ["emailjanitor.net"], else: []
+
+    test "verified #{scenario} self-mail never shields ordinary siblings, unverified mail retains safeguards",
+         ctx do
+      sender = unquote(sender)
+      labels = unquote(labels)
+
+      delivery =
+        Fixtures.message(
+          id: "digest",
+          from: sender,
+          labels: labels,
+          headers: [{"From", sender}, {"Message-ID", "<recorded@ses.example>"}]
+        )
+
+      Agent.update(ctx.state, fn state ->
+        state
+        |> Map.put(:messages, [delivery, Fixtures.message()])
+        |> Map.put(:arrivals, %{"100" => %{through: "101", ids: ["digest", "message-1"]}})
+        |> Map.put(
+          :contacts,
+          MapSet.new(unquote(contacts))
+        )
+      end)
+
+      # Sender alone, including a Janitor-looking sender, never grants exemption.
+      assert {:ok, %{status: :kept}} = Worker.step(ctx.config)
+      assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+
+      # Newly observed sibling IDs exercise fresh admission, rather than reviving
+      # manually/previously processed arrivals after changing proof.
+      sibling = Fixtures.message(id: "new-pitch")
+
+      Agent.update(
+        ctx.state,
+        &%{
+          &1
+          | messages: [delivery, sibling],
+            arrivals: %{"101" => %{through: "102", ids: ["new-pitch"]}}
+        }
+      )
+
+      config = %{
+        ctx.config
+        | self_mail: fn headers -> {:ok, {"Message-ID", "<recorded@ses.example>"} in headers} end
+      }
+
+      assert {:ok, %{status: :done}} = Worker.step(config)
+      assert read(ctx.state).model_inputs == [["new-pitch"]]
+      assert read(ctx.state).mutations == [["new-pitch"]]
+      assert "INBOX" in hd(read(ctx.state).messages).labels
+    end
+  end
+
+  test "filtering verified SENT self-mail still checks the ordinary sibling's sent history",
+       ctx do
+    delivery =
+      Fixtures.message(
+        id: "digest",
+        labels: ["SENT"],
+        headers: [{"From", "janitor@emailjanitor.net"}, {"Message-ID", "<recorded@ses.example>"}]
+      )
+
+    Agent.update(
+      ctx.state,
+      &Map.merge(&1, %{
+        messages: [delivery, Fixtures.message()],
+        contacts: MapSet.new(["vendor.com"])
+      })
+    )
+
+    config = %{
+      ctx.config
+      | self_mail: fn headers -> {:ok, {"Message-ID", "<recorded@ses.example>"} in headers} end
+    }
+
+    assert {:ok, %{status: :kept}} = Worker.step(config)
+    assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+  end
+
   test "unavailable self-mail evidence fails closed without retiring or changing mail", ctx do
     import ExUnit.CaptureLog
     config = %{ctx.config | self_mail: fn _ -> raise "PRIVATE_RECEIPT_FAILURE" end}
@@ -334,6 +422,145 @@ defmodule EmailJanitor.WorkerTest do
     assert current.cursor == "100" and current.baseline_id == "100"
     assert current.generation == original.generation
     assert :renew in read(ctx.state).calls
+  end
+
+  test "failed watch renewal backs off independently while periodic history cleanup continues",
+       ctx do
+    Agent.update(ctx.state, &%{&1 | arrivals: %{}})
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    {:ok, original} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+    advance(ctx.clock, 43_201)
+    Agent.update(ctx.state, &%{&1 | arrivals: %{"100" => %{through: "101", ids: ["message-1"]}}})
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, renew_error: :forbidden]}}
+
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert read(ctx.state).mutations == [["message-1"]]
+
+    assert [%EmailJanitor.Worker.Watch{attempts: 1, next_attempt_at: %DateTime{}}] =
+             Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
+
+    assert {:ok, %{status: :idle}} = Worker.step(config)
+    assert Enum.count(read(ctx.state).calls, &(&1 == :renew)) == 1
+
+    advance(ctx.clock, 3_601)
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+
+    assert [%EmailJanitor.Worker.Watch{attempts: 0, next_attempt_at: nil}] =
+             Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
+
+    {:ok, current} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+
+    assert current.generation == original.generation and
+             current.baseline_id == original.baseline_id
+
+    assert current.cursor == "101"
+  end
+
+  test "watch retry counters and their due timestamps are database constrained", ctx do
+    Agent.update(ctx.state, &%{&1 | arrivals: %{}})
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    future = DateTime.add(DateTime.utc_now(), 60)
+
+    for {attempts, next} <- [{-1, nil}, {17, future}, {1, nil}, {0, future}] do
+      assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+               Ecto.Adapters.SQL.query(
+                 Repo,
+                 ~s|UPDATE "#{ctx.scope.prefix}".janitor_worker_watches SET attempts=$1, next_attempt_at=$2 WHERE inbox_id=$3|,
+                 [attempts, next, ctx.box.id],
+                 log: false
+               )
+    end
+
+    assert [%EmailJanitor.Worker.Watch{attempts: 0, next_attempt_at: nil}] =
+             Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
+  end
+
+  for {stage, expected} <- [
+        {:thread_id_error, :gmail_unavailable},
+        {:snapshot_error, :gmail_unavailable},
+        {:full_thread_error, :eligibility_unavailable}
+      ] do
+    test "profile 404 at #{stage} preserves the arrival for provider recovery", ctx do
+      options = Keyword.put([state: ctx.state], unquote(stage), :not_found)
+      config = %{ctx.config | gmail: {Gmail, options}}
+      assert {:ok, %{status: unquote(expected)}} = Worker.step(config)
+      assert {:ok, [_]} = pending(ctx)
+      assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+    end
+  end
+
+  for {stage, reason} <- [
+        {:thread_id_error, :message_not_found},
+        {:snapshot_error, :thread_not_found},
+        {:full_thread_error, :thread_not_found}
+      ] do
+    test "only typed deletion #{stage} retires that arrival", ctx do
+      options = Keyword.put([state: ctx.state], unquote(stage), unquote(reason))
+      config = %{ctx.config | gmail: {Gmail, options}}
+      assert {:ok, %{status: :skipped}} = Worker.step(config)
+      assert {:ok, []} = pending(ctx)
+      assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+    end
+  end
+
+  test "recheck profile 404 keeps durable provenance requested for retry", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_error: :not_found]}}
+    assert {:ok, %{status: :gmail_unavailable}} = Worker.step(config)
+
+    assert [%Candidate{requested: true, status: :pending, attempts: 1}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx.state).mutations == []
+  end
+
+  test "typed thread deletion on the review fetch after eligibility retires the arrival", ctx do
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, full_thread_error_at: 2]}}
+    assert {:ok, %{status: :skipped}} = Worker.step(config)
+    assert {:ok, []} = pending(ctx)
+    assert read(ctx.state).full_thread_count == 2
+    assert read(ctx.state).mutations == []
+  end
+
+  test "profile failure on the review fetch after eligibility preserves the arrival", ctx do
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail, [state: ctx.state, full_thread_error_at: 2, full_thread_late_error: :not_found]}
+    }
+
+    assert {:ok, %{status: :gmail_unavailable}} = Worker.step(config)
+    assert {:ok, [_]} = pending(ctx)
+    assert read(ctx.state).mutations == []
+  end
+
+  for {reason, expected, requested} <- [
+        {:thread_not_found, :skipped, false},
+        {:not_found, :gmail_unavailable, true}
+      ] do
+    test "recheck execute fetch #{reason} retains precise terminal versus retry semantics", ctx do
+      Agent.update(ctx.quota, &%{&1 | block: :cap})
+      assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+      assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+      Agent.update(ctx.state, &Map.put(&1, :full_thread_count, 0))
+
+      config = %{
+        ctx.config
+        | gmail:
+            {Gmail,
+             [state: ctx.state, full_thread_error_at: 2, full_thread_late_error: unquote(reason)]}
+      }
+
+      assert {:ok, %{status: unquote(expected)}} = Worker.step(config)
+
+      assert [%Candidate{requested: unquote(requested)}] =
+               Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+      assert read(ctx.state).full_thread_count == 2
+      assert read(ctx.state).mutations == []
+    end
   end
 
   test "at most five targets are admitted per step and remaining arrivals continue", ctx do

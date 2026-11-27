@@ -9,7 +9,7 @@ const bounded = (text, size) => typeof text === 'string' && bytes(text) <= size;
 // separates authored text from untrusted evidence; it grants no capabilities.
 export function parse(input) {
   if (!input || Array.isArray(input) || Object.keys(input).sort().join(',') !== 'body,reply_expected,subject' ||
-      !bounded(input.body, 1_000_000) || !bounded(input.subject, 1024) || typeof input.reply_expected !== 'boolean' ||
+      !bounded(input.body, 128_000) || !bounded(input.subject, 1024) || typeof input.reply_expected !== 'boolean' ||
       /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(input.body)) return clarify('unreadable');
   const forwarding = new ForwardParser();
   const bySubject = forwarding.read(input.body, input.subject);

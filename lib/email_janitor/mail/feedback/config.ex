@@ -7,7 +7,7 @@ defmodule EmailJanitor.Mail.Feedback.Context do
   @moduledoc "Host-built command context. Keys contain only opaque identifiers; callbacks are never derived from email content."
   @enforce_keys [:key, :scope, :inbox, :conversation_id, :guard, :respond, :render]
   @derive {Inspect, only: [:inbox, :conversation_id]}
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [verified_reference: false]
 end
 
 defmodule EmailJanitor.Mail.Feedback.Binding do
@@ -30,6 +30,8 @@ defmodule EmailJanitor.Mail.Feedback.Config do
          true <- inbox.address == mail.sender,
          parser when is_binary(parser) <- opts[:parser_executable],
          true <- Path.type(parser) == :absolute,
+         {:ok, %{type: :regular, mode: mode}} <- File.stat(parser),
+         true <- Bitwise.band(mode, 0o111) != 0,
          route when is_function(route, 1) <- opts[:route],
          resolve when is_function(resolve, 1) <- opts[:resolve],
          true <- signup?(opts[:signup_url]) do
