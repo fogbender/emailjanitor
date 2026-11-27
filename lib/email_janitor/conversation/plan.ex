@@ -133,7 +133,7 @@ defmodule EmailJanitor.Conversation.Plan do
       cond do
         body == "" -> true
         normalized == body -> false
-        kind == :sender and canonical_address?(raw) -> true
+        kind == :header -> not copied_header?(normalized, raw)
         byte_size(body) < 12 -> true
         String.contains?(normalized, body) -> false
         true -> not copied_passage?(normalized, body)
@@ -150,32 +150,36 @@ defmodule EmailJanitor.Conversation.Plan do
 
   defp source_values(%Content{} = source), do: [{:body, Content.read(source)}]
 
-  defp source_values({:subject, source}) do
+  defp source_values({kind, source}) when kind in [:sender, :subject] do
     raw = Content.read(source)
-    {"subject", decoded} = Mail.Parsers.RFC2822.parse_header("Subject: " <> raw, [])
+    # Decode encoded words as unstructured text, so every display name, comment
+    # and group is covered rather than only RFC2822's first From mailbox.
+    decoded =
+      try do
+        {"subject", value} = Mail.Parsers.RFC2822.parse_header("Subject: " <> raw, [])
+        if is_binary(value), do: value, else: raw
+      rescue
+        _ -> raw
+      catch
+        _, _ -> raw
+      end
+
     [{:header, raw}, {:header, decoded}] |> Enum.uniq()
   end
 
-  defp source_values({:sender, source}) do
-    raw = Content.read(source)
-    {"from", decoded} = Mail.Parsers.RFC2822.parse_header("From: " <> raw, [])
+  defp copied_header?(instruction, raw) do
+    identifier =
+      raw
+      |> String.replace(~r/[^\s<>(),:;"@]+@[a-zA-Z0-9.-]+/u, " ")
+      |> String.replace(~r/[<>(),:;"]/u, " ")
+      |> normalize()
 
-    names =
-      decoded
-      |> List.wrap()
-      |> Enum.flat_map(fn
-        {name, _address} when is_binary(name) and name != "" -> [{:header, name}]
-        _ -> []
-      end)
-
-    [{:sender, raw} | names]
-  end
-
-  defp canonical_address?(raw) do
-    case EmailJanitor.Address.normalize(raw) do
-      {:ok, address} -> address == String.downcase(String.trim(raw))
-      _ -> false
-    end
+    command = instruction |> String.replace(~r/[<>(),:;"]/u, " ") |> normalize()
+    # Names and short subject identifiers may legitimately appear in a new
+    # behavioral instruction. Reject an instruction copied wholesale from header
+    # text, or a long copied passage; do not reject ordinary "Keep mail from X".
+    (byte_size(command) >= 4 and String.contains?(identifier, command)) or
+      copied_passage?(command, identifier)
   end
 
   defp copied_passage?(instruction, body) do
