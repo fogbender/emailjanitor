@@ -93,7 +93,9 @@ defmodule EmailJanitor.SelfHost.Credentials do
              else
                # A late rotation is still an owned capability, even after
                # disconnect. Never activate it or throw it away on a CAS miss.
-               if current.state not in [:pending, :active] do
+               # Reauthorization alone is not an explicit retirement. Keep its
+               # accepted late grant dormant so fresh consent resumes normally.
+               if current.state in [:disconnected, :revoking, :revocation_required] do
                  state =
                    Revocations.stage!(scope, %{current | token_ciphertext: nil}, new_grant: true)
 

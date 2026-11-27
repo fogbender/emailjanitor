@@ -583,4 +583,120 @@ defmodule EmailJanitor.SelfHostGrantsTest do
     assert Repo.all(from(g in GoogleGrant, where: g.inbox_id == ^id), prefix: ctx.scope.prefix) ==
              []
   end
+
+  defp overlapping_refreshes(ctx) do
+    {:ok, _} = SelfHost.connect(ctx.owner, result("A", 30), "Etc/UTC")
+    before = host_binding(ctx)
+    observer = self()
+
+    Req.Test.stub(:grant_refresh, fn conn ->
+      send(observer, {:overlapping_refresh, self()})
+
+      receive do
+        :invalid ->
+          conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{error: "invalid_grant"})
+
+        :rotate ->
+          Req.Test.json(conn, %{
+            access_token: "late-rotation",
+            refresh_token: "PRIVATE_REFRESH_B",
+            expires_in: 3600,
+            token_type: "Bearer"
+          })
+      end
+    end)
+
+    late = Task.async(fn -> Credentials.token({ctx.box.id, before.epoch}) end)
+    assert_receive {:overlapping_refresh, late_wire}, 5000
+    invalid = Task.async(fn -> Credentials.token({ctx.box.id, before.epoch}) end)
+    assert_receive {:overlapping_refresh, invalid_wire}, 5000
+    send(invalid_wire, :invalid)
+    assert {:error, :reauthorization_required} = Task.await(invalid, 5000)
+    assert tokens(ctx) == []
+    assert host_binding(ctx).state == :reauthorization_required
+    {late, late_wire}
+  end
+
+  test "disconnect after invalid current proof remains fenced behind another live SDK reply",
+       ctx do
+    {late, wire} = overlapping_refreshes(ctx)
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert host_binding(ctx).state == :revocation_required
+    old = Repo.get!(Revocation, ctx.box.id, prefix: ctx.scope.prefix)
+    assert old.state == :manual_required
+
+    assert {:error, :refresh_pending} =
+             Revocations.confirm_manual(
+               ctx.box.id,
+               old.request_id,
+               old.google_subject,
+               :google_access_removed
+             )
+
+    assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, result("C"), "Etc/UTC")
+    send(wire, :rotate)
+    assert {:error, :google_credentials_unavailable} = Task.await(late, 5000)
+    assert tokens(ctx) == ~w(PRIVATE_REFRESH_C PRIVATE_REFRESH_B)
+    fresh = Repo.get!(Revocation, ctx.box.id, prefix: ctx.scope.prefix)
+    assert fresh.state == :manual_required
+    refute fresh.request_id == old.request_id
+    assert host_binding(ctx).state == :revocation_required
+  end
+
+  test "invalid current proof cannot erase already quarantined rotation uncertainty on disconnect",
+       ctx do
+    dead = Task.async(fn -> EmailJanitor.Owner.capture() end) |> Task.await()
+
+    Repo.insert!(
+      struct!(
+        RefreshAttempt,
+        Map.merge(dead, %{
+          id: Ecto.UUID.generate(),
+          inbox_id: ctx.box.id,
+          source_version: host_binding(ctx).token_version,
+          state: :quarantined
+        })
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    {:ok, _} = SelfHost.connect(ctx.owner, result("A", 30), "Etc/UTC")
+    before = host_binding(ctx)
+
+    Req.Test.stub(:grant_refresh, fn conn ->
+      conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{error: "invalid_grant"})
+    end)
+
+    assert {:error, :reauthorization_required} = Credentials.token({ctx.box.id, before.epoch})
+    assert tokens(ctx) == []
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert host_binding(ctx).state == :revocation_required
+    row = Repo.get!(Revocation, ctx.box.id, prefix: ctx.scope.prefix)
+    assert row.state == :manual_required
+    assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, result("B"), "Etc/UTC")
+  end
+
+  test "a late accepted SDK reply behind reauthorization stays dormant until explicit retirement",
+       ctx do
+    {late, wire} = overlapping_refreshes(ctx)
+    failed = host_binding(ctx)
+    send(wire, :rotate)
+    assert {:error, :google_credentials_unavailable} = Task.await(late, 5000)
+    assert host_binding(ctx).state == :reauthorization_required
+    assert tokens(ctx) == ["PRIVATE_REFRESH_B"]
+    assert Repo.get(Revocation, ctx.box.id, prefix: ctx.scope.prefix) == nil
+
+    assert {:ok, :idle} =
+             Revocations.tick(ctx.config.google_oauth,
+               revoke: fn _, _ -> flunk("reauthorization is not a retirement request") end
+             )
+
+    assert {:ok, _} = SelfHost.connect(ctx.owner, result("C"), "Etc/UTC")
+    resumed = host_binding(ctx)
+    assert resumed.epoch == failed.epoch
+    assert tokens(ctx) == ~w(PRIVATE_REFRESH_B PRIVATE_REFRESH_C)
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert retire(ctx, "B") == :retirement_continues
+    assert retire(ctx, "C") == :revoked
+  end
 end

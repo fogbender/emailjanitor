@@ -209,7 +209,10 @@ defmodule EmailJanitor.SelfHost.Revocations do
     else
       grant = Grants.next(scope, binding.id)
       present = not is_nil(grant)
-      unusable = not present and binding.state == :reauthorization_required
+
+      unusable =
+        not present and binding.state == :reauthorization_required and
+          not Refreshes.uncertain?(scope, binding.id)
 
       fields = %{
         request_id: Ecto.UUID.generate(),
