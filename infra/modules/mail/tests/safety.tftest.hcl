@@ -77,7 +77,7 @@ run "safe_transport_defaults" {
     error_message = "MX and DKIM belong only to the dedicated new mail zone."
   }
   assert {
-    condition     = jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Resource == aws_ses_domain_identity.mail.arn && jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Condition.StringEquals["ses:FromAddress"] == "janitor@janitor.example.com"
+    condition     = toset(jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Action) == toset(["ses:SendEmail", "ses:SendRawEmail"]) && jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Resource == aws_ses_domain_identity.mail.arn && jsondecode(aws_iam_role_policy.runtime_mail.policy).Statement[4].Condition.StringEquals["ses:FromAddress"] == "janitor@janitor.example.com"
     error_message = "Sending must remain scoped to the Janitor domain identity and exact From address."
   }
 }
