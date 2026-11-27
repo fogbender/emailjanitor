@@ -81,6 +81,33 @@ defmodule EmailJanitor.DigestTest do
     assert {:ok, :not_due} = Digest.tick(ctx.scope, ctx.inbox.id, ~U[2026-11-20 21:05:00Z])
   end
 
+  test "confirmed settlement records before a valid browser schedule exists", ctx do
+    TestRepo.delete_all(Schedule, prefix: ctx.scope.prefix)
+
+    assert {:error, :invalid_digest_schedule} =
+             Digest.configure(ctx.scope, ctx.inbox.id, "Unknown/Browser", @start)
+
+    assert {:ok, activity} =
+             TestRepo.transaction(fn ->
+               row = event(ctx.scope, ctx.inbox, 71)
+
+               TestRepo.insert_all(
+                 "digest_host_claims",
+                 [%{message_id: "settled", digest_id: row.id}],
+                 prefix: ctx.scope.prefix
+               )
+
+               row
+             end)
+
+    assert TestRepo.get!(Activity, activity.id, prefix: ctx.scope.prefix).digest_id == nil
+    assert TestRepo.aggregate("digest_host_claims", :count, prefix: ctx.scope.prefix) == 1
+    assert :ok = Digest.configure(ctx.scope, ctx.inbox.id, "Etc/UTC", @start)
+    assert {:ok, {:ready, snapshot}} = Digest.tick(ctx.scope, ctx.inbox.id, @due)
+    assert {:ok, message} = Digest.render(ctx.scope, snapshot.id)
+    assert Content.read(message.text) =~ "Subject 71"
+  end
+
   test "delayed tick excludes late activity, first digest teaches replies, and snapshots stay frozen",
        ctx do
     first = event(ctx.scope, ctx.inbox, 1)

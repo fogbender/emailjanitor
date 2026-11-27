@@ -40,9 +40,6 @@ defmodule EmailJanitor.Digest do
     transaction(scope, fn ->
       lock_mailbox!(scope, inbox_id)
 
-      if is_nil(scope.repo.get(Schedule, inbox_id, prefix: scope.prefix)),
-        do: scope.repo.rollback(:unknown_digest_schedule)
-
       row = struct(Activity, Map.from_struct(event) |> Map.put(:inbox_id, inbox_id))
       scope.repo.insert!(row, prefix: scope.prefix, on_conflict: :nothing)
       keys = [inbox_id: inbox_id, message_id: event.message_id, kind: event.kind]
