@@ -26,6 +26,11 @@ mock_provider "google" {
     }
   }
 }
+mock_provider "google-beta" {
+  mock_resource "google_project_service_identity" {
+    defaults = { email = "service-123456789012@gcp-sa-pubsub.iam.gserviceaccount.com" }
+  }
+}
 
 variables {
   name              = "janitor-test"

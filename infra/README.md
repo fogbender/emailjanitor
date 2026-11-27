@@ -99,6 +99,27 @@ Supply `name`, `mail_domain`, `google_project_id`,
 Do not put OAuth tokens into OpenTofu variables
 or user-data: those would persist in state and instance metadata.
 
+## Gmail poison-notification handling
+
+The Gmail pull subscription forwards repeatedly unacknowledged notification hints
+to a private dead-letter topic after approximately five delivery attempts. Pub/Sub
+counts these attempts on a best-effort basis; this is not an exact retry cap.
+The dead-letter topic and its persistent inspection subscription retain hints for
+one day. Hints contain mailbox/history metadata, never full email content. The
+application must still acknowledge deliberately disconnected identities only
+after verifying that state, and durably coalesce valid hints before acknowledgement.
+Temporary Gmail authorization failures belong to the affected inbox's durable
+recovery state rather than an endless notification retry.
+
+The pinned `google-beta` provider explicitly generates the Pub/Sub service
+identity. That service agent receives Publisher only on the dead-letter topic
+and Subscriber only on the source subscription, as required for forwarding and
+acknowledgement. The Janitor consumer retains only its existing source-subscription
+grant; it gains no project-wide or dead-letter read permission. An operator can
+inspect `gmail_dead_letter_subscription` with a separately authorized identity.
+Monitor its backlog/forwarded count and verify actual forwarding before launch;
+native mocked plans cannot prove provider delivery or IAM propagation timing.
+
 ## NixOS runtime and secrets
 
 Import `nix/module.nix` into the NixOS image and supply the built Elixir release:
