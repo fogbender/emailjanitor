@@ -404,3 +404,13 @@ redirection/retry, configuration, redaction and atomic-file tests plus dependenc
 audit. Only synthetic workload identities and mocked HTTP are used. Service
 unit wiring and deployment remain host integration work; no cloud resources
 have been changed by this helper slice.
+
+Targeted execution preserves uncovered Done work as a stable metadata-only
+candidate when an earlier overlapping action is still live. It returns
+`{:blocked, :already_reserved}` without another quota reservation or Gmail intent;
+a fresh eligible subset can then pass normal admission. Candidate existence is
+not new-arrival or paid-backlog authorization by itself.
+Policy adapters must explicitly implement `retire_candidate_messages/4` to support
+partial metadata withdrawal. Legacy `retire_candidate/4` is used only when all
+remaining work is withdrawn; unsupported partial retirement rolls back before
+changing either host metadata or the core candidate.

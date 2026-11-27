@@ -447,19 +447,21 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
                  if(unquote(keep_b), do: ["message-2"], else: [])
                )
 
-      assert {:existing, ^action_id, :unresolved} =
-               database(fn ->
-                 Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
-               end)
+      newer_result =
+        database(fn ->
+          Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+        end)
+
+      if unquote(keep_b),
+        do: assert(newer_result == {:existing, action_id, :unresolved}),
+        else: assert(newer_result == {:blocked, :already_reserved})
 
       if running do
         {pid, monitor, owner} = running
         send(owner, :continue_existing)
         assert_receive {:existing_old_result, result}, 5_000
 
-        if unquote(keep_b),
-          do: assert(result == {:error, :proposal_changed}),
-          else: assert(match?({:done, _}, result))
+        assert result == {:error, :proposal_changed}
 
         assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
       else
@@ -468,9 +470,7 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
             Executor.execute(ctx.scope, ctx.inbox, old, {TestGmail, [state: ctx.state]})
           end)
 
-        if unquote(keep_b),
-          do: assert(result == {:error, :proposal_changed}),
-          else: assert(match?({:done, _}, result))
+        assert result == {:error, :proposal_changed}
       end
 
       fence = fn ->
@@ -493,6 +493,28 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
                  end)
 
         assert accepted_at == fence.()
+      end
+
+      unless unquote(keep_b) do
+        assert {:blocked, :already_reserved} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+                 end)
+
+        database(fn ->
+          assert [%{message_ids: ["message-2"]}] =
+                   TestRepo.all(
+                     Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                     prefix: ctx.scope.prefix
+                   )
+        end)
+
+        assert {:ok, fresh} = review.(["message-2"], [])
+
+        assert {:done, _} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]})
+                 end)
       end
 
       expected_calls =
@@ -605,13 +627,14 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
 
     assert {:ok, fresh} = review.(["message-1", "message-2", "message-3"], ["message-3"])
 
-    assert {:existing, ^action_id, :unresolved} =
+    assert {:blocked, :already_reserved} =
              database(fn ->
                Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]},
                  policy: policy
                )
              end)
 
+    assert database(fn -> Store.get(ctx.scope, ctx.inbox.id, action_id).state end) == :unresolved
     send(owner, :continue_pending_keep)
     assert_receive {:pending_keep_result, {:error, :proposal_changed}}, 5_000
     assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
