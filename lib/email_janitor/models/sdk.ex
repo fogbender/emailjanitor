@@ -26,8 +26,10 @@ defmodule EmailJanitor.Models.SDK do
       do: throw(:invalid_content)
 
     target_ids = Keyword.get(opts, :target_ids)
+
     if not is_nil(target_ids) and (not is_list(target_ids) or length(target_ids) not in 1..5),
       do: throw(:invalid_content)
+
     schema = if is_nil(target_ids), do: Decision.schema(), else: TargetDecisions.schema()
 
     payload = messages |> selected_messages() |> Enum.map(&payload/1) |> Jason.encode!()

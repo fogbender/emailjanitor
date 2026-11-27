@@ -1,0 +1,326 @@
+defmodule EmailJanitor.Conversation do
+  @moduledoc "Shared authenticated chat/email workflow. Hosts supply the scope, inbox, policy and connection guard."
+  alias EmailJanitor.{Content, Executor, Preferences, Store}
+
+  alias EmailJanitor.Conversation.{
+    Context,
+    ExplicitSelection,
+    Ledger,
+    Lookup,
+    Outcome,
+    Plan,
+    Receipt
+  }
+
+  @doc "Handle one transient user message. The caller must authenticate it before constructing Context."
+  def respond(%Context{} = ctx, request_id, %Content{} = request) do
+    with {:ok, request_id} <- Ecto.UUID.cast(request_id),
+         {:ok, _} <- Ecto.UUID.cast(ctx.conversation_id),
+         true <- not ctx.scope.repo.in_transaction?(),
+         true <- byte_size(Content.read(request)) in 1..16_000,
+         :ok <- ctx.guard.(),
+         {:ok, snapshot} <- Preferences.snapshot(ctx.scope, ctx.inbox.id) do
+      case Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id) do
+        %Receipt{completed: true} = receipt -> {:ok, Outcome.render(receipt, snapshot)}
+        pending -> plan(ctx, request_id, request, snapshot, pending)
+      end
+    else
+      _ -> {:error, :conversation_unavailable}
+    end
+  rescue
+    _ -> {:error, :conversation_unavailable}
+  catch
+    _, _ -> {:error, :conversation_unavailable}
+  end
+
+  defp plan(ctx, request_id, request, snapshot, pending) do
+    previous = pending || Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id)
+
+    evidence =
+      case previous do
+        nil ->
+          {:ok, [], []}
+
+        receipt ->
+          case Lookup.load(ctx, receipt.references) do
+            {:ok, _, _} = found -> found
+            _ when is_nil(pending) -> {:ok, [], []}
+            error -> error
+          end
+      end
+
+    with {:ok, refs, messages} <- evidence do
+      propose(ctx, request_id, request, snapshot, refs, messages, false, 2)
+    end
+  end
+
+  defp propose(ctx, request_id, request, snapshot, refs, messages, truncated, remaining) do
+    with :ok <- ctx.guard.(),
+         {:ok, proposal} <-
+           ctx.planner.plan(
+             ctx.inbox,
+             snapshot,
+             request,
+             refs,
+             messages,
+             Keyword.put(ctx.model, :search_truncated, truncated)
+           ) do
+      case proposal do
+        %Plan{operation: :search} when remaining > 0 ->
+          with {:ok, refs, messages, truncated} <- Lookup.search(ctx, proposal.query) do
+            propose(ctx, request_id, request, snapshot, refs, messages, truncated, remaining - 1)
+          end
+
+        %Plan{operation: :search} ->
+          {:ok,
+           Content.new(
+             "Please narrow down the sender or subject so I can identify the right email."
+           )}
+
+        %Plan{} = proposal ->
+          apply_plan(ctx, request_id, snapshot, proposal, refs)
+      end
+    else
+      _ -> {:error, :conversation_unavailable}
+    end
+  end
+
+  defp apply_plan(ctx, request_id, snapshot, proposal, refs) do
+    selected =
+      if proposal.operation == :answer,
+        do: refs,
+        else: Enum.filter(refs, &(&1.token in proposal.references))
+
+    with {:ok, receipt} <-
+           Ledger.reserve(
+             ctx.scope,
+             ctx.inbox.id,
+             ctx.conversation_id,
+             request_id,
+             proposal,
+             selected,
+             ctx.guard
+           ) do
+      if receipt.completed do
+        {:ok, Outcome.render(receipt, snapshot)}
+      else
+        with :ok <- teach(ctx, receipt, proposal, snapshot),
+             {:ok, current} <- Preferences.snapshot(ctx.scope, ctx.inbox.id),
+             :ok <- effects(ctx, receipt, selected, current),
+             {:ok, finished} <-
+               Ledger.complete(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id) do
+          if proposal.operation == :answer and proposal.preference_target == :none,
+            do: {:ok, proposal.reply},
+            else: {:ok, Outcome.render(finished, current)}
+        end
+      end
+    end
+  end
+
+  defp teach(_ctx, %{preference_target: :none}, _plan, _snapshot), do: :ok
+
+  defp teach(_ctx, %{preference_status: status}, _plan, _snapshot)
+       when status in [:updated, :unchanged],
+       do: :ok
+
+  defp teach(ctx, receipt, proposal, snapshot) do
+    target = if proposal.preference_target == :all, do: :all, else: {:inbox, ctx.inbox.id}
+
+    {status, revision} =
+      case Preferences.replace(ctx.scope, target, snapshot, proposal.instruction, receipt.id) do
+        {:ok, change} -> {if(change.changed, do: :updated, else: :unchanged), change.revision}
+        _ -> {:failed, nil}
+      end
+
+    with {:ok, _} <-
+           Ledger.record_preference(
+             ctx.scope,
+             ctx.inbox.id,
+             ctx.conversation_id,
+             receipt.id,
+             status,
+             revision
+           ),
+         do: :ok
+  end
+
+  defp effects(_ctx, %{operation: :answer}, _refs, _snapshot), do: :ok
+
+  defp effects(ctx, %{operation: :done} = receipt, refs, snapshot) do
+    refs
+    |> Enum.group_by(& &1.thread_id)
+    |> Enum.reduce_while(:ok, fn {thread_id, selected}, :ok ->
+      remaining = unprocessed(receipt, selected)
+
+      if remaining == [] do
+        {:cont, :ok}
+      else
+        ids = Enum.map(remaining, & &1.message_id)
+        opts = execution_options(ctx) |> Keyword.put(:cleanup_target_ids, ids)
+
+        result =
+          with :ok <- ctx.guard.(),
+               {:ok, proposal} <-
+                 Executor.review(
+                   ctx.scope,
+                   ctx.inbox,
+                   thread_id,
+                   ctx.gmail,
+                   {ExplicitSelection, []},
+                   Content.read(Preferences.text(snapshot)),
+                   snapshot.instruction_version,
+                   opts
+                 ) do
+            Executor.execute(ctx.scope, ctx.inbox, proposal, ctx.gmail, opts)
+          end
+
+        case record_cleanup(ctx, receipt, remaining, result) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end
+    end)
+  end
+
+  defp effects(ctx, %{operation: :restore} = receipt, refs, snapshot) do
+    refs
+    |> Enum.group_by(& &1.action_id)
+    |> Enum.reduce_while(:ok, fn {action_id, selected}, :ok ->
+      remaining = unprocessed(receipt, selected)
+
+      {status, id} =
+        cond do
+          remaining == [] ->
+            {"unchanged", nil}
+
+          is_nil(action_id) ->
+            {"protected", nil}
+
+          true ->
+            effect_id = effect_id(receipt.id, action_id)
+            restore = Keyword.get(ctx.execution_options, :restore_adapter, EmailJanitor.Restore)
+
+            opts =
+              execution_options(ctx)
+              |> Keyword.put(:authorize, ctx.guard)
+              |> Keyword.put(:expected_instruction_version, snapshot.instruction_version)
+
+            result =
+              try do
+                with :ok <- ctx.guard.() do
+                  apply(restore, :apply, [
+                    ctx.scope,
+                    ctx.inbox,
+                    effect_id,
+                    action_id,
+                    Enum.map(remaining, & &1.message_id),
+                    ctx.gmail,
+                    opts
+                  ])
+                end
+              rescue
+                _ -> {:unresolved, effect_id}
+              catch
+                _, _ -> {:unresolved, effect_id}
+              end
+
+            restore_result(result)
+        end
+
+      case record_results(ctx, receipt, remaining, status, id) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp unprocessed(receipt, refs) do
+    terminal =
+      Enum.filter(receipt.results, &(&1["status"] != "unavailable"))
+      |> Enum.map(& &1["reference"])
+
+    Enum.reject(refs, &(&1.token in terminal))
+  end
+
+  defp cleanup_result(_ctx, {:done, id}), do: {"done", id}
+  defp cleanup_result(_ctx, {:blocked, :upgrade_required}), do: {"blocked", nil}
+
+  defp cleanup_result(_ctx, {:blocked, reason})
+       when reason in [:manually_restored, :action_settled],
+       do: {"protected", nil}
+
+  defp cleanup_result(_ctx, {:unresolved, id}), do: {"unresolved", id}
+  defp cleanup_result(_ctx, {:existing, id, :done}), do: {"done", id}
+  defp cleanup_result(_ctx, {:existing, _id, :restored}), do: {"protected", nil}
+
+  defp cleanup_result(_ctx, {:existing, id, state}) when state in [:intent, :unresolved],
+    do: {"unresolved", id}
+
+  defp cleanup_result(_ctx, {:keep, :no_matching_inbox_messages}), do: {"unchanged", nil}
+  defp cleanup_result(_ctx, {:keep, _}), do: {"protected", nil}
+
+  defp cleanup_result(_ctx, {:skip, reason}) when reason != :proposal_changed,
+    do: {"protected", nil}
+
+  defp cleanup_result(_ctx, _), do: {"unavailable", nil}
+
+  defp record_cleanup(ctx, receipt, refs, result) do
+    {status, effect_id} = cleanup_result(ctx, result)
+
+    if status == "done" do
+      action = Store.get(ctx.scope, ctx.inbox.id, effect_id)
+
+      Enum.reduce_while(refs, :ok, fn ref, :ok ->
+        actual =
+          if action && ref.message_id in action.applied_message_ids,
+            do: "done",
+            else: "unavailable"
+
+        case record_results(ctx, receipt, [ref], actual, effect_id) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end)
+    else
+      record_results(ctx, receipt, refs, status, effect_id)
+    end
+  end
+
+  defp restore_result({:done, id}), do: {"restored", id}
+  defp restore_result({:existing, :done, id}), do: {"restored", id}
+  defp restore_result({:unresolved, id}), do: {"unresolved", id}
+
+  defp restore_result({:existing, state, id}) when state in [:intent, :unresolved],
+    do: {"unresolved", id}
+
+  defp restore_result(_), do: {"unavailable", nil}
+
+  defp record_results(ctx, receipt, refs, status, effect_id) do
+    Enum.reduce_while(refs, :ok, fn ref, :ok ->
+      case Ledger.record_result(
+             ctx.scope,
+             ctx.inbox.id,
+             ctx.conversation_id,
+             receipt.id,
+             ref.token,
+             status,
+             effect_id
+           ) do
+        {:ok, _} -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp execution_options(ctx),
+    do:
+      ctx.execution_options |> Keyword.put(:policy, ctx.policy) |> Keyword.put(:guard, ctx.guard)
+
+  defp effect_id(request_id, action_id) do
+    <<a::48, _::4, b::12, _::2, c::62, _::binary>> =
+      :crypto.hash(:sha256, request_id <> action_id)
+
+    {:ok, uuid} = Ecto.UUID.load(<<a::48, 5::4, b::12, 2::2, c::62>>)
+    uuid
+  end
+end
