@@ -219,7 +219,7 @@ defmodule EmailJanitor.Conversation do
     loaded =
       Enum.reduce_while(unfinished, {:ok, [], [], []}, fn ref, {:ok, fresh, missing, known} ->
         case bound_result(ctx, receipt, ref) do
-          {status, action_id} when status in [:done, :unresolved] ->
+          {status, action_id} when status in [:done, :restored, :unresolved, :unsupported] ->
             {:cont, {:ok, fresh, missing, known ++ [{ref, status, action_id}]}}
 
           :none ->
@@ -275,6 +275,28 @@ defmodule EmailJanitor.Conversation do
         finish_effects(ctx, claimed, available, proposal)
       end
     end
+  end
+
+  defp bound_result(ctx, %{operation: :restore} = receipt, %{action_id: action} = _ref)
+       when is_binary(action) do
+    id = effect_id(receipt.id, action)
+    restore = Keyword.get(ctx.execution_options, :restore_adapter, EmailJanitor.Restore)
+
+    if Code.ensure_loaded?(restore) and function_exported?(restore, :outcome, 3) do
+      case apply(restore, :outcome, [ctx.scope, ctx.inbox, id]) do
+        {:done, ^id} -> {:restored, id}
+        {:unresolved, ^id} -> {:unresolved, id}
+        {:cancelled, ^id} -> {:unsupported, nil}
+        :none -> :none
+        _ -> {:error, :restore_unavailable}
+      end
+    else
+      :none
+    end
+  rescue
+    _ -> {:error, :restore_unavailable}
+  catch
+    _, _ -> {:error, :restore_unavailable}
   end
 
   defp bound_result(ctx, receipt, ref) do
@@ -406,10 +428,20 @@ defmodule EmailJanitor.Conversation do
                    opts
                  ),
                :ok <- ctx.guard.() do
-            Executor.execute(ctx.scope, ctx.inbox, proposal, ctx.gmail, opts)
+            {:reviewed, proposal,
+             Executor.execute(ctx.scope, ctx.inbox, proposal, ctx.gmail, opts)}
           end
 
-        case record_cleanup(ctx, receipt, remaining, result) do
+        recorded =
+          case result do
+            {:reviewed, proposal, executed} ->
+              record_cleanup(ctx, receipt, remaining, executed, proposal)
+
+            other ->
+              record_cleanup(ctx, receipt, remaining, other, nil)
+          end
+
+        case recorded do
           :ok -> {:cont, :ok}
           error -> {:halt, error}
         end
@@ -459,9 +491,9 @@ defmodule EmailJanitor.Conversation do
                   _ -> {:error, :restore_unavailable}
                 end
               rescue
-                _ -> {:unresolved, effect_id}
+                _ -> {:error, :restore_unavailable}
               catch
-                _, _ -> {:unresolved, effect_id}
+                _, _ -> {:error, :restore_unavailable}
               end
 
             restore_result(ctx, restore, effect_id, result)
@@ -507,7 +539,7 @@ defmodule EmailJanitor.Conversation do
 
   defp cleanup_result(_ctx, _), do: {"unavailable", nil}
 
-  defp record_cleanup(ctx, receipt, refs, result) do
+  defp record_cleanup(ctx, receipt, refs, result, proposal) do
     {status, effect_id} = cleanup_result(ctx, result)
     action = if effect_id, do: Store.get(ctx.scope, ctx.inbox.id, effect_id), else: nil
 
@@ -522,9 +554,13 @@ defmodule EmailJanitor.Conversation do
 
           :none ->
             cond do
-              ((status == "done" and action) && ref.message_id not in action.message_ids) and
-                  Ledger.owns_action?(ctx.scope, ctx.inbox.id, receipt.id, action.id) ->
-                {"unchanged", nil}
+              (status == "done" and action) && ref.message_id not in action.message_ids ->
+                if proposal && ref.message_id not in EmailJanitor.Proposal.inbox_ids(proposal),
+                  do: {"unchanged", nil},
+                  else: {"deferred", nil}
+
+              (status == "done" and action) && ref.message_id in action.applied_message_ids ->
+                {"handled_elsewhere", nil}
 
               status == "done" ->
                 {"protected", nil}

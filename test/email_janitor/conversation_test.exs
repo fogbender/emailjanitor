@@ -33,6 +33,7 @@ defmodule EmailJanitor.ConversationFixtureGmail do
 
   def remove_inbox(inbox, ids, opts) do
     result = EmailJanitor.TestGmail.remove_inbox(inbox, ids, opts)
+    if hook = opts[:after_apply], do: hook.()
     if opts[:kill_after_apply], do: Process.exit(self(), :kill)
     result
   end
@@ -40,21 +41,24 @@ defmodule EmailJanitor.ConversationFixtureGmail do
   def prepare_add_inbox(_inbox, ids, opts) do
     {:ok,
      fn ->
-       Agent.get_and_update(opts[:state], fn state ->
-         if opts[:reject_restore] do
-           {{:rejected, :rate_limited},
-            %{state | calls: state.calls ++ [{:restore_attempt, ids}]}}
-         else
-           messages =
-             Enum.map(state.messages, fn message ->
-               if message.id in ids,
-                 do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
-                 else: message
-             end)
+       result =
+         Agent.get_and_update(opts[:state], fn state ->
+           if opts[:reject_restore] do
+             {{:rejected, :rate_limited},
+              %{state | calls: state.calls ++ [{:restore_attempt, ids}]}}
+           else
+             messages =
+               Enum.map(state.messages, fn message ->
+                 if message.id in ids,
+                   do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
+                   else: message
+               end)
 
-           {:ok, %{state | messages: messages, calls: state.calls ++ [{:restore, ids}]}}
-         end
-       end)
+             {:ok, %{state | messages: messages, calls: state.calls ++ [{:restore, ids}]}}
+           end
+         end)
+
+       if opts[:restore_timeout], do: {:error, :timeout}, else: result
      end}
   end
 end
@@ -77,12 +81,23 @@ defmodule EmailJanitor.ConversationFixtureRestore do
     opts[:fixture_restore].(effect_id)
   end
 
-  def outcome(_, _, effect_id), do: Process.get({__MODULE__, :outcome}).(effect_id)
+  def outcome(_, _, effect_id),
+    do: Process.get({__MODULE__, :outcome}, fn _ -> :none end).(effect_id)
 end
 
 defmodule EmailJanitor.ConversationFixtureCancelledRestore do
   def apply(_, _, _, _, _, _, _), do: {:error, :rate_limited}
   def outcome(_, _, effect_id), do: {:cancelled, effect_id}
+end
+
+defmodule EmailJanitor.ConversationFixtureCrashAfterRestore do
+  def apply(scope, inbox, effect, action, ids, gmail, opts) do
+    result = EmailJanitor.Restore.apply(scope, inbox, effect, action, ids, gmail, opts)
+    if opts[:fixture_crash_after_restore], do: Process.exit(self(), :kill)
+    result
+  end
+
+  defdelegate outcome(scope, inbox, effect), to: EmailJanitor.Restore
 end
 
 defmodule EmailJanitor.ConversationFixtureFailedSettlement do
@@ -607,7 +622,7 @@ defmodule EmailJanitor.ConversationTest do
            opts ++
              [
                kill_after_apply: true,
-               before: fn ->
+               after_apply: fn ->
                  Process.exit(Agent.get(control, & &1.owner), :kill)
                end
              ]}
@@ -1044,13 +1059,15 @@ defmodule EmailJanitor.ConversationTest do
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 
-  test "a foreign applied action with the email back in Inbox reports a safeguard", t do
+  test "a foreign applied action is reported without attributing it to this request", t do
     ctx = context(t.ctx, target: :none)
     assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
     Agent.update(t.state, &%{&1 | messages: [message()]})
     id = Ecto.UUID.generate()
     assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Done again."))
-    assert Content.read(reply) =~ "safeguard"
+    assert Content.read(reply) =~ "Another Janitor action already handled"
+    refute Content.read(reply) =~ "safeguard"
+    refute Content.read(reply) =~ "I marked"
     refute Content.read(reply) =~ "needed no inbox change"
     assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
@@ -1470,5 +1487,96 @@ defmodule EmailJanitor.ConversationTest do
     assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
     assert {:ok, ^reply} = Conversation.respond(ctx, id, Content.new("Retry."))
     assert Agent.get(t.state, & &1.calls) == [["abc123"], {:restore_attempt, ["abc123"]}]
+  end
+
+  for timeout <- [false, true] do
+    test "restore recovery uses durable evidence before Gmail reads, ambiguous=#{timeout}", t do
+      Agent.update(
+        t.state,
+        &%{
+          &1
+          | messages: [
+              message(id: "abc123", thread_id: "def456"),
+              message(id: "abc124", thread_id: "def456")
+            ]
+        }
+      )
+
+      ctx = context(t.ctx, target: :none)
+      assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+      {gmail, opts} = ctx.gmail
+
+      ctx = %{
+        context(ctx, operation: :restore, target: :none)
+        | gmail: {gmail, Keyword.put(opts, :restore_timeout, unquote(timeout))},
+          execution_options: [
+            restore_adapter: EmailJanitor.ConversationFixtureCrashAfterRestore,
+            fixture_crash_after_restore: true
+          ]
+      }
+
+      id = Ecto.UUID.generate()
+
+      assert {:error, :conversation_unavailable} =
+               Conversation.respond(ctx, id, Content.new("Undo."))
+
+      [effect] = TestRepo.all(EmailJanitor.Restore.Effect, prefix: ctx.scope.prefix)
+
+      assert EmailJanitor.Restore.outcome(ctx.scope, ctx.inbox, effect.id) ==
+               {if(unquote(timeout), do: :unresolved, else: :done), effect.id}
+
+      Agent.update(
+        t.state,
+        &%{&1 | messages: Enum.reject(&1.messages, fn m -> m.id == "abc123" end)}
+      )
+
+      resumed = %{
+        ctx
+        | gmail: {gmail, Keyword.put(opts, :thread_error, :gmail_unavailable)},
+          execution_options: [],
+          model: [script: fn _, _, _ -> flunk("no replan") end]
+      }
+
+      assert {:ok, reply} = Conversation.respond(resumed, id, Content.new("Retry."))
+
+      assert Content.read(reply) =~
+               if(unquote(timeout), do: "2 emails is uncertain", else: "returned 2 emails")
+
+      refute Content.read(reply) =~ "could no longer be found"
+      refute Content.read(reply) =~ "could not restore"
+
+      assert Agent.get(t.state, & &1.calls) == [
+               ["abc123", "abc124"],
+               {:restore, ["abc123", "abc124"]}
+             ]
+    end
+  end
+
+  test "a restore exception before admission remains retryable without inventing an uncertain effect",
+       t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+
+    ctx = %{
+      context(ctx, operation: :restore, target: :none)
+      | execution_options: [
+          restore_adapter: EmailJanitor.ConversationFixtureRestore,
+          fixture_restore: fn _ -> raise "PRIVATE_RESTORE_BODY" end
+        ]
+    }
+
+    id = Ecto.UUID.generate()
+
+    log =
+      capture_log(fn ->
+        assert {:error, :effects_pending} = Conversation.respond(ctx, id, Content.new("Undo."))
+      end)
+
+    refute log =~ "PRIVATE_RESTORE_BODY"
+    receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id)
+    refute receipt.completed
+    refute Enum.any?(receipt.results, &(&1["status"] == "unresolved"))
+    assert TestRepo.all(EmailJanitor.Restore.Effect, prefix: ctx.scope.prefix) == []
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 end

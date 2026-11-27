@@ -16,6 +16,8 @@ defmodule EmailJanitor.Conversation.Outcome do
     restored = Enum.count(results, &(&1["status"] == "restored"))
     blocked = Enum.count(results, &(&1["status"] == "blocked"))
     protected = Enum.count(results, &(&1["status"] == "protected"))
+    handled_elsewhere = Enum.count(results, &(&1["status"] == "handled_elsewhere"))
+    deferred = Enum.count(results, &(&1["status"] == "deferred"))
     missing = max(0, length(receipt.references) - length(results))
 
     uncertain =
@@ -54,6 +56,14 @@ defmodule EmailJanitor.Conversation.Outcome do
       if(unsupported > 0,
         do:
           "I could not restore #{count(unsupported)} because restoration is unavailable for this request."
+      ),
+      if(handled_elsewhere > 0,
+        do:
+          "Another Janitor action already handled #{count(handled_elsewhere)}. I did not send another Gmail request."
+      ),
+      if(deferred > 0,
+        do:
+          "I deferred #{count(deferred)} while another action was processed; this request did not change them."
       ),
       if(unchanged > 0, do: "#{count(unchanged)} needed no inbox change.")
     ]
