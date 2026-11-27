@@ -43,6 +43,17 @@ run "safe_transport_defaults" {
     error_message = "Mail transport objects must use server-side KMS encryption."
   }
   assert {
+    condition = (
+      jsondecode(aws_kms_key.spool.policy).Statement[1].Principal.Service == "sns.amazonaws.com" &&
+      toset(jsondecode(aws_kms_key.spool.policy).Statement[1].Action) == toset(["kms:GenerateDataKey", "kms:Decrypt"]) &&
+      jsondecode(aws_kms_key.spool.policy).Statement[1].Condition.ArnEquals["aws:SourceArn"] == aws_sns_topic.receipts.arn &&
+      jsondecode(aws_kms_key.spool.policy).Statement[1].Condition.StringEquals["aws:SourceAccount"] == "123456789012" &&
+      jsondecode(aws_kms_key.spool.policy).Statement[1].Condition.StringEquals["kms:EncryptionContext:aws:sns:topicArn"] == aws_sns_topic.receipts.arn &&
+      jsondecode(aws_kms_key.spool.policy).Statement[0].Principal.AWS == "arn:aws:iam::123456789012:root"
+    )
+    error_message = "SNS must use the custom key only for this account's exact receipt topic; IAM delegation must remain enabled."
+  }
+  assert {
     condition     = aws_s3_bucket_public_access_block.spool.block_public_acls && aws_s3_bucket_public_access_block.spool.block_public_policy && aws_s3_bucket_public_access_block.spool.restrict_public_buckets
     error_message = "The mail spool must not be public."
   }

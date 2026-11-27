@@ -70,7 +70,7 @@ defmodule EmailJanitor.Mail.SDK do
            request(
              ExAws.SQS.receive_message(config.queue_url,
                max_number_of_messages: 1,
-               wait_time_seconds: 0
+               wait_time_seconds: 20
              ),
              prepared
            ) do
