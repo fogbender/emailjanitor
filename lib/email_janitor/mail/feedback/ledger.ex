@@ -2,6 +2,9 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
   @moduledoc false
   import Ecto.Query, except: [update: 2, update: 3]
   alias EmailJanitor.Mail.Feedback.Record
+  # Shared Receiver's 1,100s watchdog exceeds Sent readback + the 900s core
+  # conversation + reply dispatch; keep its durable claim beyond that budget.
+  @claim_lease_seconds 1200
 
   def get(scope, id), do: scope.repo.get(Record, id, prefix: scope.prefix)
 
@@ -122,7 +125,7 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
                set: [
                  state: :processing,
                  claim_id: token,
-                 lease_until: DateTime.add(now, 1000),
+                 lease_until: DateTime.add(now, @claim_lease_seconds),
                  updated_at: now
                ]
              ],
