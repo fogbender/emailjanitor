@@ -14,9 +14,11 @@ defmodule EmailJanitor.Executor do
   }
 
   def execute(scope, %Inbox{} = inbox, %Proposal{} = proposal, {gmail, options}, opts \\ []) do
-    if scope.repo.in_transaction?(),
-      do: {:error, :outer_transaction},
-      else: Owner.run(fn -> do_execute(scope, inbox, proposal, gmail, options, opts) end)
+    cond do
+      scope.repo.in_transaction?() -> {:error, :outer_transaction}
+      not valid_proposal_ids?(proposal) -> {:skip, :proposal_changed}
+      true -> Owner.run(fn -> do_execute(scope, inbox, proposal, gmail, options, opts) end)
+    end
   end
 
   @doc "Fetch and review a thread; known keep decisions retire obsolete pending work."

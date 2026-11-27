@@ -37,7 +37,12 @@ defmodule EmailJanitor.TargetPolicy do
   def reserve(ctx, inbox, action, ids, now),
     do: EmailJanitor.TestPolicy.reserve(ctx, inbox, action, ids, now)
 
-  def reserve(ctx, inbox, action, ids, now, _admission), do: reserve(ctx, inbox, action, ids, now)
+  def reserve(ctx, inbox, action, ids, now, admission) do
+    if observer = Map.get(ctx, :observer),
+      do: send(observer, {:target_admission, ids, admission.inbox_message_ids})
+
+    reserve(ctx, inbox, action, ids, now)
+  end
 
   def settle(ctx, inbox, action, result),
     do: EmailJanitor.TestPolicy.settle(ctx, inbox, action, result)
@@ -99,7 +104,7 @@ defmodule EmailJanitor.TargetsTest do
     do: Executor.execute(ctx.scope, ctx.inbox, proposal, {TestGmail, [state: ctx.state]}, opts)
 
   defp policy(ctx, adapter \\ EmailJanitor.TargetPolicy),
-    do: %Policy{adapter: adapter, context: %{scope: ctx.scope, mode: :block}}
+    do: %Policy{adapter: adapter, context: %{scope: ctx.scope, mode: :block, observer: self()}}
 
   test "one model review selects Done targets while preserving older INBOX and legitimate context",
        ctx do
@@ -144,19 +149,126 @@ defmodule EmailJanitor.TargetsTest do
   end
 
   test "legacy policies cannot silently authorize a partial-INBOX mutation", ctx do
+    blocked = policy(ctx, EmailJanitor.TestPolicy)
+
+    {:ok, whole} =
+      Reviewer.review(
+        ctx.messages,
+        ctx.inbox,
+        MapSet.new(),
+        {EmailJanitor.TestClassifier, []},
+        "",
+        1
+      )
+
+    assert {:blocked, :upgrade_required} = execute(ctx, whole, policy: blocked)
+    assert [original] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
     {:ok, proposal} = review(ctx, ["pitch"])
 
-    assert {:blocked, :partial_admission_unsupported} =
-             execute(ctx, proposal, policy: policy(ctx, EmailJanitor.TestPolicy))
+    assert {:error, :partial_admission_unsupported} = execute(ctx, proposal, policy: blocked)
 
     assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+    assert [^original] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
 
-    assert %{rows: []} =
+    assert %{rows: [["reserve"]]} =
              Ecto.Adapters.SQL.query!(TestRepo, "SELECT kind FROM ej_test_a.policy_events", [],
                log: false
              )
 
     assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "admission receives the full INBOX snapshot separately from selected Done IDs", ctx do
+    {:ok, proposal} = review(ctx, ["pitch", "keep"], keep_ids: ["keep"])
+    assert {:blocked, :upgrade_required} = execute(ctx, proposal, policy: policy(ctx))
+    assert_receive {:target_admission, ["pitch"], ["keep", "old-context", "pitch"]}
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "malformed proposal selections are rejected before a safeguard can retire context", ctx do
+    {:ok, whole} =
+      Reviewer.review(
+        ctx.messages,
+        ctx.inbox,
+        MapSet.new(),
+        {EmailJanitor.TestClassifier, []},
+        "",
+        1
+      )
+
+    assert {:blocked, :upgrade_required} = execute(ctx, whole, policy: policy(ctx))
+    assert [original] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    {:ok, partial} = review(ctx, ["pitch"])
+    Agent.update(ctx.state, &%{&1 | contacted: ["vendor.com"]})
+
+    for malformed <- [
+          %{partial | evaluated_message_ids: false},
+          %{partial | evaluated_message_ids: "pitch"},
+          %{partial | evaluated_message_ids: []},
+          %{partial | evaluated_message_ids: ["pitch", "pitch"]},
+          %{partial | inbox_message_ids: false}
+        ] do
+      assert {:skip, :proposal_changed} = execute(ctx, malformed, policy: policy(ctx))
+    end
+
+    assert [^original] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert %{rows: []} =
+             Ecto.Adapters.SQL.query!(
+               TestRepo,
+               "SELECT kind FROM ej_test_a.policy_events WHERE kind='retire'",
+               [],
+               log: false
+             )
+
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  for new_guard <- [:correspondence, :sent_reply] do
+    test "a new execute-time #{new_guard} guard retires targets while preserving INBOX context",
+         ctx do
+      {:ok, whole} =
+        Reviewer.review(
+          ctx.messages,
+          ctx.inbox,
+          MapSet.new(),
+          {EmailJanitor.TestClassifier, []},
+          "",
+          1
+        )
+
+      assert {:blocked, :upgrade_required} = execute(ctx, whole, policy: policy(ctx))
+      assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+      {:ok, partial} = review(ctx, ["pitch"])
+
+      expected =
+        case unquote(new_guard) do
+          :correspondence ->
+            Agent.update(ctx.state, &%{&1 | contacted: ["vendor.com"]})
+            :prior_correspondence
+
+          :sent_reply ->
+            Agent.update(
+              ctx.state,
+              &%{&1 | messages: &1.messages ++ [message(id: "sent-reply", labels: ["SENT"])]}
+            )
+
+            :proposal_changed
+        end
+
+      assert {:skip, ^expected} = execute(ctx, partial, policy: policy(ctx))
+      assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+      assert %{rows: [[["pitch"]]]} =
+               Ecto.Adapters.SQL.query!(
+                 TestRepo,
+                 "SELECT message_ids FROM ej_test_a.policy_events WHERE action_id=$1 AND kind='retire'",
+                 [id],
+                 log: false
+               )
+
+      assert [] = Agent.get(ctx.state, & &1.calls)
+    end
   end
 
   test "fresh keep retires evaluated IDs but preserves unevaluated INBOX pending context", ctx do

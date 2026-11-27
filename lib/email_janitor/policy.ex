@@ -52,12 +52,13 @@ defmodule EmailJanitor.Policy do
           policy.adapter.reserve(policy.context, inbox_id, action_id, message_ids, now)
 
         true ->
-          {:blocked, :partial_admission_unsupported}
+          {:error, :partial_admission_unsupported}
       end
 
     case result do
       :ok -> :ok
       {:blocked, reason} when is_atom(reason) -> {:blocked, reason}
+      {:error, :partial_admission_unsupported} = unsupported -> unsupported
       _ -> {:error, :policy_unavailable}
     end
   rescue
