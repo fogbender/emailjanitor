@@ -206,6 +206,8 @@ defmodule EmailJanitor.ReviewContextTest do
                  options
                )
     end
+
+    assert Agent.get(t.state, & &1.fetches) == 0
   end
 
   test "a refusing factory preserves pending candidates without retiring through the base policy",
