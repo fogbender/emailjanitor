@@ -199,9 +199,18 @@ defmodule EmailJanitor.Executor do
          :ok <- Owner.dispatch_window(),
          {:ok, {status, action}} <- Store.intent(scope, inbox.id, proposal, history_id, opts) do
       case status do
-        :existing -> existing(scope, inbox, action, opts)
-        :created -> apply_intent(scope, inbox, action, mutation, opts)
-        :blocked -> {:blocked, action}
+        :existing ->
+          existing(scope, inbox, action, opts)
+
+        :deferred ->
+          existing(scope, inbox, action, opts)
+          {:blocked, :already_reserved}
+
+        :created ->
+          apply_intent(scope, inbox, action, mutation, opts)
+
+        :blocked ->
+          {:blocked, action}
       end
     else
       false -> {:skip, :proposal_changed}

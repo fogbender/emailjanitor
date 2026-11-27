@@ -154,7 +154,7 @@ defmodule EmailJanitor.Store do
           record_review(scope, inbox_id, review_ids(evaluated_ids, opts))
         end
 
-        if uncovered == [], do: {:existing, existing}, else: {:blocked, :already_reserved}
+        if uncovered == [], do: {:existing, existing}, else: {:deferred, existing}
       else
         if stale?, do: scope.repo.rollback(:proposal_changed)
 
@@ -278,16 +278,7 @@ defmodule EmailJanitor.Store do
         prefix: scope.prefix
       )
 
-    for action <- cancelled,
-        do:
-          retire_metadata!(
-            scope,
-            policy,
-            inbox_id,
-            action.id,
-            retirement_ids(action.message_ids, opts),
-            action.message_ids -- retirement_ids(action.message_ids, opts)
-          )
+    for action <- cancelled, do: retire_cancelled_metadata!(scope, policy, inbox_id, action, opts)
 
     :ok
   end
@@ -341,19 +332,28 @@ defmodule EmailJanitor.Store do
         )
 
       for action <- cancelled,
-          do:
-            retire_metadata!(
-              scope,
-              policy,
-              inbox_id,
-              action.id,
-              retirement_ids(action.message_ids, opts),
-              action.message_ids -- retirement_ids(action.message_ids, opts)
-            )
+          do: retire_cancelled_metadata!(scope, policy, inbox_id, action, opts)
 
       record_review(scope, inbox_id, fence_ids)
       :retired
     end)
+  end
+
+  defp retire_cancelled_metadata!(scope, policy, inbox_id, action, opts) do
+    outstanding = action.remaining_metadata_ids || action.message_ids
+    ids = retirement_ids(outstanding, opts)
+    remaining = outstanding -- ids
+    retire_metadata!(scope, policy, inbox_id, action.id, ids, remaining)
+
+    scope.repo.update_all(
+      from(a in Action,
+        where: a.id == ^action.id and a.inbox_id == ^inbox_id and a.state == :cancelled
+      ),
+      [set: [remaining_metadata_ids: remaining]],
+      prefix: scope.prefix
+    )
+
+    :ok
   end
 
   defp retire_candidate!(scope, policy, inbox_id, candidate, opts) do

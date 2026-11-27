@@ -669,6 +669,74 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
   end
 
+  test "retaining uncovered work also recovers and settles its abandoned overlapping intent",
+       ctx do
+    messages = [message(), message(id: "message-2")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+    policy = %Policy{adapter: EmailJanitor.TargetPolicy, context: ctx.policy.context}
+
+    review = fn targets ->
+      database(fn ->
+        Executor.review(
+          ctx.scope,
+          ctx.inbox,
+          "thread-1",
+          {TestGmail, [state: ctx.state]},
+          {EmailJanitor.TargetClassifier, []},
+          "",
+          1,
+          cleanup_target_ids: targets
+        )
+      end)
+    end
+
+    {:ok, first} = review.(["message-1"])
+    parent = self()
+
+    assert {:error, :executor_unavailable} =
+             EmailJanitor.Owner.run(fn ->
+               database(fn ->
+                 {:ok, {:created, action}} =
+                   Store.intent(ctx.scope, ctx.inbox.id, first, "100", policy: policy)
+
+                 send(parent, {:orphan_for_overlap, action.id, self()})
+                 raise "Synthetic abandoned prewire action"
+               end)
+             end)
+
+    assert_receive {:orphan_for_overlap, action_id, owner}
+    monitor = Process.monitor(owner)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _}, 5_000
+    {:ok, combined} = review.(["message-1", "message-2"])
+
+    assert {:blocked, :already_reserved} =
+             database(fn ->
+               Executor.execute(ctx.scope, ctx.inbox, combined, {TestGmail, [state: ctx.state]},
+                 policy: policy
+               )
+             end)
+
+    database(fn ->
+      assert Store.get(ctx.scope, ctx.inbox.id, action_id).state == :cancelled
+
+      assert [[[], ["message-1"]]] ==
+               Ecto.Adapters.SQL.query!(
+                 TestRepo,
+                 "SELECT message_ids,not_applied_ids FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 AND kind='settle'",
+                 [action_id],
+                 log: false
+               ).rows
+
+      assert [%{message_ids: ["message-2"]}] =
+               TestRepo.all(
+                 Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                 prefix: ctx.scope.prefix
+               )
+    end)
+
+    assert Agent.get(ctx.state, & &1.calls) == []
+  end
+
   for entry <- [:settle_action, :execute] do
     test "#{entry} cannot overwrite terminal reconciliation with stale unresolved settlement",
          ctx do
