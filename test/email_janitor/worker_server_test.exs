@@ -126,6 +126,59 @@ defmodule EmailJanitor.WorkerServerTest do
     refute_receive :attempted, 100
   end
 
+  test "notification wake during a successful step coalesces into one immediate followup" do
+    owner = self()
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, ["a"]} end,
+         resolve: fn ref -> {:ok, config(ref)} end,
+         step: fn _ ->
+           send(owner, {:started, self()})
+           receive do: (:continue -> :ok)
+           {:ok, %{status: :idle, more?: false}}
+         end,
+         interval_ms: 5_000,
+         timeout_ms: 5_000}
+      )
+
+    assert_receive {:started, first}, 1_000
+    for _ <- 1..3, do: Server.wake(server)
+    assert :sys.get_state(server).entries["a"].pending_wake
+    refute_receive {:started, _}, 50
+    send(first, :continue)
+    assert_receive {:started, second}, 1_000
+    send(second, :continue)
+    refute_receive {:started, _}, 100
+  end
+
+  test "notification wake during a failed step preserves backoff and consumes the hint" do
+    owner = self()
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, ["a"]} end,
+         resolve: fn ref -> {:ok, config(ref)} end,
+         step: fn _ ->
+           send(owner, {:started, self()})
+           receive do: (:continue -> :ok)
+           {:ok, %{status: :rate_limited, more?: false}}
+         end,
+         interval_ms: 5_000,
+         timeout_ms: 5_000}
+      )
+
+    assert_receive {:started, first}, 1_000
+    Server.wake(server)
+    assert :sys.get_state(server).entries["a"].pending_wake
+    send(first, :continue)
+    wait_failed(server, 100)
+    refute Map.get(:sys.get_state(server).entries["a"], :pending_wake, false)
+    refute_receive {:started, _}, 100
+  end
+
   test "due backlog runs again promptly without waiting the normal poll interval" do
     owner = self()
     counter = start_supervised!({Agent, fn -> 0 end})

@@ -102,6 +102,8 @@ defmodule EmailJanitor.Worker.Server do
 
     entries =
       Map.new(state.entries, fn {key, entry} ->
+        busy = Enum.any?(state.running, fn {_, running} -> running.key == key end)
+        entry = if busy, do: Map.put(entry, :pending_wake, true), else: entry
         {key, if(entry.attempts == 0, do: %{entry | due: now}, else: entry)}
       end)
 
@@ -195,6 +197,7 @@ defmodule EmailJanitor.Worker.Server do
         delay =
           cond do
             repaired -> 0
+            outcome != :failed and Map.get(entry, :pending_wake, false) -> 0
             outcome == :more -> 100
             outcome == :failed -> min(state.interval_ms * Integer.pow(2, attempts), 300_000)
             true -> state.interval_ms
