@@ -90,12 +90,17 @@ defmodule EmailJanitor.SelfHost.Config do
   defp public_url(_), do: :error
 
   defp valid_host?(host) do
-    case :inet.parse_address(String.to_charlist(host)) do
+    case :inet.parse_strict_address(String.to_charlist(host)) do
       {:ok, _} ->
         true
 
       _ ->
-        byte_size(host) <= 253 and not Regex.match?(~r/\A[0-9.]+\z/, host) and
+        not match?({:ok, _}, :inet.parse_address(String.to_charlist(host))) and
+          not Regex.match?(
+            ~r/\A(?:[0-9]+|0[xX][a-fA-F0-9]+)\z/,
+            List.last(String.split(host, "."))
+          ) and
+          byte_size(host) <= 253 and not Regex.match?(~r/\A[0-9.]+\z/, host) and
           Enum.all?(String.split(host, "."), fn label ->
             Regex.match?(~r/\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\z/, label)
           end)
