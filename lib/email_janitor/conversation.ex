@@ -316,6 +316,7 @@ defmodule EmailJanitor.Conversation do
     Enum.reject(refs, &(&1.token in terminal))
   end
 
+  defp cleanup_result(ctx, {:deferred, _covering_id, result}), do: cleanup_result(ctx, result)
   defp cleanup_result(_ctx, {:done, id}), do: {"done", id}
   defp cleanup_result(_ctx, {:settlement_pending, id, :done}), do: {"done", id}
   defp cleanup_result(_ctx, {:settlement_pending, id, :unresolved}), do: {"unresolved", id}

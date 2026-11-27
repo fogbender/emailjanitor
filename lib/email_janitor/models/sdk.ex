@@ -55,7 +55,7 @@ defmodule EmailJanitor.Models.SDK do
              Content.new(user_text),
              schema,
              opts,
-             false
+             true
            ),
          {:ok, value} <- Jason.decode(Content.read(object)),
          {:ok, _} <- parse(value, target_ids) do
