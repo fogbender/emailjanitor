@@ -37,6 +37,6 @@ in (beam.mixRelease {
   postFixup = old.postFixup + ''
     wrapProgram "$out/bin/email_janitor" \
       --set RELEASE_DISTRIBUTION none \
-      --run 'export RELEASE_COOKIE="$(${coreutils}/bin/head -c 32 /dev/urandom | ${coreutils}/bin/base64)"'
+      --run 'export RELEASE_COOKIE="janitor_$(${coreutils}/bin/head -c 32 /dev/urandom | ${coreutils}/bin/base64)"'
   '';
 })
