@@ -58,10 +58,13 @@ bounded retry. Repeated disconnect is idempotent.
 
 Fresh consent for the same immutable Google subject remains blocked while any
 old revocation can still run, even through another OAuth client or address. A
-dead BEAM owner is insufficient subprocess-death proof: a persisted 60-second
-quarantine exceeds the 30-second owning operation plus its last possible
-13-second SDK process before recovery. Current successful calls wait for the
-helper's exit status. If Google's SDK already rejected the saved refresh grant
+dead BEAM owner is insufficient subprocess-death proof. A persisted retry time
+is only a scheduling hint: after confirming death, recovery waits 20 physical
+seconds outside SQL, then revalidates the exact request/owner and death proof
+under the mailbox lock. This bounds the final possible 13-second SDK helper even
+if the wall clock jumps forward. Live or unknown owners stay blocked. The whole
+operation remains bounded by its 60-second owner and 70-second job watchdogs.
+Current successful calls wait for the helper's exit status. If Google's SDK already rejected the saved refresh grant
 and the ordinary resolver erased it, local disconnect can complete without
 claiming Google project permissions were removed, provided no old revocation is
 pending. An unexplained missing capability is displayed as requiring manual
