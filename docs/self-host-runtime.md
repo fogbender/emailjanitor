@@ -58,6 +58,11 @@ credential-version check: a late response cannot revive a disconnected grant or
 overwrite newer consent. Revoked grants clear credentials, require reauthorization
 and invalidate prepared work. Each SDK resolver captures its explicit inbox and
 epoch; there is no ambient Google account or machine credential fallback.
+`Store.refs/0` exposes internal lifecycle pairs; a scheduler must use the
+`Store.worker_refs/0` adapter, whose bounded opaque binary keys include the
+connection epoch. `fetch_binding/1` decodes those keys and checks the live epoch;
+hosts normalize the verified binding back to an internal pair before building
+credential or policy closures.
 Concurrent refresh losers re-read a valid winning grant. A stale invalid-grant
 response likewise uses newer consent instead of reporting a false reconnect need.
 

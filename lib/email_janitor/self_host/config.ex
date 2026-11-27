@@ -80,7 +80,7 @@ defmodule EmailJanitor.SelfHost.Config do
          fragment: nil
        }}
       when is_binary(host) and host != "" and path in [nil, "/"] and port in 1..65_535 ->
-        if not Regex.match?(~r/:(?:0[0-9]*|)\/?\z/, value) and
+        if valid_host?(host) and not Regex.match?(~r/:(?:0[0-9]*|)\/?\z/, value) and
              (scheme == "https" or
                 (scheme == "http" and host in ["localhost", "127.0.0.1", "::1"])),
            do: {:ok, String.trim_trailing(value, "/")},
@@ -92,6 +92,19 @@ defmodule EmailJanitor.SelfHost.Config do
   end
 
   defp public_url(_), do: :error
+
+  defp valid_host?(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, _} ->
+        true
+
+      _ ->
+        byte_size(host) <= 253 and not Regex.match?(~r/\A[0-9.]+\z/, host) and
+          Enum.all?(String.split(host, "."), fn label ->
+            Regex.match?(~r/\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\z/, label)
+          end)
+    end
+  end
 
   defp database(env) do
     socket = Map.get(env, "JANITOR_DATABASE_SOCKET", "/run/postgresql")
