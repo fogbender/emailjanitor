@@ -660,6 +660,40 @@ defmodule EmailJanitor.GmailSDKTest do
     assert DateTime.compare(first_requested_at, second_requested_at) in [:lt, :eq]
   end
 
+  test "missing nested history messages always produce timestamped incomplete evidence" do
+    for field <- ~w(labelsAdded labelsRemoved messagesAdded messagesDeleted) do
+      mock(fn _ ->
+        Tesla.Mock.json(%{
+          "historyId" => "102",
+          "history" => [%{"id" => "101", field => [%{"labelIds" => ["INBOX"]}]}]
+        })
+      end)
+
+      assert {:ok,
+              %{
+                complete?: false,
+                reason: :invalid_history,
+                events: [],
+                added_message_ids: [],
+                deleted_message_ids: [],
+                started_at: %DateTime{}
+              }} =
+               SDK.history("inbox-1", "100", options())
+    end
+  end
+
+  test "malformed SDK history decoding also returns incomplete evidence" do
+    for response <- [
+          "PRIVATE_BODY_SENTINEL-not-json",
+          Jason.encode!(%{"historyId" => "102", "history" => [nil]})
+        ] do
+      mock(fn _ -> %Tesla.Env{status: 200, body: response} end)
+
+      assert {:ok, %{complete?: false, events: [], history_id: nil, started_at: %DateTime{}}} =
+               SDK.history("inbox-1", "100", options())
+    end
+  end
+
   test "malformed JSON from Google returns a fixed error without raw data" do
     mock(fn _ -> %Tesla.Env{status: 200, body: "PRIVATE_BODY_SENTINEL-not-json"} end)
 
