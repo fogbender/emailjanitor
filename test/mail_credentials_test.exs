@@ -117,6 +117,22 @@ defmodule EmailJanitor.MailCredentialsTest do
     end
   end
 
+  test "SDK rejects credential fields beyond their independent limits" do
+    base = F.config(fn _ -> flunk("oversized credentials must never reach HTTP") end)
+
+    valid = [
+      access_key_id: "synthetic-access",
+      secret_access_key: "synthetic-secret",
+      security_token: "synthetic-token"
+    ]
+
+    for {field, size} <- [access_key_id: 4097, secret_access_key: 4097, security_token: 16_385] do
+      credentials = Keyword.put(valid, field, String.duplicate("x", size))
+      config = %{base | credentials: fn -> {:ok, credentials} end}
+      assert {:error, :mail_unavailable} = SDK.prepare(config)
+    end
+  end
+
   defp stable_boundary(path, seconds, attempts) when attempts > 0 do
     now = System.system_time(:second)
     write(path, %{value() | "expires_at" => now + seconds})
