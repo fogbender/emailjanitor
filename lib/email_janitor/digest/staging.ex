@@ -121,6 +121,11 @@ defmodule EmailJanitor.Digest.Staging do
       {:ok, _} = Digest.record(scope, action.inbox_id, event)
     end
 
+    # Restoration may have completed before delayed settlement could promote
+    # these headers. Preserve the historical event but do not report it pending.
+    restored = Enum.filter(action.restored_message_ids, &(&1 in applied))
+    :ok = Digest.withdraw_pending(scope, action.inbox_id, restored)
+
     # Only this action's exact original targets have a durable terminal outcome.
     # Retain unrelated rows rather than claiming they were proved unapplied.
     scope.repo.delete_all(from(s in staged_query, where: s.message_id in ^action.message_ids),
