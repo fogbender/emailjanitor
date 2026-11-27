@@ -15,7 +15,7 @@ defmodule EmailJanitor.Executor do
          {:ok, history_id} <- safe(fn -> gmail.history_id(inbox.id, options) end),
          {:ok, {status, action}} <- Store.intent(scope, inbox.id, proposal, history_id, opts) do
       case status do
-        :existing -> existing(inbox, action, opts)
+        :existing -> existing(scope, inbox, action, opts)
         :created -> apply_intent(scope, inbox, action, gmail, options, opts)
         :blocked -> {:blocked, action}
       end
@@ -35,29 +35,27 @@ defmodule EmailJanitor.Executor do
         :ok = Store.transition(scope, inbox.id, action.id, :intent, :done)
 
         settle(
+          scope,
           inbox,
           action.id,
-          {:confirmed, action.message_ids},
           {:done, action.id},
-          :done,
           opts
         )
 
       _ ->
         :ok = Store.transition(scope, inbox.id, action.id, :intent, :unresolved)
-        settle(inbox, action.id, :unresolved, {:unresolved, action.id}, :unresolved, opts)
+        settle(scope, inbox, action.id, {:unresolved, action.id}, opts)
     end
   end
 
   def reconcile(scope, inbox, action_id, history, opts \\ []) do
     case Store.reconcile(scope, inbox.id, action_id, history) do
-      {:ok, {state, result}} = resolved ->
+      {:ok, {_state, _result}} = resolved ->
         settle(
+          scope,
           inbox,
           action_id,
-          {:reconciled, result.removed_ids, result.retry_ids},
           resolved,
-          state,
           opts
         )
 
@@ -68,36 +66,43 @@ defmodule EmailJanitor.Executor do
 
   @doc "Retry host settlement from durable outcomes without issuing any Gmail request."
   def settle_action(scope, inbox, action_id, opts \\ []) do
-    case Store.get(scope, inbox.id, action_id) do
-      nil -> {:error, :unknown_action}
-      action -> existing(inbox, action, opts)
-    end
+    settle(scope, inbox, action_id, nil, opts)
   end
 
-  defp existing(inbox, action, opts) do
-    result =
-      case action.state do
-        state when state in [:done, :restored, :cancelled] ->
-          {:reconciled, action.applied_message_ids,
-           action.message_ids -- action.applied_message_ids}
+  defp existing(scope, inbox, action, opts), do: settle_action(scope, inbox, action.id, opts)
 
-        :unresolved ->
-          :unresolved
+  defp settle(scope, inbox, id, success, opts) do
+    case Store.with_locked_action(scope, inbox.id, id, fn action ->
+           result =
+             case action.state do
+               state when state in [:done, :restored, :cancelled] ->
+                 {:reconciled, action.applied_message_ids,
+                  action.message_ids -- action.applied_message_ids}
 
-        :intent ->
-          :in_flight
-      end
+               :unresolved ->
+                 :unresolved
 
-    if result == :in_flight,
-      do: {:existing, action.id, action.state},
-      else:
-        settle(inbox, action.id, result, {:existing, action.id, action.state}, action.state, opts)
-  end
+               :intent ->
+                 :in_flight
+             end
 
-  defp settle(inbox, id, result, success, state, opts) do
-    case Policy.settle(Keyword.get(opts, :policy, Policy.unlimited()), inbox.id, id, result) do
-      :ok -> success
-      _ -> {:settlement_pending, id, state}
+           if result == :in_flight do
+             {:existing, action.id, action.state}
+           else
+             case Policy.settle(
+                    Keyword.get(opts, :policy, Policy.unlimited()),
+                    inbox.id,
+                    id,
+                    result
+                  ) do
+               :ok -> success || {:existing, action.id, action.state}
+               _ -> scope.repo.rollback({:settlement_pending, id, action.state})
+             end
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, {:settlement_pending, _, _} = pending} -> pending
+      error -> error
     end
   end
 

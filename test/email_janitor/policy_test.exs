@@ -56,7 +56,7 @@ defmodule EmailJanitor.PolicyTest do
     TestRepo
   }
 
-  alias EmailJanitor.Store.{Action, Scope}
+  alias EmailJanitor.Store.{Action, Candidate, Scope}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(TestRepo)
@@ -107,6 +107,40 @@ defmodule EmailJanitor.PolicyTest do
     assert [["reserve", ["message-1"]]] = events()
     assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
     assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "repeated blocked notifications retain one candidate and promote its ID on admission",
+       ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["reserve", ["message-1"]]] = events()
+    assert {:done, ^id} = execute(ctx, :allow)
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert %Action{id: ^id} = Store.get(ctx.scope, ctx.inbox.id, id)
+    assert [["message-1"]] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "a cancelled admitted candidate never lends its ID to a new reservation", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert {:ok, {:created, %Action{id: ^id}}} =
+             Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100",
+               policy: policy(ctx, :allow)
+             )
+
+    Ecto.Adapters.SQL.query!(
+      TestRepo,
+      "UPDATE #{ctx.scope.prefix}.actions SET state='cancelled' WHERE id=$1::uuid",
+      [Ecto.UUID.dump!(id)],
+      log: false
+    )
+
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: next}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    refute next == id
   end
 
   for mode <- [:error, :raise] do

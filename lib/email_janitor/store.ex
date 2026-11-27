@@ -2,11 +2,12 @@ defmodule EmailJanitor.Store do
   @moduledoc "Scoped durable intents and restoration history. No raw email or provider output is accepted."
   import Ecto.Query
   alias EmailJanitor.{Inbox, Policy, Proposal, Reconciliation}
-  alias EmailJanitor.Store.{Action, Mailbox, Migration, Scope}
+  alias EmailJanitor.Store.{Action, Candidate, CandidateMigration, Mailbox, Migration, Scope}
 
   def install(%Scope{repo: repo, prefix: prefix}) do
     Ecto.Adapters.SQL.query!(repo, ~s(CREATE SCHEMA IF NOT EXISTS "#{prefix}"), [], log: false)
     Ecto.Migrator.up(repo, 1, Migration, prefix: prefix, log: false)
+    Ecto.Migrator.up(repo, 2, CandidateMigration, prefix: prefix, log: false)
   end
 
   def add_inbox(%Scope{} = scope, %Inbox{} = inbox) do
@@ -62,15 +63,33 @@ defmodule EmailJanitor.Store do
       if existing do
         {:existing, existing}
       else
+        ids = Enum.sort(proposal.message_ids)
+
+        candidate =
+          scope.repo.get_by(Candidate, [inbox_id: inbox_id, message_ids: ids],
+            prefix: scope.prefix
+          ) ||
+            scope.repo.insert!(%Candidate{inbox_id: inbox_id, message_ids: ids},
+              prefix: scope.prefix
+            )
+
+        record = %{record | id: candidate.id}
         policy = Keyword.get(opts, :policy, Policy.unlimited())
         now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
 
         case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
-          :ok -> {:created, scope.repo.insert!(record, prefix: scope.prefix)}
+          :ok ->
+            action = scope.repo.insert!(record, prefix: scope.prefix)
+            scope.repo.delete!(candidate, prefix: scope.prefix)
+            {:created, action}
+
           # A block commits the host's pending-candidate metadata but never creates
           # a Gmail mutation intent. Errors roll back the entire reservation.
-          {:blocked, reason} -> {:blocked, reason}
-          {:error, reason} -> scope.repo.rollback(reason)
+          {:blocked, reason} ->
+            {:blocked, reason}
+
+          {:error, reason} ->
+            scope.repo.rollback(reason)
         end
       end
     end)
@@ -80,6 +99,27 @@ defmodule EmailJanitor.Store do
     scope.repo.one(from(a in Action, where: a.id == ^id and a.inbox_id == ^inbox_id),
       prefix: scope.prefix
     )
+  end
+
+  @doc "Read the current durable action and settle while transitions are excluded."
+  def with_locked_action(%Scope{} = scope, inbox_id, id, fun) do
+    scope.repo.transaction(fn ->
+      mailbox =
+        scope.repo.one(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if is_nil(mailbox), do: scope.repo.rollback(:unknown_action)
+
+      action =
+        scope.repo.one(
+          from(a in Action, where: a.id == ^id and a.inbox_id == ^inbox_id, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if is_nil(action), do: scope.repo.rollback(:unknown_action)
+      fun.(action)
+    end)
   end
 
   def transition(%Scope{} = scope, inbox_id, id, from_state, to_state)

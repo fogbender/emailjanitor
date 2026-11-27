@@ -36,6 +36,13 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
 
 ## Implemented foundation
 
+Host policy callbacks reserve and settle under database locks. Settlement rereads
+the current durable outcome while excluding reconciliation and transition races;
+retrying settlement cannot overwrite a newer outcome with stale uncertainty.
+Blocked admissions retain one non-mutation candidate ID per inbox/exact message
+set; admission promotes that same ID to an action. A later cancelled retry gets
+a new reservation ID. Candidate markers contain IDs only, never email bodies.
+
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
 - Validated, tool-free classifier boundary; transient content redaction and HTML
