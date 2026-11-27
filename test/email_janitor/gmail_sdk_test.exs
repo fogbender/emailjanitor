@@ -183,6 +183,7 @@ defmodule EmailJanitor.GmailSDKTest do
     for response <- [
           %{"historyId" => "not-a-cursor", "expiration" => "1795708800000"},
           %{"historyId" => "200", "expiration" => "not-an-expiration"},
+          %{"historyId" => "200", "expiration" => "100000000000000000000"},
           %{"historyId" => "200"}
         ] do
       mock(fn _ -> Tesla.Mock.json(response) end)
@@ -568,30 +569,45 @@ defmodule EmailJanitor.GmailSDKTest do
   test "history evidence records a timestamp before the first history HTTP request" do
     before_call = DateTime.utc_now()
 
-    mock(fn _ ->
-      send(self(), {:history_requested_at, DateTime.utc_now()})
-      Tesla.Mock.json(%{"historyId" => "100", "history" => []})
+    mock(fn env ->
+      page = env.query[:pageToken]
+      send(self(), {:history_requested_at, page, DateTime.utc_now()})
+
+      if page == nil do
+        Tesla.Mock.json(%{"historyId" => "100", "history" => [], "nextPageToken" => "second"})
+      else
+        assert page == "second"
+        Tesla.Mock.json(%{"historyId" => "100", "history" => []})
+      end
     end)
 
     assert {:ok, %{complete?: true, started_at: started_at}} =
              SDK.history("inbox-1", "100", options())
 
-    assert_received {:history_requested_at, requested_at}
+    assert_received {:history_requested_at, nil, first_requested_at}
+    assert_received {:history_requested_at, "second", second_requested_at}
     assert DateTime.compare(before_call, started_at) in [:lt, :eq]
-    assert DateTime.compare(started_at, requested_at) in [:lt, :eq]
+    assert DateTime.compare(started_at, first_requested_at) in [:lt, :eq]
+    assert DateTime.compare(first_requested_at, second_requested_at) in [:lt, :eq]
   end
 
   test "expired history and incomplete pagination never become retry evidence" do
     mock(fn _ -> Tesla.Mock.json(%{"error" => "PRIVATE_BODY_SENTINEL"}, status: 404) end)
 
-    assert {:ok, %{complete?: false, reason: :history_expired, events: []}} =
+    assert {:ok,
+            %{
+              complete?: false,
+              reason: :history_expired,
+              events: [],
+              started_at: %DateTime{}
+            }} =
              SDK.history("inbox-1", "100", options())
 
     mock(fn _ ->
       Tesla.Mock.json(%{"historyId" => "102", "nextPageToken" => "more", "history" => []})
     end)
 
-    assert {:ok, %{complete?: false, reason: :page_limit, events: []}} =
+    assert {:ok, %{complete?: false, reason: :page_limit, events: [], started_at: %DateTime{}}} =
              SDK.history("inbox-1", "100", options(max_pages: 1))
   end
 
@@ -600,17 +616,19 @@ defmodule EmailJanitor.GmailSDKTest do
       Tesla.Mock.json(%{"historyId" => "102", "nextPageToken" => "same", "history" => []})
     end)
 
-    assert {:ok, %{complete?: false, reason: :page_loop}} =
+    assert {:ok, %{complete?: false, reason: :page_loop, started_at: %DateTime{}}} =
              SDK.history("inbox-1", "100", options())
 
     mock(fn _ -> Tesla.Mock.json(%{"historyId" => "102", "history" => [%{"id" => "broken"}]}) end)
 
-    assert {:ok, %{complete?: false, reason: :invalid_history}} =
+    assert {:ok, %{complete?: false, reason: :invalid_history, started_at: %DateTime{}}} =
              SDK.history("inbox-1", "100", options())
   end
 
   test "a failed later history page discards partial evidence" do
     mock(fn env ->
+      send(self(), {:history_requested_at, env.query[:pageToken], DateTime.utc_now()})
+
       if env.query[:pageToken] == nil do
         Tesla.Mock.json(%{
           "historyId" => "102",
@@ -627,8 +645,19 @@ defmodule EmailJanitor.GmailSDKTest do
       end
     end)
 
-    assert {:ok, %{complete?: false, reason: :gmail_unavailable, events: []}} =
+    assert {:ok,
+            %{
+              complete?: false,
+              reason: :gmail_unavailable,
+              events: [],
+              started_at: started_at
+            }} =
              SDK.history("inbox-1", "100", options())
+
+    assert_received {:history_requested_at, nil, first_requested_at}
+    assert_received {:history_requested_at, "next", second_requested_at}
+    assert DateTime.compare(started_at, first_requested_at) in [:lt, :eq]
+    assert DateTime.compare(first_requested_at, second_requested_at) in [:lt, :eq]
   end
 
   test "malformed JSON from Google returns a fixed error without raw data" do

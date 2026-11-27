@@ -82,9 +82,8 @@ defmodule EmailJanitor.Gmail.SDK do
                  body: %Model.WatchRequest{topicName: topic}
                )
              end),
-           true <- history_id?(id) and is_binary(expiry),
-           {milliseconds, ""} when milliseconds > 0 <- Integer.parse(expiry),
-           {:ok, expires_at} <- DateTime.from_unix(milliseconds, :millisecond) do
+           true <- history_id?(id),
+           {:ok, expires_at} <- watch_expiration(expiry) do
         {:ok, %{history_id: id, expires_at: expires_at}}
       else
         {:error, _} = error -> error
@@ -418,6 +417,17 @@ defmodule EmailJanitor.Gmail.SDK do
        }}
 
   defp history_id?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9]{1,32}\z/, value)
+
+  defp watch_expiration(value) when is_binary(value) do
+    with {milliseconds, ""} when milliseconds > 0 <- Integer.parse(value),
+         {:ok, expires_at} <- DateTime.from_unix(milliseconds, :millisecond) do
+      {:ok, expires_at}
+    else
+      _ -> {:error, :invalid_watch}
+    end
+  end
+
+  defp watch_expiration(_), do: {:error, :invalid_watch}
 
   defp call(fun) do
     case fun.() do
