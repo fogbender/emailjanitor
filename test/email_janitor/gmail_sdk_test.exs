@@ -234,7 +234,19 @@ defmodule EmailJanitor.GmailSDKTest do
       "body" => %{"attachmentId" => "attachment-reference"}
     }
 
-    for payload <- [attachment, %{"mimeType" => "multipart/mixed", "parts" => [attachment]}] do
+    for payload <- [
+          attachment,
+          %{"mimeType" => "multipart/mixed", "parts" => [attachment]},
+          %{"mimeType" => "multipart/mixed", "parts" => [part("text/plain", ""), attachment]},
+          %{
+            "mimeType" => "multipart/mixed",
+            "parts" => [part("text/plain", " \n\t"), attachment]
+          },
+          %{
+            "mimeType" => "multipart/mixed",
+            "parts" => [%{"mimeType" => "text/plain", "body" => %{"size" => 0}}, attachment]
+          }
+        ] do
       mock(fn _ ->
         Tesla.Mock.json(%{"id" => "thread-1", "messages" => [gmail_message(payload)]})
       end)

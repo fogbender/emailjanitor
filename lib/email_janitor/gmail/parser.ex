@@ -13,6 +13,8 @@ defmodule EmailJanitor.Gmail.Parser do
          {:ok, headers} <- headers(payload.headers),
          {:ok, fragments} <- parts(payload, 0),
          true <- fragments != [],
+         true <-
+           not omitted_attachment?(payload, 0) or Enum.any?(fragments, &(String.trim(&1) != "")),
          body = Enum.join(fragments, "\n"),
          true <- byte_size(body) <= @max_text,
          {:ok, date} <- date(value.internalDate) do
@@ -81,6 +83,15 @@ defmodule EmailJanitor.Gmail.Parser do
   end
 
   defp parts(_, _), do: {:error, :invalid_mime}
+
+  defp omitted_attachment?(_, depth) when depth > 30, do: true
+
+  defp omitted_attachment?(%Google.MessagePart{filename: name}, _)
+       when is_binary(name) and name != "",
+       do: true
+
+  defp omitted_attachment?(%Google.MessagePart{} = part, depth),
+    do: Enum.any?(part.parts || [], &omitted_attachment?(&1, depth + 1))
 
   # AMP is an alternative representation, and related inline images are visual
   # resources. Omit them only when supported readable text is also available.
