@@ -21,6 +21,7 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
          {:ok, decoded} <- decode(value) do
       {:ok, decoded}
     else
+      {:error, :parser_start_unavailable} -> {:error, :reply_parser_unavailable}
       _ -> unsupported()
     end
   rescue
@@ -42,22 +43,30 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
   end
 
   defp command(executable, frame) do
-    port =
-      Port.open({:spawn_executable, String.to_charlist(executable)}, [
-        :binary,
-        :exit_status,
-        :use_stdio,
-        :stderr_to_stdout,
-        :hide
-      ])
-
-    try do
-      true = Port.command(port, frame)
-      receive_output(port, <<>>, System.monotonic_time(:millisecond) + 5_000)
-    after
-      if Port.info(port), do: Port.close(port)
-      drain(port)
+    with {:ok, port} <- open(executable) do
+      try do
+        true = Port.command(port, frame)
+        receive_output(port, <<>>, System.monotonic_time(:millisecond) + 5_000)
+      after
+        if Port.info(port), do: Port.close(port)
+        drain(port)
+      end
     end
+  end
+
+  defp open(executable) do
+    {:ok,
+     Port.open({:spawn_executable, String.to_charlist(executable)}, [
+       :binary,
+       :exit_status,
+       :use_stdio,
+       :stderr_to_stdout,
+       :hide
+     ])}
+  rescue
+    _ -> {:error, :parser_start_unavailable}
+  catch
+    _, _ -> {:error, :parser_start_unavailable}
   end
 
   defp receive_output(port, buffer, deadline) do

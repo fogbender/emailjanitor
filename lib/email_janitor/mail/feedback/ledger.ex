@@ -31,6 +31,8 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
            if get(scope, row.id) do
              insert(scope, row)
            else
+             now = DateTime.utc_now()
+
              pending =
                from(r in Record,
                  where:
@@ -41,7 +43,10 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
                        :waiting_sent,
                        :workflow_retry,
                        :reply_pending
-                     ]
+                     ] and
+                     ((is_nil(r.authenticated_at) and r.expires_at > ^now) or
+                        (not is_nil(r.authenticated_at) and
+                           r.authenticated_at > ^DateTime.add(now, -3600)))
                )
 
              sender = from(r in pending, where: r.sender_inbox_id == ^row.sender_inbox_id)
@@ -180,7 +185,6 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
         ids = Enum.map(rows, &elem(&1, 0))
         # Signup recipients have no Google identity/actions. Remove their exact old
         # reply metadata first, then the unused synthetic transport-only mailbox.
-        signup_ids = for {id, :signup, _} <- rows, do: id
 
         for inbox_id <-
               rows
@@ -195,12 +199,14 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
           )
         end
 
-        scope.repo.delete_all(
-          from(o in EmailJanitor.Mail.Outgoing,
-            where: o.dedupe_id in ^signup_ids and o.inserted_at < ^cutoff
-          ),
-          prefix: scope.prefix
-        )
+        for {id, :signup, inbox_id} <- rows do
+          scope.repo.delete_all(
+            from(o in EmailJanitor.Mail.Outgoing,
+              where: o.inbox_id == ^inbox_id and o.kind == :assistant and o.dedupe_id == ^id
+            ),
+            prefix: scope.prefix
+          )
+        end
 
         scope.repo.delete_all(from(r in Record, where: r.id in ^ids), prefix: scope.prefix)
 

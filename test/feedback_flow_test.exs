@@ -519,7 +519,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     {:ok, live_id} =
       accept(ctx, %{ctx.incoming | id: "ses-live"}, raw(ctx.sender.address, "live@example.com"))
 
-    old = DateTime.add(DateTime.utc_now(), -8 * 86400)
+    old = DateTime.add(DateTime.utc_now(), -7 * 86400 - 60)
 
     Repo.update_all(
       from(r in Record, where: r.id in ^[signup_id, stale_id, live_id]),
@@ -539,7 +539,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
       prefix: ctx.scope.prefix
     )
 
-    Repo.update_all(EmailJanitor.Mail.Outgoing, [set: [inserted_at: old]],
+    Repo.update_all(EmailJanitor.Mail.Outgoing, [set: [inserted_at: DateTime.add(old, 120)]],
       prefix: ctx.scope.prefix
     )
 
@@ -549,5 +549,76 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Ledger.get(ctx.scope, live_id)
     assert Repo.get(Store.Mailbox, signup.sender_inbox_id, prefix: ctx.scope.prefix) == nil
     assert Repo.all(EmailJanitor.Mail.Outgoing, prefix: ctx.scope.prefix) == []
+  end
+
+  test "expired hint state does not consume admission and the global live receipt ceiling is enforced",
+       ctx do
+    for n <- 1..20 do
+      assert {:ok, _} =
+               accept(
+                 ctx,
+                 %{ctx.incoming | id: "expired-#{n}"},
+                 raw(ctx.sender.address, "expired-#{n}@example.com")
+               )
+    end
+
+    Repo.update_all(Record, [set: [expires_at: DateTime.add(DateTime.utc_now(), -1)]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:ok, _} =
+             accept(
+               ctx,
+               %{ctx.incoming | id: "after-outage"},
+               raw(ctx.sender.address, "after-outage@example.com")
+             )
+
+    now = DateTime.utc_now()
+
+    rows =
+      for n <- 1..999 do
+        %{
+          id: Ecto.UUID.generate(),
+          kind: :feedback,
+          source_ses_id: "global-#{n}",
+          sender_address: "other@example.net",
+          sender_inbox_id: "other-#{n}",
+          rfc_message_id: "global-#{n}@example.net",
+          route_key: "other",
+          received_at: now,
+          expires_at: DateTime.add(now, 3600),
+          state: :pending,
+          inserted_at: now,
+          updated_at: now
+        }
+      end
+
+    Repo.insert_all(Record, rows, prefix: ctx.scope.prefix)
+
+    assert :ignored =
+             accept(
+               ctx,
+               %{ctx.incoming | id: "global-overflow"},
+               raw(ctx.sender.address, "global-overflow@example.com")
+             )
+
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 0
+  end
+
+  test "a missing parser is rejected at configuration and a removed executable retries as infrastructure failure",
+       ctx do
+    opts =
+      ctx.config
+      |> Map.from_struct()
+      |> Map.to_list()
+      |> Keyword.put(:parser_executable, "/nonexistent-emailjanitor-parser")
+
+    assert {:error, :invalid_feedback_configuration} = Config.new(opts)
+    config = %{ctx.config | parser_executable: "/nonexistent-emailjanitor-parser"}
+    {:ok, id} = accept(ctx)
+    assert {:ok, :deferred} = Feedback.process(config, id)
+    assert Ledger.get(ctx.scope, id).state == :waiting_sent
+    assert Agent.get(ctx.state, & &1.commands) == []
+    assert Agent.get(ctx.state, & &1.deliveries) == []
   end
 end
