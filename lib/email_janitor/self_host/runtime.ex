@@ -101,7 +101,8 @@ defmodule EmailJanitor.SelfHost.Runtime do
          {:ok, gmail} <- Adapters.gmail(ref),
          {:ok, model} <- Adapters.model(config),
          {:ok, mail} <- Adapters.mail(config),
-         {:ok, lifecycle} <- lifecycle(binding) do
+         {:ok, lifecycle} <- lifecycle(binding),
+         :ok <- Authority.discover(ref, inbox) do
       guard = fn -> Store.guard(ref, inbox) end
 
       module.new(SelfHost.scope(), inbox,

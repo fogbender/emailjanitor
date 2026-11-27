@@ -49,6 +49,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       EmailJanitor.Gmail.Ingestion.install(scope)
       EmailJanitor.Worker.install(scope)
       Digest.install_staging(scope)
+      EmailJanitor.Conversation.Ledger.install(scope)
       EmailJanitor.Mail.Feedback.install(scope)
       HostStore.install(scope)
       Ecto.Migrator.up(Repo, 102, SelfHost.AuthorityMigration, prefix: scope.prefix, log: false)
@@ -287,6 +288,137 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     }
 
     assert {:error, :transport_unavailable} = SelfHost.Transport.install(changed)
+  end
+
+  defp bound_action(ctx, ids) do
+    alias EmailJanitor.Conversation.{ExecutionPolicy, Ledger, Plan}
+    request = Ecto.UUID.generate()
+    conversation = Ecto.UUID.generate()
+    refs = Enum.map(ids, &reference(ctx, &1))
+
+    plan = %Plan{
+      operation: :done,
+      references: Enum.map(refs, & &1.token),
+      preference_target: :none,
+      instruction: Content.new(""),
+      query: Content.new(""),
+      reply: Content.new(""),
+      search_complete: true
+    }
+
+    {:ok, receipt} =
+      Ledger.reserve(ctx.scope, ctx.box.id, conversation, request, plan, refs, fn -> :ok end)
+
+    :ok = Authority.record(ctx.ref, ctx.owner, conversation, request, :done, refs)
+    {:ok, base} = ActivityPolicy.for_references(ctx.ref, ctx.box, refs)
+    policy = ExecutionPolicy.new(base, ctx.scope, ctx.box.id, receipt)
+    {:ok, reviewed} = proposal(Enum.map(ids, &message(id: &1)), ctx)
+
+    {:ok, {:created, action}} =
+      CoreStore.intent(ctx.scope, ctx.box.id, reviewed, "100", policy: policy)
+
+    {request, action}
+  end
+
+  test "manual discovery recovers only a real bound undispatched action without refreshing authority or backoff",
+       ctx do
+    alias EmailJanitor.Gmail.Ingestion
+    alias EmailJanitor.Worker.Candidate
+    alias EmailJanitor.Store.ReviewFence
+
+    {:ok, _} =
+      Ingestion.baseline(ctx.scope, ctx.box, %{
+        history_id: "100",
+        expires_at: DateTime.add(DateTime.utc_now(), 3600)
+      })
+
+    {request, action} = bound_action(ctx, ["m1", "m2"])
+    assert :ok = CoreStore.cancel_prepared(ctx.scope, ctx.box.id, action.id, action.owner_token)
+
+    first_fence =
+      Repo.get_by!(ReviewFence, [inbox_id: ctx.box.id, message_id: "m1"],
+        prefix: ctx.scope.prefix
+      ).reviewed_at
+
+    assert :ok = Authority.discover(ctx.ref, ctx.box)
+
+    source =
+      Repo.get_by!(Candidate, [inbox_id: ctx.box.id, candidate_id: action.id],
+        prefix: ctx.scope.prefix
+      )
+
+    assert source.authority_id == request
+    assert source.message_ids == ["m1", "m2"]
+    assert source.source_kind == :manual and source.requested
+    retry = DateTime.add(DateTime.utc_now(), 120)
+
+    Repo.update!(Ecto.Changeset.change(source, attempts: 3, next_attempt_at: retry),
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok = Authority.discover(ctx.ref, ctx.box)
+
+    replay =
+      Repo.get_by!(Candidate, [inbox_id: ctx.box.id, candidate_id: action.id],
+        prefix: ctx.scope.prefix
+      )
+
+    assert replay.attempts == 3 and replay.next_attempt_at == retry
+    assert replay.request_version == source.request_version
+
+    assert Repo.get_by!(ReviewFence, [inbox_id: ctx.box.id, message_id: "m1"],
+             prefix: ctx.scope.prefix
+           ).reviewed_at == first_fence
+
+    # An exact fresh Keep retirement must survive later host discovery.
+    assert {:ok, :retired} =
+             CoreStore.retire_ineligible(
+               ctx.scope,
+               ctx.box.id,
+               action.thread_id,
+               1,
+               DateTime.add(DateTime.utc_now(), 1),
+               policy: ActivityPolicy.settlement(ctx.ref, ctx.box),
+               evaluated_message_ids: ["m1"],
+               inbox_message_ids: ["m1", "m2"]
+             )
+
+    assert :ok = Authority.discover(ctx.ref, ctx.box)
+
+    assert Repo.get_by!(Candidate, [inbox_id: ctx.box.id, candidate_id: action.id],
+             prefix: ctx.scope.prefix
+           ).message_ids == ["m2"]
+
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert {:error, :manual_authorization_changed} = Authority.discover(ctx.ref, ctx.box)
+  end
+
+  test "manual discovery never invents a source from an unbound grant or an ambiguous wire action",
+       ctx do
+    alias EmailJanitor.Worker.Candidate
+    alias EmailJanitor.Gmail.Ingestion
+
+    {:ok, _} =
+      Ingestion.baseline(ctx.scope, ctx.box, %{
+        history_id: "100",
+        expires_at: DateTime.add(DateTime.utc_now(), 3600)
+      })
+
+    assert :ok =
+             Authority.record(
+               ctx.ref,
+               ctx.owner,
+               Ecto.UUID.generate(),
+               Ecto.UUID.generate(),
+               :done,
+               [reference(ctx, "unbound")]
+             )
+
+    {_request, action} = bound_action(ctx, ["m1"])
+    assert :ok = CoreStore.begin_dispatch(ctx.scope, ctx.box.id, action.id, action.owner_token)
+    assert :ok = CoreStore.transition(ctx.scope, ctx.box.id, action.id, :intent, :unresolved)
+    assert :ok = Authority.discover(ctx.ref, ctx.box)
+    assert Repo.aggregate(Candidate, :count, prefix: ctx.scope.prefix) == 0
   end
 
   test "the registered digest worker sends recorded Done at local21:00 exactly once", ctx do

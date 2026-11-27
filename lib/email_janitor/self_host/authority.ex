@@ -34,9 +34,13 @@ end
 
 defmodule EmailJanitor.SelfHost.Authority do
   @moduledoc "Host-authenticated, metadata-only manual retry grants; never inferred from a core candidate."
+  import Ecto.Query
   alias EmailJanitor.{SelfHost, Conversation.Reference, Gmail.Parser}
   alias EmailJanitor.Store, as: CoreStore
   alias EmailJanitor.SelfHost.{Grant, Owner, Store}
+  alias EmailJanitor.Conversation.Ledger.ActionBinding
+  alias EmailJanitor.Store.Action
+  alias EmailJanitor.Worker.Candidate
 
   def record(_ref, _owner, _conversation, _request, operation, _refs) when operation != :done,
     do: :ok
@@ -117,6 +121,87 @@ defmodule EmailJanitor.SelfHost.Authority do
          true <-
            subject == binding.google_subject and epoch == binding.epoch and ids -- granted == [] do
       :ok
+    else
+      _ -> {:error, :manual_authorization_changed}
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  end
+
+  @doc "Discover only this epoch's real, bound and proven-undispatched manual work."
+  def discover({id, epoch} = ref, inbox) do
+    scope = SelfHost.scope()
+
+    with :ok <- Store.guard(ref, inbox),
+         {:ok, binding, _} <- Store.fetch_binding(ref),
+         %Owner{subject: owner} <- scope.repo.get(Owner, 1, prefix: scope.prefix, log: false) do
+      rows =
+        scope.repo.all(
+          from(g in Grant,
+            join: b in ActionBinding,
+            on: b.inbox_id == g.inbox_id and b.request_id == g.request_id,
+            join: a in Action,
+            on: a.id == b.action_id and a.inbox_id == b.inbox_id,
+            left_join: source in Candidate,
+            on: source.inbox_id == a.inbox_id and source.candidate_id == a.id,
+            where:
+              g.inbox_id == ^id and g.connection_epoch == ^epoch and
+                g.owner_subject == ^owner and g.google_subject == ^binding.google_subject and
+                a.state == :cancelled and is_nil(a.dispatch_started_at) and
+                fragment(
+                  "cardinality(COALESCE(?, ?)) > 0",
+                  a.remaining_metadata_ids,
+                  a.message_ids
+                ) and
+                (is_nil(source.candidate_id) or
+                   (source.source_kind == :manual and source.status == :pending and
+                      not fragment(
+                        "? <@ COALESCE(?, ?)",
+                        source.message_ids,
+                        a.remaining_metadata_ids,
+                        a.message_ids
+                      ))),
+            order_by: [asc: a.updated_at, asc: a.id],
+            limit: 100,
+            select: {g.request_id, g.message_ids, b.message_ids, a}
+          ),
+          prefix: scope.prefix,
+          log: false
+        )
+
+      Enum.reduce_while(rows, :ok, fn {request, granted, bound, action}, :ok ->
+        ids =
+          Enum.filter(
+            action.remaining_metadata_ids || action.message_ids,
+            &(&1 in granted and &1 in bound)
+          )
+
+        if ids == [] do
+          {:cont, :ok}
+        else
+          case Store.transaction(fn scoped ->
+                 Store.lock_mailbox(scoped, id)
+
+                 with :ok <- Store.guard(ref, inbox),
+                      :ok <- allow(ref, request, ids) do
+                   EmailJanitor.Worker.queue_manual(
+                     scoped,
+                     inbox,
+                     action.id,
+                     action.thread_id,
+                     ids,
+                     authority_id: request,
+                     refresh_authority: false
+                   )
+                 end
+               end) do
+            {:ok, :ok} -> {:cont, :ok}
+            {:ok, {:error, :ineligible_recheck}} -> {:cont, :ok}
+            {:error, :ineligible_recheck} -> {:cont, :ok}
+            _ -> {:halt, {:error, :manual_authorization_changed}}
+          end
+        end
+      end)
     else
       _ -> {:error, :manual_authorization_changed}
     end
