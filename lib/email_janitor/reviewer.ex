@@ -13,8 +13,9 @@ defmodule EmailJanitor.Reviewer do
         opts \\ []
       ) do
     with {:ok, messages, masked?} <- select_targets(messages, opts),
-         {:classify, _} <- Safeguards.evaluate(messages, inbox, contacted_keys, restored),
-         {:ok, classifier_messages} <- self_mail_filter(messages, opts),
+         {:ok, classifier_messages} <- filter_self_mail(messages, opts),
+         {:classify, _} <-
+           Safeguards.evaluate(classifier_messages, inbox, contacted_keys, restored),
          [_ | _] = targets <- Enum.filter(classifier_messages, &Message.cleanup_target?/1),
          {:ok, decisions} <-
            classify(masked?, classifier, classifier_messages, instructions, inbox) do
@@ -54,7 +55,8 @@ defmodule EmailJanitor.Reviewer do
     end
   end
 
-  defp self_mail_filter(messages, opts) do
+  @doc "Exclude only scoped, positively verified Janitor deliveries before identity/contact safeguards."
+  def filter_self_mail(messages, opts) do
     matcher = Keyword.get(opts, :self_mail, fn _ -> {:ok, false} end)
 
     if is_function(matcher, 1) do
