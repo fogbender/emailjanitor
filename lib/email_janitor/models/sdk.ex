@@ -84,15 +84,9 @@ defmodule EmailJanitor.Models.SDK do
     # no executable tools, so use its normal text API and validate JSON locally.
     generated = generate(config.provider, model, context, options, schema)
 
-    with {:ok, response} <- generated,
-         object =
-           if(config.provider == :bedrock,
-             do: ReqLLM.Response.text(response),
-             else: ReqLLM.Response.object(response)
-           ),
-         {:ok, _} <- parse(object, target_ids) do
-      if is_binary(object), do: Jason.decode(object), else: {:ok, object}
-    else
+    case generated do
+      {:ok, response} -> decision_object(response, config.provider, target_ids)
+      {:invalid, :decision} -> {:invalid, :decision}
       _ -> {:error, :model_unavailable}
     end
   rescue
@@ -103,6 +97,24 @@ defmodule EmailJanitor.Models.SDK do
 
     _, _ ->
       {:error, :model_unavailable}
+  end
+
+  # Only parsing an already successful provider response produces this fixed
+  # invalid result; transport/auth/timeouts retain the retryable outage result.
+  defp decision_object(response, provider, target_ids) do
+    object =
+      if provider == :bedrock,
+        do: ReqLLM.Response.text(response),
+        else: ReqLLM.Response.object(response)
+
+    case parse(object, target_ids) do
+      {:ok, _} -> if is_binary(object), do: Jason.decode(object), else: {:ok, object}
+      _ -> {:invalid, :decision}
+    end
+  rescue
+    _ -> {:invalid, :decision}
+  catch
+    _, _ -> {:invalid, :decision}
   end
 
   # ReqLLM 1.31 emits raw request-bearing exceptions even with payloads:none.
@@ -163,14 +175,26 @@ defmodule EmailJanitor.Models.SDK do
           error_steps: Keyword.delete(request.error_steps, :llm_telemetry_exception)
       }
 
-      ReqLLM.Runtime.execute_prepared(request, deadline, fn
-        %Req.Response{status: status, body: %ReqLLM.Response{} = response}
-        when status in 200..299 ->
-          {:ok, response}
+      result =
+        ReqLLM.Runtime.execute_prepared(request, deadline, fn
+          %Req.Response{status: status, body: %ReqLLM.Response{} = response}
+          when status in 200..299 ->
+            {:ok, response}
 
-        _ ->
-          {:error, :model_unavailable}
-      end)
+          %Req.Response{status: status} when status in 200..299 ->
+            {:invalid, :decision}
+
+          _ ->
+            {:error, :model_unavailable}
+        end)
+
+      case result do
+        {:error, %ReqLLM.Error.API.Response{status: status}} when status in 200..299 ->
+          {:invalid, :decision}
+
+        other ->
+          other
+      end
     end
   end
 

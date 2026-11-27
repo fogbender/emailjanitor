@@ -277,7 +277,7 @@ defmodule EmailJanitor.ModelsTest do
         do: Logger.put_process_level(self(), level),
         else: Logger.delete_process_level(self())
 
-      logs = capture_log(fn -> assert {:error, :model_unavailable} = run(:bedrock) end)
+      logs = capture_log(fn -> assert {:error, :invalid_decision} = run(:bedrock) end)
       refute logs =~ "PRIVATE_BODY_SENTINEL"
       assert Logger.get_process_level(self()) == level
     end
@@ -627,7 +627,7 @@ defmodule EmailJanitor.ModelsTest do
       })
     end)
 
-    assert {:error, _} = run(:azure)
+    assert {:error, :invalid_decision} = run(:azure)
   end
 
   test "model dispatch fails closed when a raw HTTP exporter or SDK debug mode is enabled" do
@@ -661,7 +661,38 @@ defmodule EmailJanitor.ModelsTest do
       })
     end)
 
-    assert {:error, :model_unavailable} = run(:azure)
+    assert {:error, :invalid_decision} = run(:azure)
+  end
+
+  test "successful Azure transport with malformed tool JSON reports invalid decision, not outage" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        id: "test-completion",
+        object: "chat.completion",
+        model: "gpt-4o-mini",
+        choices: [
+          %{
+            index: 0,
+            finish_reason: "tool_calls",
+            message: %{
+              role: "assistant",
+              content: nil,
+              tool_calls: [
+                %{
+                  id: "tool-1",
+                  type: "function",
+                  function: %{name: "structured_output", arguments: "{PRIVATE_BODY_SENTINEL"}
+                }
+              ]
+            }
+          }
+        ],
+        usage: %{prompt_tokens: 1, completion_tokens: 1, total_tokens: 2}
+      })
+    end)
+
+    logs = capture_log(fn -> assert {:error, :invalid_decision} = run(:azure) end)
+    refute logs =~ "PRIVATE_BODY_SENTINEL"
   end
 
   test "Nova text must be valid constrained JSON, not a tool or prose fallback" do
@@ -673,7 +704,7 @@ defmodule EmailJanitor.ModelsTest do
       })
     end)
 
-    assert {:error, :model_unavailable} = run(:bedrock)
+    assert {:error, :invalid_decision} = run(:bedrock)
   end
 
   test "config offers only Bedrock self-host and Azure SaaS, and redacts secrets" do
