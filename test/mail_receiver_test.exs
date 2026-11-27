@@ -197,8 +197,9 @@ defmodule EmailJanitor.MailReceiverTest do
     assert {:next, "incoming/later", 0} = Receiver.sweep_orphans(config, nil)
     assert {:next, nil, 60_000} = Receiver.sweep_orphans(config, "incoming/later")
     assert_received {:deleted, "/janitor-spool/incoming/tail"}
-    assert length(Receiver.children(config)) == 5
-    assert Receiver.children(config) |> Enum.map(& &1.id) |> Enum.uniq() |> length() == 5
+    assert length(Receiver.children(config)) == 6
+    assert Receiver.children(config) |> Enum.map(& &1.id) |> Enum.uniq() |> length() == 6
+    assert {:next, nil, 60_000} = Receiver.purge_feedback(config)
     refute inspect(config) =~ "PRIVATE_SMTP_COMMAND_BODY"
   end
 end
