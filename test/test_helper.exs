@@ -28,6 +28,7 @@ for prefix <- [
   EmailJanitor.Mail.Store.install(scope)
   EmailJanitor.Digest.install(scope)
   EmailJanitor.Conversation.Ledger.install(scope)
+  EmailJanitor.SelfHost.Web.install(scope)
 end
 
 for prefix <- ["ej_digest_stage", "ej_digest_stage_other", "ej_digest_stage_concurrency"] do

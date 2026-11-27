@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Run inside: nix develop .#browser --command bash scripts/check-browser
+set -euo pipefail
+# Runtime configuration must never start the deployed Repo/Stripe worker here.
+unset JANITOR_ENABLE_SELF_HOST JANITOR_ENABLE_SELF_HOST_WEB
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+umask 077
+janitor_browser_dir=$(mktemp -d /tmp/emailjanitor-browser.XXXXXX)
+janitor_browser_pg=false
+export JANITOR_BROWSER_ARTIFACT_DIR="${JANITOR_BROWSER_ARTIFACT_DIR:-$(mktemp -d /tmp/emailjanitor-browser-artifacts.XXXXXX)}"
+janitor_browser_pid=''
+cleanup() {
+  janitor_browser_exit=$?
+  if [ -n "$janitor_browser_pid" ]; then
+    kill "$janitor_browser_pid" 2>/dev/null || true
+    wait "$janitor_browser_pid" 2>/dev/null || true
+  fi
+  if "$janitor_browser_pg"; then
+    pg_ctl -D "$janitor_browser_dir/data" -m immediate -w -t 10 stop >/dev/null || true
+  fi
+  if [ "$janitor_browser_exit" -ne 0 ] && [ -f "$janitor_browser_dir/server.log" ]; then
+    cp -- "$janitor_browser_dir/server.log" "$JANITOR_BROWSER_ARTIFACT_DIR/fixture-failure.log" || true
+  fi
+  rm -rf -- "$janitor_browser_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+npm --prefix browser ci --ignore-scripts --no-audit --no-fund
+MIX_ENV=test mix compile --warnings-as-errors
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout "$janitor_browser_dir/key.pem" -out "$janitor_browser_dir/cert.pem" \
+  -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  >"$janitor_browser_dir/tls.log" 2>&1
+initdb -D "$janitor_browser_dir/data" --no-locale --encoding=UTF8 \
+  --auth-local=trust --auth-host=reject >"$janitor_browser_dir/init.log"
+pg_ctl -D "$janitor_browser_dir/data" -l "$janitor_browser_dir/postgres.log" \
+  -o "-h '' -k $janitor_browser_dir -p 5432 -F" -w start >/dev/null
+janitor_browser_pg=true
+createdb -h "$janitor_browser_dir" -p 5432 emailjanitor_browser
+export JANITOR_BROWSER_DIR="$janitor_browser_dir"
+export JANITOR_BROWSER_PORT="${JANITOR_BROWSER_PORT:-$((14000 + RANDOM % 20000))}"
+export JANITOR_BROWSER_ARTIFACT_DIR="${JANITOR_BROWSER_ARTIFACT_DIR:-$(mktemp -d /tmp/emailjanitor-browser-artifacts.XXXXXX)}"
+if [ ! -e "$JANITOR_BROWSER_ARTIFACT_DIR" ] && [ ! -L "$JANITOR_BROWSER_ARTIFACT_DIR" ]; then
+  mkdir -m 700 -- "$JANITOR_BROWSER_ARTIFACT_DIR"
+fi
+if [ -L "$JANITOR_BROWSER_ARTIFACT_DIR" ] || [ ! -d "$JANITOR_BROWSER_ARTIFACT_DIR" ] ||
+   [ ! -O "$JANITOR_BROWSER_ARTIFACT_DIR" ] || [ "$(stat -c '%a' "$JANITOR_BROWSER_ARTIFACT_DIR")" != 700 ]; then
+  echo 'Browser artifacts require an owned private directory without a symlink.' >&2
+  exit 1
+fi
+printf 'Synthetic browser artifacts: %s\n' "$JANITOR_BROWSER_ARTIFACT_DIR"
+MIX_ENV=test mix run --no-start scripts/browser-fixture.exs >"$janitor_browser_dir/server.log" 2>&1 &
+janitor_browser_pid=$!
+janitor_browser_ready=false
+for janitor_browser_attempt in {1..120}; do
+  if ! kill -0 "$janitor_browser_pid" 2>/dev/null; then
+    cat "$janitor_browser_dir/server.log" >&2
+    exit 1
+  fi
+  if curl --silent --fail --insecure --max-time 1 "https://localhost:$JANITOR_BROWSER_PORT/" >/dev/null 2>&1; then
+    janitor_browser_ready=true
+    break
+  fi
+  sleep 0.5
+done
+if ! "$janitor_browser_ready"; then
+  echo 'Synthetic HTTPS fixture did not start.' >&2
+  cat "$janitor_browser_dir/server.log" >&2
+  exit 1
+fi
+node browser/check.mjs
+# Test data only: verify transient browser content never reached logs/database.
+pg_dump -h "$janitor_browser_dir" emailjanitor_browser >"$janitor_browser_dir/metadata.sql"
+python3 - "$janitor_browser_dir" <<'PY'
+import pathlib, sys
+folder = pathlib.Path(sys.argv[1])
+for name in ["server.log", "metadata.sql"]:
+    assert b"BROWSER_EMAIL_BODY_SENTINEL" not in (folder / name).read_bytes(), name
+print("PASS: browser message absent from database dump and server logs.")
+PY
