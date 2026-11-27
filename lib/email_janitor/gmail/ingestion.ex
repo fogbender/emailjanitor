@@ -406,7 +406,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
              }}
         end
       else
-        {:error, :not_found} ->
+        {:error, reason} when reason in [:message_not_found, :thread_not_found] ->
           {:skip, :deleted_arrival}
 
         {:error, reason} = error when reason in @provider_errors ->

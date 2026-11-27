@@ -1186,6 +1186,15 @@ defmodule EmailJanitor.IngestionTest do
                box,
                checkpoint.generation,
                "message-1",
+               {Gmail, [thread_id: fn _ -> {:error, :message_not_found} end]}
+             )
+
+    assert {:error, :eligibility_unavailable} =
+             Ingestion.eligible_thread(
+               scope,
+               box,
+               checkpoint.generation,
+               "message-1",
                {Gmail, [thread_id: fn _ -> {:error, :not_found} end]}
              )
 

@@ -186,6 +186,10 @@ defmodule EmailJanitor.Worker.Ledger do
 
   def watch_due?(scope, inbox, checkpoint, now) do
     case scope.repo.get(Watch, inbox.id, prefix: scope.prefix, log: false) do
+      %Watch{generation: generation, next_attempt_at: %DateTime{} = next}
+      when generation == checkpoint.generation ->
+        DateTime.compare(next, now) != :gt
+
       %Watch{generation: generation, renewed_at: at} when generation == checkpoint.generation ->
         DateTime.diff(now, at) >= 43_200 or
           DateTime.diff(checkpoint.watch_expires_at, now) <= 86_400
@@ -196,11 +200,47 @@ defmodule EmailJanitor.Worker.Ledger do
   end
 
   def watched(scope, inbox, generation, now) do
-    scope.repo.insert_all(Watch, [%{inbox_id: inbox.id, generation: generation, renewed_at: now}],
+    scope.repo.insert_all(
+      Watch,
+      [
+        %{
+          inbox_id: inbox.id,
+          generation: generation,
+          renewed_at: now,
+          attempts: 0,
+          next_attempt_at: nil
+        }
+      ],
       prefix: scope.prefix,
       log: false,
       conflict_target: [:inbox_id],
-      on_conflict: {:replace, [:generation, :renewed_at]}
+      on_conflict: {:replace, [:generation, :renewed_at, :attempts, :next_attempt_at]}
+    )
+
+    :ok
+  end
+
+  def watch_failed(scope, inbox, generation, now) do
+    old = scope.repo.get(Watch, inbox.id, prefix: scope.prefix, log: false)
+    same = old && old.generation == generation
+    attempts = min(if(same, do: old.attempts, else: 0) + 1, 16)
+    renewed = if same, do: old.renewed_at, else: DateTime.add(now, -43_200)
+
+    scope.repo.insert_all(
+      Watch,
+      [
+        %{
+          inbox_id: inbox.id,
+          generation: generation,
+          renewed_at: renewed,
+          attempts: attempts,
+          next_attempt_at: DateTime.add(now, delay(attempts))
+        }
+      ],
+      prefix: scope.prefix,
+      log: false,
+      conflict_target: [:inbox_id],
+      on_conflict: {:replace, [:generation, :renewed_at, :attempts, :next_attempt_at]}
     )
 
     :ok
@@ -373,8 +413,10 @@ defmodule EmailJanitor.Worker.Ledger do
                  scope.repo.rollback(:ineligible_recheck)
 
                existing && existing.source_kind == :arrival ->
-                 # Independently verified arrivals never become a wider manual grant.
-                 if not Enum.all?(ids, &(&1 in existing.message_ids)),
+                 # An exact manual request must not silently activate the
+                 # arrival's wider independent selection. Keep its provenance
+                 # intact and require a separate exact candidate for subsets.
+                 if Enum.sort(ids) != Enum.sort(existing.message_ids),
                    do: scope.repo.rollback(:ineligible_recheck)
 
                existing ->

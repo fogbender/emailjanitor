@@ -430,6 +430,10 @@ generation. Only an explicit `lifecycle: {:reconnect, previous_generation}` can
 establish a new baseline. The `on_baseline` callback and expected preference
 version atomically bind that generation to the host's captured connection epoch;
 no watch or model call runs inside the activation transaction.
+Watch-renewal failures have separate durable retry backoff and do not stop an
+already active checkpoint from periodic history catch-up or local cleanup.
+Verified Janitor deliveries are removed before safeguards, correspondence lookup
+and classification; ordinary siblings retain all of those checks.
 
 `Worker.Server` supervises these steps with bounded concurrency (default two,
 maximum eight), one active task per trusted inbox reference, bounded task
@@ -443,6 +447,7 @@ adapter/config, database-only `router:`, optional `wake:` callback), and call
 That generic wake preserves failure backoff. Only a trusted explicit auth/config
 repair or upgrade uses `wake/2` with a host-derived reference to reset that one
 inbox's backoff; new references must still appear in the trusted list callback.
+Host references are opaque binaries of 1–256 bytes, independent of Gmail IDs.
 
 The host's `authorize` callback is checked again inside admission. It must use
 bounded local database checks, and explicit disconnect/binding changes must lock

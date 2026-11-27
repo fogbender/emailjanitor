@@ -145,10 +145,19 @@ defmodule EmailJanitor.Worker do
 
   defp renew(config, checkpoint, now) do
     if Ledger.watch_due?(config.scope, config.inbox, checkpoint, now) do
-      with :ok <- authorized(config),
-           {:ok, _} <-
-             Ingestion.renew_watch(config.scope, config.inbox, config.topic, config.gmail) do
-        Ledger.watched(config.scope, config.inbox, checkpoint.generation, now)
+      with :ok <- authorized(config) do
+        case protect(fn ->
+               Ingestion.renew_watch(config.scope, config.inbox, config.topic, config.gmail)
+             end) do
+          {:ok, _} ->
+            Ledger.watched(config.scope, config.inbox, checkpoint.generation, now)
+
+          _ ->
+            :ok = Ledger.watch_failed(config.scope, config.inbox, checkpoint.generation, now)
+            report(config, :watch_renewal_failed)
+            # An active durable cursor still supports periodic history catch-up.
+            :ok
+        end
       end
     else
       :ok
@@ -202,14 +211,14 @@ defmodule EmailJanitor.Worker do
             review_targets(config, checkpoint, id, snapshot, instructions, version, now)
           end
 
-        {:error, :not_found} ->
+        {:error, :thread_not_found} ->
           processed(config, checkpoint, [id], :skipped)
 
         error ->
           pre_review_failure(config, checkpoint, id, thread, version, now, error)
       end
     else
-      {:error, :not_found} -> processed(config, checkpoint, [id], :skipped)
+      {:error, :message_not_found} -> processed(config, checkpoint, [id], :skipped)
       error -> pre_review_failure(config, checkpoint, id, "arrival:" <> id, version, now, error)
     end
   end
@@ -272,6 +281,7 @@ defmodule EmailJanitor.Worker do
               :connection_changed,
               :model_unavailable,
               :gmail_unavailable,
+              :not_found,
               :eligibility_unavailable,
               :self_mail_unavailable,
               :policy_unavailable
@@ -402,6 +412,19 @@ defmodule EmailJanitor.Worker do
   defp finish_review(
          config,
          checkpoint,
+         _eligible,
+         targets,
+         _snapshot,
+         _version,
+         _now,
+         {:error, :thread_not_found}
+       ) do
+    processed(config, checkpoint, targets, :skipped)
+  end
+
+  defp finish_review(
+         config,
+         checkpoint,
          eligible,
          targets,
          snapshot,
@@ -417,11 +440,18 @@ defmodule EmailJanitor.Worker do
     result =
       with :ok <- authorized(config),
            :ok <- Ingestion.authorize_proposal(config.scope, config.inbox, eligible, proposal),
-           do: Executor.execute(config.scope, config.inbox, proposal, config.gmail, policy: gate)
+           do:
+             Executor.execute(config.scope, config.inbox, proposal, config.gmail,
+               policy: gate,
+               self_mail: config.self_mail
+             )
 
     case result do
       {:done, _} ->
         processed(config, checkpoint, targets, :done)
+
+      {:error, :thread_not_found} ->
+        processed(config, checkpoint, targets, :skipped)
 
       {:deferred, covering_id, _} = deferred ->
         # A terminal covering action may own only part of this new selection.
@@ -622,7 +652,7 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :unsupported_policy, now)
         {:deferred, reason}
 
-      {:error, :not_found} ->
+      {:error, :thread_not_found} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :skipped
 
@@ -666,6 +696,19 @@ defmodule EmailJanitor.Worker do
     :kept
   end
 
+  defp finish_recheck(
+         config,
+         _checkpoint,
+         candidate,
+         _snapshot,
+         _version,
+         now,
+         {:error, :thread_not_found}
+       ) do
+    Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
+    :skipped
+  end
+
   defp finish_recheck(config, checkpoint, candidate, snapshot, version, now, {:ok, proposal}) do
     context = %{
       config: config,
@@ -687,13 +730,18 @@ defmodule EmailJanitor.Worker do
              ),
            do:
              Executor.execute(config.scope, config.inbox, proposal, config.gmail,
-               policy: %Policy{adapter: Gate, context: context}
+               policy: %Policy{adapter: Gate, context: context},
+               self_mail: config.self_mail
              )
 
     case result do
       {:done, _} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :done
+
+      {:error, :thread_not_found} ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
+        :skipped
 
       {:unresolved, _} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
@@ -895,6 +943,7 @@ defmodule EmailJanitor.Worker do
             ],
        do: value
 
+  defp status({:error, :not_found}), do: :gmail_unavailable
   defp status({:error, reason}) when reason in @fixed_errors, do: reason
   defp status(_), do: :worker_unavailable
 
