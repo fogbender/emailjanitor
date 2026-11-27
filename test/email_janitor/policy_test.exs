@@ -198,6 +198,7 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   test "bounded unreadable model input preserves previously identified pending work", ctx do
+    Req.Test.stub(__MODULE__, fn _ -> flunk("Unreadable model input must not send HTTP") end)
     assert {:blocked, :upgrade_required} = execute(ctx, :block)
     assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
 
@@ -213,7 +214,8 @@ defmodule EmailJanitor.PolicyTest do
                ctx.inbox,
                "thread-1",
                {TestGmail, [state: ctx.state]},
-               {EmailJanitor.Models.SDK, [config: config]},
+               {EmailJanitor.Models.SDK,
+                [config: config, http_options: [plug: {Req.Test, __MODULE__}]]},
                String.duplicate("p", 32_001),
                1,
                policy: policy(ctx, :block)
