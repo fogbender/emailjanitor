@@ -9,31 +9,82 @@ defmodule EmailJanitor.Reviewer do
         classifier,
         instructions,
         version,
-        restored \\ MapSet.new()
+        restored \\ MapSet.new(),
+        opts \\ []
       ) do
-    with {:classify, _} <- Safeguards.evaluate(messages, inbox, contacted_keys, restored),
-         {:ok, %Decision{action: :done, confidence: :high} = decision} <-
-           Classifier.propose(classifier, messages, instructions, inbox) do
-      ids = messages |> Enum.filter(&Message.in_inbox?/1) |> Enum.map(& &1.id) |> Enum.sort()
+    with {:ok, messages, masked?} <- select_targets(messages, opts),
+         {:classify, _} <- Safeguards.evaluate(messages, inbox, contacted_keys, restored),
+         [_ | _] = targets <- Enum.filter(messages, &Message.cleanup_target?/1),
+         {:ok, decisions} <- classify(masked?, classifier, messages, instructions, inbox) do
+      done =
+        decisions
+        |> Enum.filter(fn {_, decision} ->
+          decision.action == :done and decision.confidence == :high
+        end)
+        |> Enum.sort_by(&elem(&1, 0))
 
-      case {Enum.uniq(Enum.map(messages, & &1.thread_id)), ids} do
+      case {Enum.uniq(Enum.map(messages, & &1.thread_id)), done} do
         {[thread_id], [_ | _]} ->
+          categories = Map.new(done, fn {id, decision} -> {id, decision.category} end)
+
           {:ok,
            %Proposal{
              thread_id: thread_id,
-             message_ids: ids,
+             message_ids: Enum.map(done, &elem(&1, 0)),
+             inbox_message_ids: inbox_ids(messages),
+             evaluated_message_ids: targets |> Enum.map(& &1.id) |> Enum.sort(),
              fingerprint: Message.fingerprint(messages),
              instruction_version: version,
-             category: decision.category
+             category: Proposal.batch_category(categories),
+             message_categories: categories
            }}
+
+        {[_], []} ->
+          {:keep, :classifier_kept}
 
         _ ->
           {:keep, :no_matching_inbox_messages}
       end
     else
       {:keep, _} = keep -> keep
-      {:ok, %Decision{}} -> {:keep, :classifier_kept}
+      [] -> {:keep, :no_matching_inbox_messages}
       {:error, _} = error -> error
     end
   end
+
+  defp select_targets(messages, opts) do
+    case Keyword.fetch(opts, :cleanup_target_ids) do
+      :error ->
+        {:ok, messages, false}
+
+      {:ok, ids} when is_list(ids) and length(ids) <= 200 ->
+        if Enum.all?(ids, &(is_binary(&1) and byte_size(&1) in 1..256)) and
+             length(Enum.uniq(ids)) == length(ids) do
+          {:ok,
+           Enum.map(messages, &%{&1 | cleanup_target: Message.in_inbox?(&1) and &1.id in ids}),
+           true}
+        else
+          {:error, :invalid_targets}
+        end
+
+      _ ->
+        {:error, :invalid_targets}
+    end
+  end
+
+  defp classify(true, classifier, messages, instructions, inbox),
+    do: Classifier.propose_targets(classifier, messages, instructions, inbox)
+
+  defp classify(false, classifier, messages, instructions, inbox) do
+    case Classifier.propose(classifier, messages, instructions, inbox) do
+      {:ok, %Decision{} = decision} ->
+        {:ok, Map.new(Enum.filter(messages, &Message.cleanup_target?/1), &{&1.id, decision})}
+
+      other ->
+        other
+    end
+  end
+
+  defp inbox_ids(messages),
+    do: messages |> Enum.filter(&Message.in_inbox?/1) |> Enum.map(& &1.id) |> Enum.sort()
 end
