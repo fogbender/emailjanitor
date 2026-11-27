@@ -56,6 +56,17 @@ changes existing parent-zone MX records. Delegate that subdomain at its parent
 DNS provider after reviewing the output. Do not replace the existing nameservers
 of a domain containing other mail/web services with this zone.
 
+For a dedicated domain whose public Route53 zone is already delegated, the
+shared `modules/mail` module also accepts `existing_hosted_zone_id`. It selects
+only a public zone for the exact `mail_domain` and verifies that its zone ID
+matches the operator's explicit selection. That mode creates no hosted zone and
+does not change its nameserver delegation. Every MX, DMARC, verification and DKIM
+record has `allow_overwrite = false`: an existing record from another service
+must be reviewed/imported deliberately rather than overwritten. An unrelated
+parent zone or a private zone is unsuitable. The new-zone AWS reference remains
+the default. Newly managed zones have a destroy guard; do not toggle a deployed
+stack's zone ownership mode without a reviewed state migration.
+
 An optional name under `emailjanitor.net` can be delegated manually to those same
 name servers. It points directly to your AWS account, with no SaaS mail relay.
 Your own domain remains independent. Retired delegated names must not be assigned
