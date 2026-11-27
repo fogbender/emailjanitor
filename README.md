@@ -253,7 +253,11 @@ accepts only a previously saved `OAuth.Session`; it verifies Google's RS256
 signature, issuer, audience, authorized party, expiry, nonce and verified email.
 Both documented Google issuer values (`https://accounts.google.com` and
 `accounts.google.com`) are accepted; unrelated issuers remain rejected.
-Connecting requires the granted Gmail scope and a refresh token. Token responses
+Connect callbacks require a refresh token, and may return a verified grant even
+when the user declined Gmail access. The host must capture it in encrypted
+storage before checking Gmail scope and deciding whether to activate the inbox.
+Keep every accepted grant until it is revoked; declining scope must not lose it.
+Sign-in requires only verified identity. Token responses
 are reduced to access/refresh credentials, Bearer type, expiry epoch seconds and
 scope, inside redacted `Content`; ID tokens are discarded after verification.
 
