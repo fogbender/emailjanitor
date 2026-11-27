@@ -253,6 +253,8 @@ defmodule EmailJanitor.SelfHost.Store do
   end
 
   @doc false
+  # Internal lifecycle pairs. Worker.Server requires the opaque binary adapter
+  # below; tuples must never be passed directly as its list callback results.
   def refs do
     scope = SelfHost.scope()
 
@@ -267,6 +269,28 @@ defmodule EmailJanitor.SelfHost.Store do
      )}
   rescue
     _ -> {:error, :self_host_unavailable}
+  end
+
+  @doc "Bounded opaque keys for Worker.Server's trusted list callback."
+  def worker_refs do
+    with {:ok, refs} <- refs() do
+      {:ok,
+       Enum.map(refs, fn {id, epoch} ->
+         [id, epoch] |> Jason.encode!() |> Base.url_encode64(padding: false)
+       end)}
+    end
+  end
+
+  def fetch_binding(key) when is_binary(key) and byte_size(key) in 1..256 do
+    with {:ok, json} <- Base.url_decode64(key, padding: false),
+         {:ok, [id, epoch]} <- Jason.decode(json),
+         true <- is_binary(id) and byte_size(id) in 1..200 and is_integer(epoch) and epoch > 0 do
+      fetch_binding({id, epoch})
+    else
+      _ -> {:error, :inbox_unavailable}
+    end
+  rescue
+    _ -> {:error, :inbox_unavailable}
   end
 
   @doc false
