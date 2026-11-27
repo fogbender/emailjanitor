@@ -13,6 +13,13 @@ defmodule EmailJanitor.Digest do
   def install(%Scope{} = scope),
     do: Ecto.Migrator.up(scope.repo, 5, Migration, prefix: scope.prefix, log: false)
 
+  defdelegate install_staging(scope), to: EmailJanitor.Digest.Staging, as: :install
+  defdelegate stage(scope, inbox_id, event), to: EmailJanitor.Digest.Staging
+
+  defdelegate confirm_staged(scope, inbox_id, action_id),
+    to: EmailJanitor.Digest.Staging,
+    as: :confirm
+
   def configure(%Scope{} = scope, inbox_id, timezone, %DateTime{} = now) do
     with {:ok, _, cutoff} <- Clock.cutoff(now, timezone),
          {:ok, :ok} <-
