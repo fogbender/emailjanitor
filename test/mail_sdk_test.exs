@@ -107,6 +107,7 @@ defmodule EmailJanitor.MailSDKTest do
     config = F.config(fn _ -> flunk("network") end)
     {receipt, _} = F.receipt(config)
     assert receipt.envelope_from == "owner@example.com"
+    assert receipt.key == "incoming/ses-123"
     assert receipt.verdicts["dkimVerdict"] == "PASS"
     refute inspect(receipt) =~ "PRIVATE-HEADER"
     refute inspect(receipt) =~ "attacker@example.net"
@@ -125,6 +126,8 @@ defmodule EmailJanitor.MailSDKTest do
       ),
       put_in(json, ["receipt", "action", "bucketName"], "attacker"),
       put_in(json, ["receipt", "action", "objectKey"], "incoming/other-message"),
+      put_in(json, ["receipt", "action", "objectKey"], "incoming/ses-123"),
+      put_in(json, ["receipt", "action", "objectKey"], "../ses-123"),
       update_in(json, ["receipt"], &Map.delete(&1, "dkimVerdict")),
       %{"Records" => [%{"s3" => %{}}]}
     ]
