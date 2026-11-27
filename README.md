@@ -253,14 +253,21 @@ ambiguous-action reconciliation; recovery still requires complete `history/3`.
 Independent-connection tests cover commits, rollback and competing snapshots.
 
 Pending work contains IDs, cursors and timestamps only. `eligible_thread/5` reads
-thread content transiently and preserves the whole conversation if any current
-INBOX message lacks same-generation post-baseline eligibility. It returns only a
-metadata eligibility proof. `authorize_proposal/4` rejects proposals outside that
-proof and rejects proofs from a previous connection generation. Hosts must also
-honor connection-generation fencing at final execution, retain the engine's
-instruction/manual-restoration guards, and use the Executor's fresh fingerprint
-and exact-ID checks. This slice does not dispatch classification or mutations,
-and it does not implement a partial-message mask for mixed old/new conversations.
+thread content transiently and returns only the known current-generation INBOX
+subset as a metadata eligibility proof. Older or unknown INBOX messages remain
+context and never gain cleanup eligibility from sharing a conversation.
+`authorize_proposal/4` requires nonempty distinct Done IDs within the nonempty
+set of evaluated targets, including eligible messages classified Keep. Every
+evaluated ID must remain in that proof and in durable same-generation discovery
+records. Legacy proposals with no evaluated set use their Done IDs. Empty,
+malformed, stale-generation and unknown-ID masks fail closed.
+
+Hosts must carry that proof into the guarded review target mask and recheck it
+before execution, retain connection-generation, instruction and manual-restore
+guards, and use the Executor's fresh fingerprint and exact-ID checks. Free-plan
+all-INBOX admission is a separate host-policy requirement; this proof itself does
+not permit removing older context or bypassing the free quota. This slice supplies
+the ingestion selection boundary and does not dispatch classification/mutations.
 
 Expired history enters `:gap` and pauses discovery/eligibility. This deliberately
 does **not** recover arrivals missed after Gmail's history retention expires.
