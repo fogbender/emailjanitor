@@ -1,6 +1,6 @@
 defmodule EmailJanitor.Executor do
   @moduledoc "Recheck a proposal, persist an intent, and mutate exact IDs once. Ambiguity never causes a retry."
-  alias EmailJanitor.{Identity, Inbox, Message, Proposal, Safeguards, Store}
+  alias EmailJanitor.{Identity, Inbox, Message, Owner, Proposal, Safeguards, Store}
 
   def execute(scope, %Inbox{} = inbox, %Proposal{} = proposal, {gmail, options}) do
     with {:ok, version} <- Store.instruction_version(scope, inbox.id),
@@ -15,7 +15,7 @@ defmodule EmailJanitor.Executor do
          {:ok, history_id} <- safe(fn -> gmail.history_id(inbox.id, options) end),
          {:ok, {status, action}} <- Store.intent(scope, inbox.id, proposal, history_id) do
       case status do
-        :existing -> {:existing, action.id, action.state}
+        :existing -> existing(scope, inbox, action)
         :created -> apply_intent(scope, inbox, action, gmail, options)
       end
     else
@@ -29,6 +29,14 @@ defmodule EmailJanitor.Executor do
   defp apply_intent(scope, inbox, action, gmail, options) do
     # Any error after sending is ambiguous: retain the intent for history-based
     # reconciliation. Repeating execute cannot issue the mutation a second time.
+    Owner.bounded(fn ->
+      with :ok <- Store.begin_dispatch(scope, inbox.id, action.id, action.owner_token) do
+        dispatch(scope, inbox, action, gmail, options)
+      end
+    end)
+  end
+
+  defp dispatch(scope, inbox, action, gmail, options) do
     case safe(fn -> gmail.remove_inbox(inbox.id, action.message_ids, options) end) do
       :ok ->
         :ok = Store.transition(scope, inbox.id, action.id, :intent, :done)
@@ -39,6 +47,18 @@ defmodule EmailJanitor.Executor do
         {:unresolved, action.id}
     end
   end
+
+  @doc "Recover an orphan before fetching fresh Gmail history for a dead owner's sent request."
+  def recover(scope, inbox, action_id), do: Store.recover(scope, inbox.id, action_id)
+
+  defp existing(scope, inbox, %{state: :intent} = action) do
+    case recover(scope, inbox, action.id) do
+      {:ok, {state, _}} -> {:existing, action.id, state}
+      _ -> {:existing, action.id, :intent}
+    end
+  end
+
+  defp existing(_, _, action), do: {:existing, action.id, action.state}
 
   defp exact_inbox_ids(messages),
     do: messages |> Enum.filter(&Message.in_inbox?/1) |> Enum.map(& &1.id) |> Enum.sort()
