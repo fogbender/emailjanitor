@@ -67,3 +67,12 @@ exporter and exercise failures for both providers. Raw payload tracing and doten
 loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
 are disabled (`max_retries: 0`); the durable job owner controls
 retry/backoff. Never put full SDK responses/errors into job arguments or reports.
+
+Finch, the underlying HTTP client, publishes raw bodies and credential headers in
+its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
+enable runtime HTTP tracing. The model adapter checks for Finch handlers before
+each call and fails closed if any are present; hosts must keep observer settings
+fixed during calls. Only the metadata-only Janitor event above is supported.
+Oversized or structurally excessive HTML is kept as `:unreadable_content` rather
+than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
+normal callers should use `Reviewer.review` to include safeguards and context.

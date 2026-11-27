@@ -37,7 +37,10 @@ defmodule EmailJanitor.Models.SDK do
     %Inbox{} = inbox = Keyword.fetch!(opts, :inbox)
 
     # SDK debug logging is process-global; fail closed if a host enables it.
-    false = Application.get_env(:req_llm, :debug, false)
+    false = ReqLLM.Debug.enabled?()
+    # Finch events include raw request bodies/headers. Observer configuration is
+    # a host trust boundary: fail closed if ANY Finch handlers are installed.
+    [] = :telemetry.list_handlers([:finch])
 
     context = [
       ReqLLM.Context.system(
@@ -86,6 +89,7 @@ defmodule EmailJanitor.Models.SDK do
   rescue
     _ -> {:error, :model_unavailable}
   catch
+    :throw, :invalid_html -> {:keep, :unreadable_content}
     _, _ -> {:error, :model_unavailable}
   end
 

@@ -43,7 +43,8 @@ defmodule EmailJanitor.ContentTest do
                    Classifier.propose(
                      {TestClassifier, [mode: mode]},
                      [message(body: "PRIVATE_BODY_SENTINEL")],
-                     ""
+                     "",
+                     inbox()
                    )
         end
       end)
