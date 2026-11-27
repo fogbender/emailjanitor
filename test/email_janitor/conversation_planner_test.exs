@@ -36,6 +36,7 @@ defmodule EmailJanitor.ConversationPlannerTest do
   defp opts(provider),
     do: [
       config: config(provider),
+      search_truncated: false,
       credential_resolver: fn "us-east-1" ->
         {:ok,
          [
@@ -98,6 +99,7 @@ defmodule EmailJanitor.ConversationPlannerTest do
       )
 
     object = %{
+      "replace_instructions" => [],
       "operation" => "restore",
       "references" => [ref.token],
       "preference_target" => "inbox",
@@ -205,5 +207,88 @@ defmodule EmailJanitor.ConversationPlannerTest do
                  Keyword.put(opts(provider), :credential_resolver, resolver)
                )
     end
+  end
+
+  test "omitted or truncated search evidence cannot authorize an effect" do
+    box = inbox()
+    msg = message()
+    {:ok, ref} = Reference.new(box.id, msg.id, msg.thread_id, "Bob", "Invitation")
+
+    object = %{
+      "operation" => "done",
+      "references" => [ref.token],
+      "preference_target" => "none",
+      "instruction" => "",
+      "replace_instructions" => [],
+      "query" => "",
+      "reply" => ""
+    }
+
+    Req.Test.stub(__MODULE__, fn _ -> flunk("missing completeness flag reached provider") end)
+
+    assert {:error, :conversation_unavailable} =
+             Planner.plan(
+               box,
+               snapshot(box),
+               Content.new("Mark it Done"),
+               [ref],
+               [msg],
+               Keyword.delete(opts(:azure), :search_truncated)
+             )
+
+    Req.Test.stub(__MODULE__, &response(&1, :azure, object))
+
+    assert {:error, :conversation_unavailable} =
+             Planner.plan(
+               box,
+               snapshot(box),
+               Content.new("Mark it Done"),
+               [ref],
+               [msg],
+               Keyword.put(opts(:azure), :search_truncated, true)
+             )
+  end
+
+  test "HTML evidence uses the readable text for both the model and the copied-passage guard" do
+    box = inbox()
+    visible = "This entire synthetic sales pitch must never become a durable instruction."
+
+    msg =
+      message(
+        body:
+          "<html><script>HIDDEN_PRIVATE_SCRIPT</script><p>This entire synthetic <b>sales pitch</b> must never become a durable instruction.</p><img src='https://tracker.invalid/secret'></html>",
+        headers: [{"From", "sales@example.org"}, {"Content-Type", "text/html"}]
+      )
+
+    {:ok, ref} = Reference.new(box.id, msg.id, msg.thread_id, "Sales", "Pitch")
+
+    object = %{
+      "operation" => "answer",
+      "references" => [],
+      "preference_target" => "inbox",
+      "instruction" => visible,
+      "replace_instructions" => [],
+      "query" => "",
+      "reply" => ""
+    }
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, wire, conn} = Plug.Conn.read_body(conn)
+      assert wire =~ "synthetic sales pitch"
+      refute wire =~ "HIDDEN_PRIVATE_SCRIPT"
+      refute wire =~ "tracker.invalid"
+      refute wire =~ "<b>"
+      response(conn, :azure, object)
+    end)
+
+    assert {:error, :conversation_unavailable} =
+             Planner.plan(
+               box,
+               snapshot(box),
+               Content.new("Discard this kind of pitch"),
+               [ref],
+               [msg],
+               opts(:azure)
+             )
   end
 end

@@ -9,6 +9,8 @@ defmodule EmailJanitor.Conversation.Migration do
       add(:operation, :text, null: false)
       add(:preference_target, :text, null: false)
       add(:references, {:array, :map}, null: false, default: [])
+      add(:context_references, {:array, :map}, null: false, default: [])
+      add(:search_complete, :boolean, null: false, default: false)
       add(:preference_status, :text, null: false, default: "none")
       add(:preference_revision, :bigint)
       add(:results, {:array, :map}, null: false, default: [])

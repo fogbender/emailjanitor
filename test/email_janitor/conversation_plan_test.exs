@@ -6,6 +6,7 @@ defmodule EmailJanitor.ConversationPlanTest do
   defp object(overrides \\ %{}) do
     Map.merge(
       %{
+        "replace_instructions" => [],
         "operation" => "answer",
         "references" => [],
         "preference_target" => "none",
@@ -20,6 +21,7 @@ defmodule EmailJanitor.ConversationPlanTest do
   test "a correction can restore and teach together without retaining raw plan text in inspection" do
     raw =
       object(%{
+        "replace_instructions" => [],
         "operation" => "restore",
         "references" => ["ref_a"],
         "preference_target" => "inbox",
@@ -99,12 +101,19 @@ defmodule EmailJanitor.ConversationPlanTest do
 
   test "a selected scope can be explicitly cleared, but dangling instructions and selections are invalid" do
     assert {:ok, %{preference_target: :all}} =
-             Plan.parse(object(%{"preference_target" => "all"}), [])
+             Plan.parse(
+               object(%{"preference_target" => "all", "replace_instructions" => ["$clear"]}),
+               []
+             )
 
     for raw <- [
           object(%{"instruction" => "Keep everything."}),
           object(%{"operation" => "done"}),
-          object(%{"operation" => "answer", "references" => ["ref_a"]})
+          object(%{
+            "replace_instructions" => [],
+            "operation" => "answer",
+            "references" => ["ref_a"]
+          })
         ] do
       assert {:error, :invalid_conversation_plan} = Plan.parse(raw, ["ref_a"])
     end

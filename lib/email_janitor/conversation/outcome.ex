@@ -4,13 +4,20 @@ defmodule EmailJanitor.Conversation.Outcome do
   alias EmailJanitor.Conversation.Receipt
 
   def render(%Receipt{} = receipt, %Preferences.Snapshot{} = snapshot) do
+    if snapshot.inbox_id == receipt.inbox_id and snapshot.scope_prefix == receipt.__meta__.prefix,
+      do: verified(receipt, snapshot),
+      else: Content.new("I could not verify this request's inbox context.")
+  end
+
+  defp verified(receipt, snapshot) do
     preferences = preference(receipt, snapshot)
     results = receipt.results
     done = Enum.count(results, &(&1["status"] == "done"))
     restored = Enum.count(results, &(&1["status"] == "restored"))
     blocked = Enum.count(results, &(&1["status"] == "blocked"))
     protected = Enum.count(results, &(&1["status"] == "protected"))
-    uncertain = Enum.count(results, &(&1["status"] == "unresolved"))
+    missing = max(0, length(receipt.references) - length(results))
+    uncertain = Enum.count(results, &(&1["status"] == "unresolved")) + missing
     unavailable = Enum.count(results, &(&1["status"] == "unavailable"))
     unchanged = Enum.count(results, &(&1["status"] == "unchanged"))
 
@@ -47,6 +54,9 @@ defmodule EmailJanitor.Conversation.Outcome do
 
   defp preference(%{preference_status: :failed}, _),
     do: "I could not update your instructions. Please try again."
+
+  defp preference(%{preference_status: :pending}, _),
+    do: "An instruction change is still being verified; I cannot confirm its outcome yet."
 
   defp preference(%{preference_status: status} = receipt, snapshot)
        when status in [:updated, :unchanged] do

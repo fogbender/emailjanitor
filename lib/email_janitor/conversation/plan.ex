@@ -2,9 +2,18 @@ defmodule EmailJanitor.Conversation.Plan do
   @moduledoc "A transient, validated proposal. Only host-supplied reference tokens can authorize a selection."
   alias EmailJanitor.Content
   @derive {Inspect, only: [:operation, :references, :preference_target]}
-  defstruct [:operation, :references, :preference_target, :instruction, :query, :reply]
+  defstruct [
+    :operation,
+    :references,
+    :preference_target,
+    :instruction,
+    :query,
+    :reply,
+    replace_instructions: [],
+    search_complete: false
+  ]
 
-  @keys ~w(operation references preference_target instruction query reply)
+  @keys ~w(operation references preference_target instruction replace_instructions query reply)
   @operations ~w(answer search done restore)
   @targets ~w(none inbox all)
   @schema %{
@@ -19,23 +28,34 @@ defmodule EmailJanitor.Conversation.Plan do
         "maxItems" => 5
       },
       "preference_target" => %{"type" => "string", "enum" => @targets},
-      "instruction" => %{"type" => "string", "maxLength" => 15_000},
+      "instruction" => %{"type" => "string", "maxLength" => 1_000},
+      "replace_instructions" => %{
+        "type" => "array",
+        "maxItems" => 5,
+        "items" => %{"type" => "string"}
+      },
       "query" => %{"type" => "string", "maxLength" => 512},
-      "reply" => %{"type" => "string", "maxLength" => 2048}
+      "reply" => %{"type" => "string", "maxLength" => 1024}
     }
   }
 
   def schema, do: @schema
 
-  def parse(object, allowed_references, source_bodies \\ []) do
+  def parse(object, allowed_references, source_bodies \\ [], instruction_refs \\ %{}) do
     with {:ok, value} <- object(object),
          true <- Enum.sort(Map.keys(value)) == Enum.sort(@keys),
          true <- value["operation"] in @operations,
          true <- value["preference_target"] in @targets,
          true <- references?(value["references"], allowed_references),
-         true <- text?(value["instruction"], 15_000),
+         true <- text?(value["instruction"], 1_000),
          true <- text?(value["query"], 512),
-         true <- text?(value["reply"], 2048),
+         true <- text?(value["reply"], 1024),
+         true <-
+           is_list(source_bodies) and length(source_bodies) <= 5 and
+             Enum.all?(source_bodies, fn source ->
+               match?(%Content{}, source) and byte_size(Content.read(source)) <= 8_000
+             end),
+         true <- instruction_references?(value, instruction_refs),
          true <- compatible?(value),
          true <- distilled?(value["instruction"], source_bodies) do
       {:ok,
@@ -43,6 +63,7 @@ defmodule EmailJanitor.Conversation.Plan do
          operation: operation(value["operation"]),
          references: value["references"],
          preference_target: target(value["preference_target"]),
+         replace_instructions: value["replace_instructions"],
          instruction: Content.new(value["instruction"]),
          query: Content.new(value["query"]),
          reply: Content.new(value["reply"])
@@ -71,13 +92,26 @@ defmodule EmailJanitor.Conversation.Plan do
       not Regex.match?(~r/[\x00-\x08\x0B-\x1F\x7F]/u, value)
   end
 
+  defp instruction_references?(value, refs) do
+    selected = value["replace_instructions"]
+    scope = target(value["preference_target"])
+
+    is_list(selected) and length(selected) <= 5 and
+      length(Enum.uniq(selected)) == length(selected) and
+      cond do
+        scope == :none -> selected == []
+        selected == ["$clear"] -> value["instruction"] == ""
+        true -> Enum.all?(selected, &(&1 in Map.get(refs, scope, [])))
+      end
+  end
+
   defp compatible?(%{"operation" => operation} = value) do
     selected = value["references"] != []
     learning = value["preference_target"] != "none"
     query = String.trim(value["query"]) != ""
-    instruction = String.trim(value["instruction"]) != ""
+    instruction = String.trim(value["instruction"]) != "" or value["replace_instructions"] != []
 
-    (learning or not instruction) and
+    learning == instruction and
       case operation do
         "search" -> query and not selected and not learning
         "answer" -> not query and not selected

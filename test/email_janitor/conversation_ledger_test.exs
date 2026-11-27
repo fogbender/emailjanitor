@@ -28,6 +28,7 @@ defmodule EmailJanitor.ConversationLedgerTest do
   defp plan(ref, opts \\ []) do
     %Plan{
       operation: Keyword.get(opts, :operation, :restore),
+      search_complete: true,
       references: [ref.token],
       preference_target: Keyword.get(opts, :target, :inbox),
       instruction: Content.new("PRIVATE_DISTILLED_INSTRUCTION"),
@@ -116,7 +117,7 @@ defmodule EmailJanitor.ConversationLedgerTest do
                "missing",
                ctx.conversation,
                ctx.request,
-               plan(ctx.ref),
+               %Plan{operation: :answer, references: [], preference_target: :none},
                [],
                fn -> :ok end
              )
@@ -206,5 +207,144 @@ defmodule EmailJanitor.ConversationLedgerTest do
     future = DateTime.add(DateTime.utc_now(), 604_801)
     assert {1, nil} = Ledger.purge(ctx.scope, future)
     assert nil == Ledger.latest(ctx.scope, ctx.box.id, ctx.conversation)
+  end
+
+  test "effect selection is pinned independently of read-only conversation context", ctx do
+    {:ok, other} = Reference.new(ctx.box.id, "abc999", "def999", "Other", "Other email")
+    request = plan(ctx.ref)
+
+    assert {:ok, receipt} =
+             Ledger.reserve(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               request,
+               [other, ctx.ref],
+               fn -> :ok end
+             )
+
+    assert length(receipt.context_references) == 2
+    assert Enum.map(receipt.references, & &1["token"]) == [ctx.ref.token]
+
+    assert {:error, :invalid_request} =
+             Ledger.reserve(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               Ecto.UUID.generate(),
+               request,
+               [ctx.ref, ctx.ref],
+               fn -> :ok end
+             )
+
+    answer = %Plan{operation: :answer, references: [], preference_target: :none}
+
+    assert {:ok, empty} =
+             Ledger.reserve(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               Ecto.UUID.generate(),
+               answer,
+               [other],
+               fn -> :ok end
+             )
+
+    assert empty.references == []
+    assert length(empty.context_references) == 1
+
+    assert {:error, :invalid_request} =
+             Ledger.reserve(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               Ecto.UUID.generate(),
+               %{request | search_complete: false},
+               [ctx.ref],
+               fn -> :ok end
+             )
+  end
+
+  test "recorded outcomes must match the reserved operation and preference target", ctx do
+    {:ok, _} = reserve(ctx)
+
+    assert {:error, :invalid_effect} =
+             Ledger.record_result(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               ctx.ref.token,
+               "done",
+               Ecto.UUID.generate()
+             )
+
+    assert {:error, :invalid_preference_result} =
+             Ledger.record_preference(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               :updated,
+               nil
+             )
+
+    assert {:error, :effects_pending} =
+             Ledger.complete(ctx.scope, ctx.box.id, ctx.conversation, ctx.request)
+
+    answer = %Plan{operation: :answer, references: [], preference_target: :none}
+    id = Ecto.UUID.generate()
+
+    {:ok, _} =
+      Ledger.reserve(ctx.scope, ctx.box.id, ctx.conversation, id, answer, [], fn -> :ok end)
+
+    assert {:error, :invalid_preference_result} =
+             Ledger.record_preference(ctx.scope, ctx.box.id, ctx.conversation, id, :updated, 1)
+  end
+
+  test "unrecorded effects stay uncertain and a foreign snapshot cannot make completion claims",
+       ctx do
+    {:ok, receipt} = reserve(ctx)
+    {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.box.id)
+    text = Outcome.render(receipt, snapshot) |> Content.read()
+    assert text =~ "uncertain"
+    assert text =~ "still being verified"
+    refute text =~ "No email or instruction changes"
+
+    for other <- [
+          %{snapshot | inbox_id: "foreign"},
+          %{snapshot | scope_prefix: ctx.foreign.prefix}
+        ] do
+      assert Outcome.render(receipt, other) |> Content.read() =~ "could not verify"
+    end
+  end
+
+  test "the seven-day window applies to get, writes and re-reservation before a purge job runs",
+       ctx do
+    {:ok, original} = reserve(ctx)
+    past = DateTime.add(DateTime.utc_now(), -604_801)
+
+    TestRepo.update_all(
+      from(r in Receipt, where: r.id == ^ctx.request),
+      [set: [inserted_at: past]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert nil == Ledger.get(ctx.scope, ctx.box.id, ctx.conversation, ctx.request)
+
+    assert {:error, :unknown_request} =
+             Ledger.record_preference(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               :updated,
+               1
+             )
+
+    assert {:ok, fresh} = reserve(ctx)
+    assert DateTime.compare(fresh.inserted_at, original.inserted_at) != :lt
+    assert fresh.inserted_at != past
   end
 end

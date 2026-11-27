@@ -8,9 +8,11 @@ defmodule EmailJanitor.Conversation.Receipt do
     field(:operation, Ecto.Enum, values: [:answer, :done, :restore])
     field(:preference_target, Ecto.Enum, values: [:none, :inbox, :all])
     field(:references, {:array, :map}, default: [])
+    field(:context_references, {:array, :map}, default: [])
+    field(:search_complete, :boolean, default: false)
 
     field(:preference_status, Ecto.Enum,
-      values: [:none, :updated, :unchanged, :failed],
+      values: [:none, :pending, :updated, :unchanged, :failed],
       default: :none
     )
 

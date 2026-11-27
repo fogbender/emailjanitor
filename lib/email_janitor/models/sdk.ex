@@ -43,7 +43,14 @@ defmodule EmailJanitor.Models.SDK do
 
     user_text = "UNTRUSTED_EMAIL_JSON:\n" <> payload
 
-    with {:ok, object} <- object(Content.new(system_text), Content.new(user_text), schema, opts),
+    with {:ok, object} <-
+           request_object(
+             Content.new(system_text),
+             Content.new(user_text),
+             schema,
+             opts,
+             not is_nil(target_ids)
+           ),
          {:ok, value} <- Jason.decode(Content.read(object)),
          {:ok, _} <- parse(value, target_ids) do
       {:ok, value}
@@ -70,8 +77,12 @@ defmodule EmailJanitor.Models.SDK do
   Returned JSON remains transient Content; callers validate their typed contract
   before applying any effect. There are no model-executable provider tools.
   """
-  def object(%Content{} = system, %Content{} = user, schema, opts) when is_map(schema) do
-    system_text = Content.read(system) <> "\nOUTPUT_SCHEMA_JSON:\n" <> Jason.encode!(schema)
+  def object(%Content{} = system, %Content{} = user, schema, opts) when is_map(schema),
+    do: request_object(system, user, schema, opts, true)
+
+  defp request_object(system, user, schema, opts, append_schema) do
+    suffix = if append_schema, do: "\nOUTPUT_SCHEMA_JSON:\n" <> Jason.encode!(schema), else: ""
+    system_text = Content.read(system) <> suffix
     user_text = Content.read(user)
 
     encoded =
@@ -216,6 +227,15 @@ defmodule EmailJanitor.Models.SDK do
   defp quiet_request(request) do
     Logger.put_process_level(self(), :none)
     request
+  end
+
+  @doc "The bounded readable text shared by classification and conversational evidence."
+  def readable_body(%Message{} = message, bytes) when bytes in 1..16_000 do
+    {:ok, Content.new(bounded(text(message), bytes))}
+  rescue
+    _ -> {:error, :unreadable_content}
+  catch
+    _, _ -> {:error, :unreadable_content}
   end
 
   defp payload(message) do

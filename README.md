@@ -40,8 +40,9 @@ The conversation foundation uses the same Azure/Bedrock SDK transport as
 classification through `Models.SDK.object/4`. `Conversation.Planner.plan/6`
 returns a transient typed proposal with inbox-bound reference tokens; email
 content cannot supply a storage scope, credential or arbitrary tool. Incomplete
-search results cannot authorize effects. Copied email passages are rejected from
-distilled instructions. These checks supplement the prompt; execution still
+search results cannot authorize effects. Readable email passages are rejected from
+distilled instructions. Small edits preserve unrelated instruction paragraphs
+without generating a full 15,000-byte scope replacement. These checks supplement the prompt; execution still
 requires the immutable executor safeguards and the host's policy.
 
 `Conversation.Ledger.install/1` installs migration 8 for seven-day metadata-only
