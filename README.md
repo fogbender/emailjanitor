@@ -63,3 +63,14 @@ The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
 scopes from model output or HTTP parameters. Query-prefix separation is covered
 here; full SaaS authorization is a later integration gate.
+
+## Self-host infrastructure foundation
+
+The [AWS/OpenTofu and NixOS foundation](infra/README.md) includes isolated mail
+transport, Gmail notification wiring, provider-mocked checks and a service module
+that consumes a supplied release. It has not been applied and is not yet a complete
+installer or deployable application. Run its local checks with:
+
+```sh
+nix develop --command bash scripts/check-infra
+```
