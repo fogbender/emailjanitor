@@ -362,6 +362,17 @@ defmodule EmailJanitor.WorkerTest do
   test "a disconnect queued during admission invalidates the prepared mutation at final fence",
        ctx do
     owner = self()
+    barrier = {__MODULE__, :disconnect_commit, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        barrier,
+        (Repo.config()[:telemetry_prefix] || [:email_janitor, :worker_test, :repo]) ++ [:query],
+        &__MODULE__.await_disconnect_commit/4,
+        %{key: barrier, owner: owner}
+      )
+
+    on_exit(fn -> :telemetry.detach(barrier) end)
 
     hook = fn ->
       executor = self()
@@ -390,11 +401,14 @@ defmodule EmailJanitor.WorkerTest do
               :ok
             end)
 
+          send(executor, {barrier, :committed})
           send(owner, :disconnected)
         end)
 
       receive do
-        {:disconnect_backend, backend} -> await_blocked(backend, 100)
+        {:disconnect_backend, backend} ->
+          await_blocked(backend, 100)
+          Process.put(barrier, true)
       after
         2_000 -> flunk("disconnect task did not start")
       end
@@ -404,6 +418,7 @@ defmodule EmailJanitor.WorkerTest do
     assert {:ok, %{status: status}} = Worker.step(ctx.config)
     assert status == :deferred
     assert_receive :disconnected, 1_000
+    assert_received {^barrier, :barrier_reached}
     assert read(ctx.state).mutations == []
 
     assert [%Action{state: :cancelled, dispatch_started_at: nil}] =
@@ -1573,7 +1588,7 @@ defmodule EmailJanitor.WorkerTest do
     end
   end
 
-  test "arrival provenance changed at final admission is a connection change, never a policy outage",
+  test "arrival generation changed at final admission is a connection change, never a policy outage",
        ctx do
     config = %{
       ctx.config
@@ -1584,8 +1599,11 @@ defmodule EmailJanitor.WorkerTest do
              history_hook: fn ->
                {:ok, cp} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
 
-               assert {:ok, :ok} =
-                        Ingestion.mark_processed(ctx.scope, ctx.box, cp.generation, ["message-1"])
+               assert {:ok, _} =
+                        Ingestion.reconnect(ctx.scope, ctx.box, cp.generation, %{
+                          history_id: "500",
+                          expires_at: DateTime.add(DateTime.utc_now(), 604_800)
+                        })
              end
            ]}
     }
@@ -1624,6 +1642,21 @@ defmodule EmailJanitor.WorkerTest do
              )
 
     Repo.one!(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix).id
+  end
+
+  # The disconnect is known committed before the final fence, independent of
+  # scheduler timing or PostgreSQL lock-queue barging. No production test hook.
+  def await_disconnect_commit(_, _, metadata, %{key: barrier, owner: owner}) do
+    if Process.get(barrier) == true and String.downcase(metadata.query) == "commit" do
+      Process.delete(barrier)
+      send(owner, {barrier, :barrier_reached})
+
+      receive do
+        {^barrier, :committed} -> :ok
+      after
+        5_000 -> flunk("disconnect did not commit after admission")
+      end
+    end
   end
 
   defp await_blocked(_backend, 0),
