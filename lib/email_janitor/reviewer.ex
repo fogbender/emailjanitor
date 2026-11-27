@@ -14,8 +14,10 @@ defmodule EmailJanitor.Reviewer do
       ) do
     with {:ok, messages, masked?} <- select_targets(messages, opts),
          {:classify, _} <- Safeguards.evaluate(messages, inbox, contacted_keys, restored),
-         [_ | _] = targets <- Enum.filter(messages, &Message.cleanup_target?/1),
-         {:ok, decisions} <- classify(masked?, classifier, messages, instructions, inbox) do
+         {:ok, classifier_messages} <- self_mail_filter(messages, opts),
+         [_ | _] = targets <- Enum.filter(classifier_messages, &Message.cleanup_target?/1),
+         {:ok, decisions} <-
+           classify(masked?, classifier, classifier_messages, instructions, inbox) do
       done =
         decisions
         |> Enum.filter(fn {_, decision} ->
@@ -47,6 +49,30 @@ defmodule EmailJanitor.Reviewer do
       [] -> {:keep, :no_matching_inbox_messages}
       {:error, _} = error -> error
     end
+  end
+
+  defp self_mail_filter(messages, opts) do
+    matcher = Keyword.get(opts, :self_mail, fn _ -> {:ok, false} end)
+
+    if is_function(matcher, 1) do
+      Enum.reduce_while(messages, {:ok, []}, fn message, {:ok, kept} ->
+        case matcher.(message.headers) do
+          {:ok, true} -> {:cont, {:ok, kept}}
+          {:ok, false} -> {:cont, {:ok, [message | kept]}}
+          _ -> {:halt, {:error, :self_mail_unavailable}}
+        end
+      end)
+      |> case do
+        {:ok, kept} -> {:ok, Enum.reverse(kept)}
+        error -> error
+      end
+    else
+      {:error, :self_mail_unavailable}
+    end
+  rescue
+    _ -> {:error, :self_mail_unavailable}
+  catch
+    _, _ -> {:error, :self_mail_unavailable}
   end
 
   defp select_targets(messages, opts) do

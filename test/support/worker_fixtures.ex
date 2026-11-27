@@ -1,0 +1,159 @@
+defmodule EmailJanitor.WorkerTest.Repo do
+  use Ecto.Repo, otp_app: :email_janitor, adapter: Ecto.Adapters.Postgres
+end
+
+defmodule EmailJanitor.WorkerTest.Gmail do
+  @behaviour EmailJanitor.Gmail
+  alias EmailJanitor.Gmail.{HistoryBatch, ThreadSnapshot}
+  def watch(_, _, options), do: watch_result(options, :watch)
+  def renew_watch(_, _, options), do: watch_result(options, :renew)
+
+  defp watch_result(options, kind) do
+    Agent.get_and_update(options[:state], fn state ->
+      result =
+        {:ok,
+         %{history_id: state.watch_id, expires_at: DateTime.add(DateTime.utc_now(), 604_800)}}
+
+      {result, %{state | calls: state.calls ++ [kind]}}
+    end)
+  end
+
+  def ingestion_batch(inbox, cursor, options) do
+    if options[:history_expired],
+      do: {:error, :history_expired},
+      else: history_batch(inbox, cursor, options)
+  end
+
+  defp history_batch(_, cursor, options) do
+    Agent.get_and_update(options[:state], fn state ->
+      value = Map.get(state.arrivals, cursor, %{through: cursor, ids: []})
+
+      result =
+        {:ok,
+         %HistoryBatch{
+           from_id: cursor,
+           through_id: value.through,
+           started_at: DateTime.utc_now(),
+           added_message_ids: value.ids,
+           more?: false
+         }}
+
+      {result, %{state | calls: state.calls ++ [{:history, cursor}]}}
+    end)
+  end
+
+  def thread_id(_, id, options) do
+    Agent.get(options[:state], fn state ->
+      case Enum.find(state.messages, &(&1.id == id)) do
+        nil -> {:error, :not_found}
+        message -> {:ok, message.thread_id}
+      end
+    end)
+  end
+
+  def thread_snapshot(_, thread, options) do
+    Agent.get_and_update(options[:state], fn state ->
+      {{:ok, %ThreadSnapshot{thread_id: thread, fingerprint: state.revision}},
+       %{state | calls: state.calls ++ [:snapshot]}}
+    end)
+  end
+
+  def thread(_, thread, options) do
+    Agent.get_and_update(options[:state], fn state ->
+      {{:ok, Enum.filter(state.messages, &(&1.thread_id == thread))},
+       %{state | calls: state.calls ++ [:full_thread]}}
+    end)
+  end
+
+  def contacted(_, _, _), do: {:ok, MapSet.new()}
+  def history_id(_, _), do: {:ok, "200"}
+
+  def remove_inbox(_, ids, options) do
+    if hook = options[:before_mutation], do: hook.()
+
+    Agent.get_and_update(options[:state], fn state ->
+      messages =
+        Enum.map(state.messages, fn message ->
+          if message.id in ids,
+            do: %{message | labels: List.delete(message.labels, "INBOX")},
+            else: message
+        end)
+
+      result = if state.mutation == :timeout_after_apply, do: {:error, :timeout}, else: :ok
+      {result, %{state | messages: messages, mutations: state.mutations ++ [ids]}}
+    end)
+  end
+
+  def history(_, _, options) do
+    Agent.get(options[:state], fn state ->
+      {:ok,
+       %{
+         complete?: true,
+         started_at: DateTime.utc_now(),
+         history_id: "202",
+         from_id: "200",
+         added_message_ids: [],
+         deleted_message_ids: [],
+         events: state.evidence
+       }}
+    end)
+  end
+end
+
+defmodule EmailJanitor.WorkerTest.Classifier do
+  @behaviour EmailJanitor.Classifier
+  def classify(messages, _instructions, options) do
+    Agent.get_and_update(options[:state], fn state ->
+      result =
+        case state.model do
+          :unreadable ->
+            {:keep, :unreadable_content}
+
+          :error ->
+            {:error, "PRIVATE_MODEL_ERROR_SENTINEL"}
+
+          mode ->
+            action = if mode == :keep, do: "keep", else: "done"
+            category = if mode == :keep, do: "legitimate", else: "cold_outreach"
+
+            {:ok,
+             %{
+               "decisions" =>
+                 Enum.map(options[:target_ids], fn id ->
+                   %{
+                     "message_id" => id,
+                     "action" => action,
+                     "confidence" => "high",
+                     "category" => category
+                   }
+                 end)
+             }}
+        end
+
+      {result, %{state | model_inputs: state.model_inputs ++ [Enum.map(messages, & &1.id)]}}
+    end)
+  end
+end
+
+defmodule EmailJanitor.WorkerTest.Policy do
+  @behaviour EmailJanitor.Policy
+  def reserve(state, inbox, id, ids, now),
+    do:
+      reserve(state, inbox, id, ids, now, %EmailJanitor.Policy.Admission{inbox_message_ids: ids})
+
+  def reserve(state, _inbox, _id, _ids, _now, admission) do
+    Agent.get_and_update(state, fn value ->
+      result = if value.block, do: {:blocked, value.block}, else: :ok
+      {result, %{value | calls: value.calls ++ [{:reserve, admission.inbox_message_ids}]}}
+    end)
+  end
+
+  def settle(state, _, _, _) do
+    Agent.get_and_update(state, fn value ->
+      result = if value.failures > 0, do: {:error, :temporary}, else: :ok
+      {result, %{value | failures: max(value.failures - 1, 0), calls: value.calls ++ [:settle]}}
+    end)
+  end
+
+  def retire_candidate(_, _, _, _), do: :ok
+end

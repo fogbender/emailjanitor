@@ -164,6 +164,46 @@ defmodule EmailJanitor.GmailSDKTest do
     assert {:ok, "100"} = SDK.history_id("inbox-1", options())
   end
 
+  test "thread revision snapshot uses only metadata and changes with the provider revision" do
+    snapshots =
+      for revision <- ["100", "101"] do
+        mock(fn env ->
+          assert env.method == :get
+          assert String.ends_with?(env.url, "/threads/thread-1")
+          assert env.query[:format] == "minimal"
+          assert env.query[:fields] == "id,historyId"
+          Tesla.Mock.json(%{"id" => "thread-1", "historyId" => revision})
+        end)
+
+        assert {:ok, snapshot} = SDK.thread_snapshot("inbox-1", "thread-1", options())
+        assert snapshot.thread_id == "thread-1" and byte_size(snapshot.fingerprint) == 64
+        refute inspect(snapshot) =~ "TOKEN_SENTINEL"
+        snapshot
+      end
+
+    assert hd(snapshots).fingerprint != List.last(snapshots).fingerprint
+  end
+
+  test "thread snapshots reject mismatched IDs, absent or invalid history and wrong account" do
+    for body <- [
+          %{"id" => "other", "historyId" => "100"},
+          %{"id" => "thread-1"},
+          %{"id" => "thread-1", "historyId" => "invalid"}
+        ] do
+      mock(fn _ -> Tesla.Mock.json(body) end)
+
+      assert {:error, :invalid_thread_snapshot} =
+               SDK.thread_snapshot("inbox-1", "thread-1", options())
+    end
+
+    mock(
+      fn _ -> flunk("wrong identity must not reach thread metadata") end,
+      %{"emailAddress" => "other@acme.com", "historyId" => "100"}
+    )
+
+    assert {:error, :wrong_inbox} = SDK.thread_snapshot("inbox-1", "thread-1", options())
+  end
+
   test "arrival lookup requests only ID and thread ID metadata" do
     mock(fn env ->
       assert env.method == :get

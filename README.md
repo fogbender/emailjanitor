@@ -198,7 +198,9 @@ so recovery can reject a snapshot fetched before its ownership barrier.
 `renew_watch/3` register all mailbox changes with a provisioned Pub/Sub topic;
 their registration cursor must not replace an existing processed-history cursor.
 `stop_watch/2` stops this application's watch on deliberate disconnection.
-The automatic notification/watch-renewal/reconciliation worker remains future work.
+The shared worker below handles watch renewal, guarded review/execution and
+durable reconciliation when supplied by a trusted host. A separate supervised
+notification poller records Pub/Sub hints.
 
 Text parts are base64url-decoded transiently, HTML is converted to readable text,
 and body content is wrapped in `Content`. Attachment bodies are not fetched.
@@ -335,3 +337,70 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
+
+
+## Shared autonomous inbox worker
+
+`Worker.install(scope)` idempotently installs the core, ingestion and scoped
+migration 11 worker metadata. The host creates one `Worker.Config` per inbox,
+binding its Scope/Inbox, Gmail and classifier adapters, current preferences,
+current connection authorization, configured Pub/Sub topic and policy. Gmail
+adapters used by the worker also implement watch/renew, thread lookup,
+`thread_snapshot/3`, bounded ingestion and complete reconciliation history.
+The Google-generated SDK supplies these operations; thread snapshots request
+only `id,historyId` and never message content.
+
+`Worker.step(config)` performs bounded work: settle/recover one durable action,
+resume or atomically establish the host connection baseline, renew its watch,
+commit one history batch, and review one conversation with at most five known
+new-arrival targets. An ordinary restart or OAuth reconsent resumes the existing
+generation. Only an explicit `lifecycle: {:reconnect, previous_generation}` can
+establish a new baseline. The `on_baseline` callback and expected preference
+version atomically bind that generation to the host's captured connection epoch;
+no watch or model call runs inside the activation transaction.
+
+`Worker.Server` supervises these steps with bounded concurrency (default two,
+maximum eight), one active task per trusted inbox reference, bounded task
+lifetimes and retry backoff. Supply `list: fn -> {:ok, refs} end` and
+`resolve: fn ref -> {:ok, config} end` as bounded host database operations;
+provider/model calls run in supervised tasks. Periodic catch-up remains necessary
+even when Pub/Sub notifications are absent. Supervise the authenticated
+`Gmail.NotificationWorker.Server` pull loop separately (trusted `source:`
+adapter/config, database-only `router:`, optional `wake:` callback), and call
+`Worker.Server.wake/1` after committing notifications when lower latency is needed.
+
+The host's `authorize` callback is checked again inside admission. It must use
+bounded local database checks, and explicit disconnect/binding changes must lock
+the core mailbox and increment its instruction version in the same transaction.
+That version is checked again at the final dispatch fence. Worker admission uses
+the Store's fresh clock under that lock, rather than a timestamp captured before
+watch/model requests. Free-plan policy receives the complete raw INBOX snapshot,
+including protected context, even though paid/unlimited cleanup may select only
+eligible targets. Read/unread and other labels are never changed.
+
+Configure `self_mail: fn headers -> Mail.Outbox.self_delivery?(scope, inbox.id,
+configured_sender, headers) end` using the shared mail component when installed.
+Only a successful delivery recorded for this exact scope, inbox, sender and
+current Message-ID establishes Janitor mail. The callback removes such mail from
+both model targets and model context; a matching sender alone establishes
+nothing. Receipt lookup failure keeps mail pending and never feeds digest
+upgrade wording to classification. This exemption does not authorize feedback.
+
+Worker rows retain only IDs, revision hashes, versions, timestamps and fixed
+outcomes, never bodies, credentials or raw model/provider responses. Stable
+`:unreadable_content` keeps arrivals pending and probes only minimal thread
+revision metadata every fifteen minutes until the revision or instructions
+change; transient failures remain retryable. Terminal policy settlement retries
+across restarts. Ambiguous mutations require fresh complete ordered history and
+are never blindly sent again. Expired ingestion history explicitly pauses in
+`:gap`; rebaselining cannot recover the unobserved outage backlog.
+
+`Worker.queue_recheck(scope, inbox, candidate_uuid)` and `queue_backlog/2` queue
+only previously identified metadata provenance, including actions cancelled
+before dispatch. They accept no arbitrary Gmail IDs. Fresh review, current
+connection generation, original identified IDs, restore/contact guards and policy
+admission are all rechecked before mutation. The host supplies `allow_recheck`
+for current paid/unlimited access; `{:blocked, :upgrade_required}` leaves
+provenance intact without repeatedly classifying unpaid requests. Requeue known
+backlog after an upgrade. Previously identified candidates can be rechecked after
+an explicit reconnect without making unknown pre-baseline mail eligible.
