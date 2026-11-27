@@ -57,30 +57,47 @@ defmodule EmailJanitor.Mail.Outbox do
 
   def get(%Scope{} = scope, id), do: scope.repo.get(Outgoing, id, prefix: scope.prefix)
 
-  @doc "Keep-only self-mail evidence: configured From, current SES Message-ID and confirmed same-inbox sender/recipient record."
-  def self_delivery?(%Scope{} = scope, inbox_id, configured_sender, headers)
-      when is_list(headers) and length(headers) <= 256 do
+  @doc "Keep-only self-mail evidence bound to a confirmed send in this immutable inbox identity."
+  def self_delivery?(scope, inbox_id, configured_sender, headers),
+    do: self_delivery?(scope, inbox_id, configured_sender, headers, fn _ -> false end)
+
+  @doc "A trusted DB-only callback may authorize recipients from this same inbox's address history."
+  def self_delivery?(
+        %Scope{} = scope,
+        inbox_id,
+        configured_sender,
+        headers,
+        historical_recipient?
+      )
+      when is_list(headers) and length(headers) <= 256 and is_function(historical_recipient?, 1) do
     with {:ok, sender} <- Address.normalize(configured_sender),
          [from] <- header_values(headers, "from"),
          {:ok, [^sender]} <- Address.parse(from),
          [rfc_id] <- header_values(headers, "message-id"),
-         {:ok, provider_id} <- MessageID.provider_id(rfc_id) do
-      case scope.repo.get(Mailbox, inbox_id, prefix: scope.prefix) do
-        %Mailbox{address: recipient} ->
-          {:ok,
-           scope.repo.exists?(
-             from(o in Outgoing,
-               where:
-                 o.inbox_id == ^inbox_id and
-                   o.state == :sent and o.provider_id == ^provider_id and o.sender == ^sender and
-                   o.recipient == ^recipient
-             ),
-             prefix: scope.prefix
-           )}
+         {:ok, provider_id} <- MessageID.provider_id(rfc_id),
+         %Mailbox{address: current_recipient} <-
+           scope.repo.get(Mailbox, inbox_id, prefix: scope.prefix) do
+      recipients =
+        scope.repo.all(
+          from(o in Outgoing,
+            where:
+              o.inbox_id == ^inbox_id and o.state == :sent and
+                o.provider_id == ^provider_id and o.sender == ^sender,
+            select: o.recipient
+          ),
+          prefix: scope.prefix
+        )
 
-        nil ->
-          {:ok, false}
-      end
+      {:ok,
+       Enum.any?(recipients, fn recipient ->
+         case Address.normalize(recipient) do
+           {:ok, ^recipient} ->
+             recipient == current_recipient or historical_recipient?.(recipient) == true
+
+           _ ->
+             false
+         end
+       end)}
     else
       _ -> {:ok, false}
     end
@@ -90,7 +107,7 @@ defmodule EmailJanitor.Mail.Outbox do
     _, _ -> {:error, :self_mail_unavailable}
   end
 
-  def self_delivery?(_, _, _, _), do: {:ok, false}
+  def self_delivery?(_, _, _, _, _), do: {:ok, false}
 
   defp header_values(headers, name) do
     for {key, value} <- headers,

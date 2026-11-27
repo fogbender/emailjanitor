@@ -29,6 +29,11 @@ defmodule EmailJanitor.SelfHost.Migration do
       timestamps(type: :utc_datetime_usec)
     end
 
+    create table(:self_host_addresses, primary_key: false) do
+      add(:inbox_id, references(:inboxes, type: :text), primary_key: true)
+      add(:address, :text, primary_key: true)
+    end
+
     create(
       constraint(:self_host_bindings, :binding_state,
         check: "state IN ('pending', 'active', 'disconnected', 'reauthorization_required')"

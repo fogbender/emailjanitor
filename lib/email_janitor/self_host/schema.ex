@@ -29,3 +29,13 @@ defmodule EmailJanitor.SelfHost.Binding do
     timestamps(type: :utc_datetime_usec)
   end
 end
+
+defmodule EmailJanitor.SelfHost.HistoricalAddress do
+  @moduledoc false
+  use Ecto.Schema
+  @primary_key false
+  schema "self_host_addresses" do
+    field(:inbox_id, :string, primary_key: true)
+    field(:address, :string, primary_key: true)
+  end
+end

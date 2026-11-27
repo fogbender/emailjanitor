@@ -55,6 +55,9 @@ defmodule EmailJanitor.SelfHostConfigTest do
        ctx do
     for url <- [
           "http://janitor.example.com",
+          "https://janitor.example.com:0",
+          "https://janitor.example.com:65536",
+          "https://janitor.example.com:99999",
           "https://user@janitor.example.com",
           "https://janitor.example.com/path",
           "https://janitor.example.com?token=secret",

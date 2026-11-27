@@ -482,6 +482,75 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert {:ok, :ok} = EmailJanitor.Gmail.Ingestion.record_signal(ctx.scope, renamed, "124")
   end
 
+  test "self delivery retains verified historical address evidence only for the same subject",
+       ctx do
+    alias EmailJanitor.Mail.{Outbox, Outgoing}
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, first} = SelfHost.connect(owner, result("work-one", "old-work@example.com"), "Etc/UTC")
+
+    {:ok, outgoing} =
+      Outbox.enqueue(
+        ctx.scope,
+        first.id,
+        :assistant,
+        [Ecto.UUID.generate()],
+        Ecto.UUID.generate()
+      )
+
+    Repo.update!(
+      Ecto.Changeset.change(outgoing,
+        state: :sent,
+        provider_id: "historical-proof",
+        sender: "janitor@janitor.example.com",
+        recipient: first.address
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    headers = [
+      {"From", "janitor@janitor.example.com"},
+      {"Message-ID", "<historical-proof@email.amazonses.com>"}
+    ]
+
+    assert {:ok, true} = Store.self_delivery?(first.id, "janitor@janitor.example.com", headers)
+
+    {:ok, renamed} =
+      SelfHost.connect(owner, result("work-one", "new-work@example.com"), "Etc/UTC")
+
+    assert renamed.id == first.id
+
+    assert {:ok, false} =
+             Outbox.self_delivery?(ctx.scope, first.id, "janitor@janitor.example.com", headers)
+
+    assert {:ok, true} = Store.self_delivery?(first.id, "janitor@janitor.example.com", headers)
+
+    {:ok, replacement} =
+      SelfHost.connect(owner, result("work-two", "old-work@example.com"), "Etc/UTC")
+
+    refute replacement.id == first.id
+
+    assert {:ok, false} =
+             Store.self_delivery?(replacement.id, "janitor@janitor.example.com", headers)
+
+    Repo.update_all(
+      from(o in Outgoing, where: o.id == ^outgoing.id),
+      [set: [recipient: "unrecorded@example.net"]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:ok, false} = Store.self_delivery?(first.id, "janitor@janitor.example.com", headers)
+  end
+
+  test "selfhost installer cannot modify a different repository or schema", ctx do
+    assert {:error, :invalid_self_host_scope} =
+             Store.install(%{ctx.scope | prefix: "ej_unrelated"})
+
+    assert {:error, :invalid_self_host_scope} =
+             Store.install(%{ctx.scope | repo: EmailJanitor.TestRepo})
+
+    assert {:error, :invalid_self_host_scope} = Store.install(nil)
+  end
+
   test "AEAD binds each ciphertext to its purpose and opaque row ID", ctx do
     content = Content.new("PRIVATE_OAUTH_ATTEMPT_SENTINEL")
     assert {:ok, first} = SelfHost.seal("browser-oauth", "id1", content)

@@ -3,11 +3,37 @@ defmodule EmailJanitor.SelfHost.Store do
   import Ecto.Query
   alias EmailJanitor.{Address, Content, Digest, Inbox, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.{Binding, Migration, Owner}
+  alias EmailJanitor.SelfHost.{Binding, HistoricalAddress, Migration, Owner}
   alias EmailJanitor.Store.Mailbox
 
-  def install(scope),
-    do: Ecto.Migrator.up(scope.repo, 100, Migration, prefix: scope.prefix, log: false)
+  def install(
+        %EmailJanitor.Store.Scope{repo: EmailJanitor.SelfHost.Repo, prefix: "ej_selfhost"} = scope
+      ),
+      do: Ecto.Migrator.up(scope.repo, 100, Migration, prefix: scope.prefix, log: false)
+
+  def install(_), do: {:error, :invalid_self_host_scope}
+
+  @doc false
+  def recipient?(inbox_id, recipient) do
+    scope = SelfHost.scope()
+
+    scope.repo.exists?(
+      from(a in HistoricalAddress, where: a.inbox_id == ^inbox_id and a.address == ^recipient),
+      prefix: scope.prefix,
+      log: false
+    )
+  end
+
+  @doc false
+  def self_delivery?(inbox_id, sender, headers) do
+    EmailJanitor.Mail.Outbox.self_delivery?(
+      SelfHost.scope(),
+      inbox_id,
+      sender,
+      headers,
+      &recipient?(inbox_id, &1)
+    )
+  end
 
   def owner?(subject) when is_binary(subject) do
     scope = SelfHost.scope()
@@ -108,6 +134,17 @@ defmodule EmailJanitor.SelfHost.Store do
             from(m in Mailbox, where: m.id == ^box.id),
             [inc: [instruction_version: 1], set: [address: box.address, updated_at: now]],
             prefix: scope.prefix
+          )
+        end
+
+        # History belongs to this immutable Google subject, never a reused address.
+        for address <- Enum.uniq([mailbox.address, box.address]) do
+          scope.repo.insert_all(
+            HistoricalAddress,
+            [%{inbox_id: box.id, address: address}],
+            prefix: scope.prefix,
+            on_conflict: :nothing,
+            log: false
           )
         end
 
