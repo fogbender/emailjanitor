@@ -40,6 +40,71 @@ defmodule EmailJanitor.Gmail.SDK do
     end)
   end
 
+  @doc "Resolve an arrival's thread ID using only minimal metadata, without downloading its body."
+  def thread_id(inbox_id, message_id, opts) do
+    guarded(fn ->
+      with true <- Parser.valid_id?(message_id),
+           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, %Model.Message{id: ^message_id, threadId: thread_id}} <-
+             call(fn ->
+               Users.gmail_users_messages_get(connection, "me", message_id,
+                 format: "minimal",
+                 fields: "id,threadId"
+               )
+             end),
+           true <- Parser.valid_id?(thread_id) do
+        {:ok, thread_id}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_message_reference}
+      end
+    end)
+  end
+
+  @doc """
+  Register or renew Gmail notifications for a pre-provisioned Pub/Sub topic.
+  Watch all changes so restoration/SENT/DRAFT changes are not filtered out.
+  The returned watch cursor is a registration snapshot; renewal must not advance
+  the host's durable processed-history cursor or skip pending catch-up.
+  """
+  def watch(inbox_id, topic, opts) do
+    guarded(fn ->
+      with true <-
+             is_binary(topic) and
+               Regex.match?(
+                 ~r/\Aprojects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/topics\/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}\z/,
+                 topic
+               ),
+           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, %Model.WatchResponse{historyId: id, expiration: expiry}} <-
+             call(fn ->
+               Users.gmail_users_watch(connection, "me",
+                 body: %Model.WatchRequest{topicName: topic}
+               )
+             end),
+           true <- history_id?(id) and is_binary(expiry),
+           {milliseconds, ""} when milliseconds > 0 <- Integer.parse(expiry),
+           {:ok, expires_at} <- DateTime.from_unix(milliseconds, :millisecond) do
+        {:ok, %{history_id: id, expires_at: expires_at}}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_watch}
+      end
+    end)
+  end
+
+  @doc "Gmail uses the same watch endpoint to renew; preserve the existing processing cursor."
+  def renew_watch(inbox_id, topic, opts), do: watch(inbox_id, topic, opts)
+
+  @doc "Stop this OAuth application's mailbox watch before deliberately disconnecting an inbox."
+  def stop_watch(inbox_id, opts) do
+    guarded(fn ->
+      with {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, _} <- call(fn -> Users.gmail_users_stop(connection, "me") end),
+           do: :ok
+    end)
+  end
+
   @impl true
   def contacted(inbox_id, keys, opts) do
     guarded(fn ->
@@ -89,7 +154,14 @@ defmodule EmailJanitor.Gmail.SDK do
       with true <- history_id?(start_id),
            {:ok, connection, _} <- verified(inbox_id, opts) do
         config = Keyword.fetch!(opts, :config)
-        history_pages(connection, start_id, config.max_pages, nil, MapSet.new(), [], [], [])
+        # Recovery can require evidence fetched after a dead-owner barrier.
+        # Capture once, before the first history request, not after the last page.
+        started_at = DateTime.utc_now()
+
+        case history_pages(connection, start_id, config.max_pages, nil, MapSet.new(), [], [], []) do
+          {:ok, evidence} -> {:ok, Map.put(evidence, :started_at, started_at)}
+          error -> error
+        end
       else
         {:error, _} = error -> error
         _ -> {:error, :invalid_history_id}

@@ -73,7 +73,13 @@ relationship. Incomplete search or authorization failures stop execution.
 `history/3` fetches all pages and exposes ordered INBOX label changes plus arrival
 and deletion IDs. Expired history, failed pages, pagination loops and limits
 produce explicitly incomplete evidence, which must never authorize a retry.
-The automatic watch/notification/reconciliation worker remains future work.
+Evidence includes `started_at`, captured before its first history HTTP request,
+so recovery can reject a snapshot fetched before its ownership barrier.
+`thread_id/3` resolves arrival IDs through minimal metadata. `watch/3` and
+`renew_watch/3` register all mailbox changes with a provisioned Pub/Sub topic;
+their registration cursor must not replace an existing processed-history cursor.
+`stop_watch/2` stops this application's watch on deliberate disconnection.
+The automatic notification/watch-renewal/reconciliation worker remains future work.
 
 Text parts are base64url-decoded transiently, HTML is converted to readable text,
 and body content is wrapped in `Content`. Attachment bodies are not fetched.

@@ -119,6 +119,94 @@ defmodule EmailJanitor.GmailSDKTest do
     assert {:ok, "100"} = SDK.history_id("inbox-1", options())
   end
 
+  test "arrival lookup requests only ID and thread ID metadata" do
+    mock(fn env ->
+      assert env.method == :get
+      assert String.ends_with?(env.url, "/messages/message-1")
+      assert env.query[:format] == "minimal"
+      assert env.query[:fields] == "id,threadId"
+      Tesla.Mock.json(%{"id" => "message-1", "threadId" => "thread-1"})
+    end)
+
+    assert {:ok, "thread-1"} = SDK.thread_id("inbox-1", "message-1", options())
+  end
+
+  test "arrival lookup rejects a mismatched returned message and missing thread ID" do
+    for response <- [%{"id" => "other-message", "threadId" => "thread-1"}, %{"id" => "message-1"}] do
+      mock(fn _ -> Tesla.Mock.json(response) end)
+
+      assert {:error, :invalid_message_reference} =
+               SDK.thread_id("inbox-1", "message-1", options())
+    end
+  end
+
+  test "watch registration and renewal use a configured topic and retain all label events" do
+    expiry = DateTime.add(DateTime.utc_now(), 6, :day) |> DateTime.to_unix(:millisecond)
+
+    mock(fn env ->
+      assert env.method == :post
+      assert String.ends_with?(env.url, "/watch")
+
+      assert Jason.decode!(env.body) == %{
+               "topicName" => "projects/emailjanitor-test/topics/mailbox-changes"
+             }
+
+      Tesla.Mock.json(%{"historyId" => "200", "expiration" => Integer.to_string(expiry)})
+    end)
+
+    for method <- [:watch, :renew_watch] do
+      assert {:ok, %{history_id: "200", expires_at: expires_at}} =
+               apply(SDK, method, [
+                 "inbox-1",
+                 "projects/emailjanitor-test/topics/mailbox-changes",
+                 options()
+               ])
+
+      assert DateTime.to_unix(expires_at, :millisecond) == expiry
+    end
+  end
+
+  test "watch rejects malformed topic names before contacting Google" do
+    Tesla.Mock.mock(fn _ -> flunk("invalid topic must not contact Google") end)
+
+    for topic <- [
+          nil,
+          "mailbox-changes",
+          "projects/../../topics/anything",
+          "projects/emailjanitor-test/topics/name?secret=x"
+        ] do
+      assert {:error, :invalid_watch} = SDK.watch("inbox-1", topic, options())
+    end
+  end
+
+  test "watch responses require a valid history cursor and expiration" do
+    for response <- [
+          %{"historyId" => "not-a-cursor", "expiration" => "1795708800000"},
+          %{"historyId" => "200", "expiration" => "not-an-expiration"},
+          %{"historyId" => "200"}
+        ] do
+      mock(fn _ -> Tesla.Mock.json(response) end)
+
+      assert {:error, :invalid_watch} =
+               SDK.watch(
+                 "inbox-1",
+                 "projects/emailjanitor-test/topics/mailbox-changes",
+                 options()
+               )
+    end
+  end
+
+  test "stopping a watch is verified and does not mutate email labels" do
+    mock(fn env ->
+      assert env.method == :post
+      assert String.ends_with?(env.url, "/stop")
+      assert env.body == ""
+      %Tesla.Env{status: 204, body: ""}
+    end)
+
+    assert :ok = SDK.stop_watch("inbox-1", options())
+  end
+
   test "MIME alternatives yield readable HTML pitch and links while attachments stay unfetched" do
     payload = %{
       "mimeType" => "multipart/mixed",
@@ -475,6 +563,22 @@ defmodule EmailJanitor.GmailSDKTest do
                %Action{history_id: "100", message_ids: ["message-1"]},
                history
              )
+  end
+
+  test "history evidence records a timestamp before the first history HTTP request" do
+    before_call = DateTime.utc_now()
+
+    mock(fn _ ->
+      send(self(), {:history_requested_at, DateTime.utc_now()})
+      Tesla.Mock.json(%{"historyId" => "100", "history" => []})
+    end)
+
+    assert {:ok, %{complete?: true, started_at: started_at}} =
+             SDK.history("inbox-1", "100", options())
+
+    assert_received {:history_requested_at, requested_at}
+    assert DateTime.compare(before_call, started_at) in [:lt, :eq]
+    assert DateTime.compare(started_at, requested_at) in [:lt, :eq]
   end
 
   test "expired history and incomplete pagination never become retry evidence" do
