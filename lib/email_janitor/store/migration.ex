@@ -17,6 +17,8 @@ defmodule EmailJanitor.Store.Migration do
       add(:inbox_id, references(:inboxes, type: :text), null: false)
       add(:thread_id, :text, null: false)
       add(:message_ids, {:array, :text}, null: false)
+      add(:applied_message_ids, {:array, :text}, null: false, default: [])
+      add(:restored_message_ids, {:array, :text}, null: false, default: [])
       add(:fingerprint, :text, null: false)
       add(:history_id, :text, null: false)
       add(:instruction_version, :integer, null: false)
