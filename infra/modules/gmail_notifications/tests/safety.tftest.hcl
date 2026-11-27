@@ -55,11 +55,15 @@ run "private_persistent_notifications" {
     error_message = "The consumer needs only its subscription-scoped subscriber role."
   }
   assert {
-    condition     = google_iam_workload_identity_pool_provider.aws.attribute_condition == "assertion.arn.startsWith('arn:aws:sts::123456789012:assumed-role/janitor-test-runtime/')" && google_service_account_iam_member.federated_host.role == "roles/iam.workloadIdentityUser"
+    condition     = google_iam_workload_identity_pool_provider.host.attribute_condition == "assertion.arn.startsWith('arn:aws:sts::123456789012:assumed-role/janitor-test-runtime/')" && google_service_account_iam_member.federated_host.role == "roles/iam.workloadIdentityUser"
     error_message = "Federation must restrict the account and role, with no long-lived service-account keys."
   }
   assert {
     condition     = alltrue([for api in google_project_service.apis : !api.disable_on_destroy])
     error_message = "Removing Janitor must not disable shared Google project APIs."
+  }
+  assert {
+    condition     = output.external_account_configuration.subject_token_type == "urn:ietf:params:aws:token-type:aws4_request" && output.external_account_configuration.credential_source.imdsv2_session_token_url == "http://169.254.169.254/latest/api/token" && length(google_iam_workload_identity_pool_provider.host.oidc) == 0
+    error_message = "Default AWS federation keeps the official IMDSv2 source and does not enable Azure authority."
   }
 }
