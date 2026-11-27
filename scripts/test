@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Every run gets a new local Unix-socket database. No shared dev/prod services.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+janitor_test_dir=$(mktemp -d /tmp/emailjanitor-test.XXXXXX)
+janitor_pg_started=false
+cleanup() {
+  if "$janitor_pg_started"; then
+    pg_ctl -D "$janitor_test_dir/data" -m immediate -w stop >/dev/null
+  fi
+  rm -rf -- "$janitor_test_dir"
+}
+trap cleanup EXIT
+initdb -D "$janitor_test_dir/data" --no-locale --encoding=UTF8 --auth-local=trust --auth-host=reject >"$janitor_test_dir/init.log"
+pg_ctl -D "$janitor_test_dir/data" -l "$janitor_test_dir/postgres.log" \
+  -o "-h '' -k $janitor_test_dir -p 5432 -F" -w start >/dev/null
+janitor_pg_started=true
+createdb -h "$janitor_test_dir" -p 5432 emailjanitor_test
+export JANITOR_TEST_SOCKET="$janitor_test_dir"
+mix test --warnings-as-errors "$@"

@@ -25,3 +25,41 @@ bash scripts/check
 
 All normal tests use synthetic messages and isolated dependencies. Do not point
 tests at a real inbox or shared database. Never commit credentials or email bodies.
+
+`scripts/check` checks formatting, compiles with warnings as errors, then starts
+a new temporary PostgreSQL cluster for the tests. It uses only a private Unix
+socket and removes its database on exit. To run selected tests:
+
+```sh
+nix develop --command bash scripts/test test/email_janitor/executor_test.exs
+```
+
+## Implemented foundation
+
+- Conservative sender and correspondence guards, including configured relays,
+  shared mailbox providers and public-suffix-aware parent-domain matching.
+- Validated, tool-free classifier boundary; transient content redaction and HTML
+  extraction. A real model adapter is not connected yet.
+- Explicit repository/schema scopes, durable idempotent action intents, exact-ID
+  Gmail mutation boundary and restoration protection, tested against PostgreSQL.
+- Dedicated short-lived execution owners, single-host Linux identity, bounded
+  dispatch and crash recovery. A dead
+  owner that never dispatched permits a fresh checked attempt. Dispatched orphan
+  actions and ordinary transport failures remain unresolved until fresh, complete Gmail history positively
+  accounts for every message; empty history never licenses replay. Live owners
+  remain protected, expired local owners are killed before recovery, and unknown
+  hosts/runtimes cannot be taken over. Hosts call `Executor.recover/3` and then
+  `Store.reconcile/4` with authenticated history started after recovery.
+  Do not wrap execution in a host transaction: it is rejected so the intent is
+  committed before Gmail is called. Low-level store ownership APIs are internal
+  executor primitives; a host should call `Executor.execute/4`.
+- Pure history-based ambiguous-action reconciliation decisions. Its live Gmail
+  history consumer and automatic recovery worker are not implemented yet.
+
+The Gmail adapter in the tests is a fake. There is no OAuth connection, running
+cleanup service, email transport, chat UI, billing, or cloud deployment yet.
+
+The SaaS will own identity/group routing and supply a trusted database schema
+scope to this library. The library does not determine tenants or accept storage
+scopes from model output or HTTP parameters. Query-prefix separation is covered
+here; full SaaS authorization is a later integration gate.
