@@ -70,7 +70,7 @@ defmodule EmailJanitor.Executor do
   defp fetch_review(scope, inbox, thread_id, gmail, options, version, opts) do
     with {:ok, {stored_version, started_at}} <- Store.review_snapshot(scope, inbox.id),
          true <- stored_version == version,
-         {:ok, current} <- safe(fn -> gmail.thread(inbox.id, thread_id, options) end),
+         {:ok, current} <- safe_thread(fn -> gmail.thread(inbox.id, thread_id, options) end),
          true <-
            is_list(current) and Enum.all?(current, &match?(%Message{thread_id: ^thread_id}, &1)) do
       inbox_ids = exact_inbox_ids(current)
@@ -375,6 +375,24 @@ defmodule EmailJanitor.Executor do
         _ -> {:halt, {:error, :protected_sender}}
       end
     end)
+  end
+
+  defp safe_thread(fun) do
+    case fun.() do
+      {:ok, _} = result ->
+        result
+
+      {:error, reason}
+      when reason in [:invalid_thread, :unreadable_content, :response_too_large] ->
+        {:error, :unreadable_content}
+
+      _ ->
+        {:error, :gmail_unavailable}
+    end
+  rescue
+    _ -> {:error, :gmail_unavailable}
+  catch
+    _, _ -> {:error, :gmail_unavailable}
   end
 
   defp safe(fun) do

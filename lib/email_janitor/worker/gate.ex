@@ -17,8 +17,12 @@ defmodule EmailJanitor.Worker.Gate do
         now,
         admission
       ) do
-    with :ok <- config.authorize.(), :ok <- proof(context) do
-      result = Policy.reserve(config.policy, inbox_id, action_id, ids, now, admission)
+    with :ok <- config.authorize.() do
+      result =
+        case proof(context) do
+          :ok -> Policy.reserve(config.policy, inbox_id, action_id, ids, now, admission)
+          result -> result
+        end
 
       if result == :ok or match?({:blocked, _}, result) do
         generation =
@@ -46,8 +50,9 @@ defmodule EmailJanitor.Worker.Gate do
   end
 
   defp proof(%{config: config, source: source, proposal: proposal, generation: generation}) do
-    with :ok <- EmailJanitor.Worker.Config.recheck(config, source),
-         do: Ledger.authorize_candidate(config.scope, config.inbox, source, proposal, generation)
+    with :ok <-
+           Ledger.authorize_candidate(config.scope, config.inbox, source, proposal, generation),
+         do: EmailJanitor.Worker.Config.recheck(config, source)
   end
 
   defp proof(%{config: config, eligible: eligible, proposal: proposal}),

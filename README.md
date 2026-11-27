@@ -482,6 +482,13 @@ discovery preserves retry deadlines and caps. A missing exact partial-retirement
 capability pauses the affected candidate until explicit repair/recheck, without
 repeated classifier calls or fallback to a whole-candidate withdrawal.
 
+Candidate attempts carry a durable request version: selection changes and
+explicit repairs increment it, while completion compares the version it began
+with. A stale run cannot clear new selected IDs or overwrite repaired counters.
+Unreadable candidate threads follow the same metadata-only deferral as arrivals.
+Final admission preserves valid upgrade refusals and revoked-manual-proof
+statuses; a quota/provider outage still uses inbox-wide backoff.
+
 ## Google workload token helper
 
 The isolated `google-auth-bridge` Nix package uses Google’s official Node SDK

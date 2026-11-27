@@ -83,7 +83,10 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   def contacted(_, _, options),
     do: Agent.get(options[:state], &{:ok, Map.get(&1, :contacts, MapSet.new())})
 
-  def history_id(_, _), do: {:ok, "200"}
+  def history_id(_, options) do
+    if hook = options[:history_hook], do: hook.()
+    {:ok, "200"}
+  end
 
   def remove_inbox(_, ids, options) do
     if hook = options[:before_mutation], do: hook.()

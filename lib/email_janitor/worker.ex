@@ -451,6 +451,18 @@ defmodule EmailJanitor.Worker do
 
         :deferred
 
+      {:error, :unreadable_content} ->
+        finish_review(
+          config,
+          checkpoint,
+          eligible,
+          targets,
+          snapshot,
+          version,
+          now,
+          {:keep, :unreadable_content}
+        )
+
       {:error, reason}
       when reason in [:partial_admission_unsupported, :partial_retirement_unsupported] ->
         Ledger.defer(
@@ -636,7 +648,7 @@ defmodule EmailJanitor.Worker do
     :kept
   end
 
-  defp finish_recheck(config, checkpoint, candidate, _snapshot, _version, now, {:ok, proposal}) do
+  defp finish_recheck(config, checkpoint, candidate, snapshot, version, now, {:ok, proposal}) do
     context = %{
       config: config,
       source: candidate,
@@ -677,6 +689,22 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :skipped
 
+      {:error, :unreadable_content} ->
+        finish_recheck(
+          config,
+          checkpoint,
+          candidate,
+          snapshot,
+          version,
+          now,
+          {:keep, :unreadable_content}
+        )
+
+      {:error, reason}
+      when reason in [:manual_recheck_unsupported, :manual_authorization_changed] ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :unsupported_policy, now)
+        {:deferred, reason}
+
       {:error, reason}
       when reason in [:partial_admission_unsupported, :partial_retirement_unsupported] ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :unsupported_policy, now)
@@ -692,12 +720,42 @@ defmodule EmailJanitor.Worker do
     end
   end
 
+  defp finish_recheck(
+         config,
+         checkpoint,
+         candidate,
+         snapshot,
+         version,
+         now,
+         {:error, :unreadable_content}
+       ),
+       do:
+         finish_recheck(
+           config,
+           checkpoint,
+           candidate,
+           snapshot,
+           version,
+           now,
+           {:keep, :unreadable_content}
+         )
+
   defp finish_recheck(config, _checkpoint, candidate, _snapshot, _version, now, error) do
     reason =
       case error do
-        {:error, :partial_retirement_unsupported} -> :unsupported_policy
-        {:error, reason} when reason in [:invalid_decision, :model_rejected] -> reason
-        _ -> :retry
+        {:error, reason}
+        when reason in [
+               :partial_retirement_unsupported,
+               :manual_recheck_unsupported,
+               :manual_authorization_changed
+             ] ->
+          :unsupported_policy
+
+        {:error, reason} when reason in [:invalid_decision, :model_rejected] ->
+          reason
+
+        _ ->
+          :retry
       end
 
     Ledger.finish_candidate(config.scope, config.inbox, candidate, reason, now)

@@ -303,7 +303,8 @@ defmodule EmailJanitor.Worker.Ledger do
               rejected_attempts: 0,
               contract_blocked: false,
               next_attempt_at: nil
-            ]
+            ],
+            inc: [request_version: 1]
           ],
           prefix: scope.prefix,
           log: false
@@ -358,7 +359,11 @@ defmodule EmailJanitor.Worker.Ledger do
                do: scope.repo.rollback(:ineligible_recheck)
 
              existing =
-               scope.repo.get_by(Candidate, [inbox_id: inbox.id, candidate_id: id],
+               scope.repo.one(
+                 from(c in Candidate,
+                   where: c.inbox_id == ^inbox.id and c.candidate_id == ^id,
+                   lock: "FOR UPDATE"
+                 ),
                  prefix: scope.prefix,
                  log: false
                )
@@ -380,6 +385,7 @@ defmodule EmailJanitor.Worker.Ledger do
                    scope.repo.update!(
                      Ecto.Changeset.change(existing,
                        message_ids: Enum.sort(ids),
+                       request_version: existing.request_version + 1,
                        attempts: 0,
                        invalid_attempts: 0,
                        rejected_attempts: 0,
@@ -416,7 +422,7 @@ defmodule EmailJanitor.Worker.Ledger do
                      p.candidate_id == ^id and p.status == :pending and not p.requested and
                      not p.contract_blocked and p.invalid_attempts < 8 and p.rejected_attempts < 4
                ),
-               [set: [requested: true, next_attempt_at: nil]],
+               [set: [requested: true, next_attempt_at: nil], inc: [request_version: 1]],
                prefix: scope.prefix,
                log: false
              )
@@ -455,7 +461,9 @@ defmodule EmailJanitor.Worker.Ledger do
            ),
          {:ok, %Checkpoint{generation: ^generation, status: :active, address: address}} <-
            Ingestion.checkpoint(scope, inbox.id),
-         true <- address == inbox.address and pending_source?(scope, inbox, fresh) do
+         true <-
+           address == inbox.address and fresh.request_version == candidate.request_version and
+             pending_source?(scope, inbox, fresh) do
       :ok
     else
       _ -> {:error, :ineligible_recheck}
@@ -527,7 +535,8 @@ defmodule EmailJanitor.Worker.Ledger do
             invalid_attempts: 0,
             rejected_attempts: 0,
             next_attempt_at: nil
-          ]
+          ],
+          inc: [request_version: 1]
         ],
         prefix: scope.prefix,
         log: false
@@ -543,7 +552,8 @@ defmodule EmailJanitor.Worker.Ledger do
           from(c in Candidate,
             where:
               c.inbox_id == ^inbox.id and
-                c.candidate_id == ^candidate.candidate_id
+                c.candidate_id == ^candidate.candidate_id and
+                c.request_version == ^candidate.request_version
           ),
           [set: [requested: false, contract_blocked: true, next_attempt_at: nil]],
           prefix: scope.prefix,
@@ -565,6 +575,7 @@ defmodule EmailJanitor.Worker.Ledger do
           from(c in Candidate,
             where:
               c.inbox_id == ^inbox.id and c.candidate_id == ^candidate.candidate_id and
+                c.request_version == ^candidate.request_version and
                 c.status == :pending
           ),
           [
@@ -584,7 +595,9 @@ defmodule EmailJanitor.Worker.Ledger do
       _ ->
         scope.repo.update_all(
           from(c in Candidate,
-            where: c.inbox_id == ^inbox.id and c.candidate_id == ^candidate.candidate_id
+            where:
+              c.inbox_id == ^inbox.id and c.candidate_id == ^candidate.candidate_id and
+                c.request_version == ^candidate.request_version
           ),
           [set: [requested: false, next_attempt_at: nil]],
           prefix: scope.prefix,
