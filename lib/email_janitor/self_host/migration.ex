@@ -23,6 +23,7 @@ defmodule EmailJanitor.SelfHost.Migration do
       add(:timezone, :text, null: false)
       add(:state, :text, null: false)
       add(:epoch, :bigint, null: false, default: 1)
+      add(:reset_baseline, :boolean, null: false, default: false)
       add(:token_version, :bigint, null: false, default: 1)
       add(:token_ciphertext, :binary)
       timestamps(type: :utc_datetime_usec)
