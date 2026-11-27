@@ -996,6 +996,23 @@ defmodule EmailJanitor.IngestionTest do
                {Gmail, [thread_id: fn _ -> {:error, :not_found} end]}
              )
 
+    for {reason, expected} <- [
+          {:thread_not_found, {:skip, :deleted_arrival}},
+          {:not_found, {:error, :eligibility_unavailable}}
+        ] do
+      assert expected ==
+               Ingestion.eligible_thread(
+                 scope,
+                 box,
+                 checkpoint.generation,
+                 "message-1",
+                 {Gmail,
+                  [thread_id: fn _ -> {:ok, "thread-1"} end, thread: fn _ -> {:error, reason} end]}
+               )
+    end
+
+    assert {:ok, [%{message_id: "message-1"}]} = Ingestion.pending(scope, box)
+
     adapter =
       {Gmail,
        [
