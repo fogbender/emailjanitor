@@ -38,6 +38,23 @@ defmodule EmailJanitor.TestPolicy do
     end
   end
 
+  def retire_candidate(context, _inbox, id, ids) do
+    if context.mode == :retire_error do
+      {:error, :unavailable}
+    else
+      record(context, id, "retire", ids)
+
+      Ecto.Adapters.SQL.query!(
+        context.scope.repo,
+        "DELETE FROM #{context.scope.prefix}.policy_events WHERE action_id=$1 AND kind='reserve'",
+        [id],
+        log: false
+      )
+
+      :ok
+    end
+  end
+
   defp record(context, id, kind, ids, rest \\ []) do
     Ecto.Adapters.SQL.query!(
       context.scope.repo,
@@ -171,6 +188,52 @@ defmodule EmailJanitor.PolicyTest do
     assert length(ids) == 512
     assert {:blocked, :upgrade_required} = execute(ctx, :block)
     assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "a growing blocked thread retires the superseded proposal at core and host", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: old}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    messages = [message(), message(id: "message-2")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    ctx = %{ctx | proposal: proposal}
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+
+    assert [%Candidate{id: current, message_ids: ["message-1", "message-2"]}] =
+             TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    refute current == old
+
+    assert %{rows: [[^old, "retire"], [^current, "reserve"]]} =
+             Ecto.Adapters.SQL.query!(
+               TestRepo,
+               "SELECT action_id,kind FROM #{ctx.scope.prefix}.policy_events ORDER BY kind DESC",
+               [],
+               log: false
+             )
+
+    assert {:done, ^current} = execute(ctx, :allow)
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["message-1", "message-2"]] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "candidate retirement failure rolls back admission and all host metadata", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: old}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    messages = [message(), message(id: "message-2")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    assert {:error, :policy_unavailable} = execute(%{ctx | proposal: proposal}, :retire_error)
+    assert [%Candidate{id: ^old}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+    assert [["reserve", ["message-1"]]] = events()
     assert [] = Agent.get(ctx.state, & &1.calls)
   end
 

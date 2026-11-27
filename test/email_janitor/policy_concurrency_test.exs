@@ -1,5 +1,8 @@
 defmodule EmailJanitor.RacePolicy do
   @behaviour EmailJanitor.Policy
+  def retire_candidate(context, inbox, id, ids),
+    do: EmailJanitor.TestPolicy.retire_candidate(context, inbox, id, ids)
+
   def reserve(context, inbox, action, ids, now),
     do: EmailJanitor.TestPolicy.reserve(context, inbox, action, ids, now)
 
@@ -84,12 +87,14 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
                            action.owner_token
                          )
 
-                   send(parent, {:prepared_recovery, action.id})
+                   send(parent, {:prepared_recovery, action.id, self()})
                    raise "SYNTHETIC_EXECUTOR_FAILURE"
                  end)
                end)
 
-      assert_receive {:prepared_recovery, id}
+      assert_receive {:prepared_recovery, id, owner}
+      owner_monitor = Process.monitor(owner)
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _}, 5_000
       state = if unquote(dispatched), do: :unresolved, else: :cancelled
 
       assert {:ok, {^state, _}} =

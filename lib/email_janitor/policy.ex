@@ -13,6 +13,8 @@ defmodule EmailJanitor.Policy do
   @callback reserve(term(), String.t(), String.t(), [String.t()], DateTime.t()) ::
               :ok | {:blocked, atom()} | {:error, atom()}
   @callback settle(term(), String.t(), String.t(), term()) :: :ok | {:error, atom()}
+  @callback retire_candidate(term(), String.t(), String.t(), [String.t()]) ::
+              :ok | {:error, atom()}
 
   def unlimited, do: %__MODULE__{adapter: EmailJanitor.Policy.Unlimited, context: nil}
 
@@ -38,6 +40,18 @@ defmodule EmailJanitor.Policy do
   catch
     _, _ -> {:error, :policy_unavailable}
   end
+
+  @doc "Retire superseded blocked-candidate metadata; this is never a Gmail/quota result."
+  def retire_candidate(%__MODULE__{} = policy, inbox_id, candidate_id, message_ids) do
+    case policy.adapter.retire_candidate(policy.context, inbox_id, candidate_id, message_ids) do
+      :ok -> :ok
+      _ -> {:error, :policy_unavailable}
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  catch
+    _, _ -> {:error, :policy_unavailable}
+  end
 end
 
 defmodule EmailJanitor.Policy.Unlimited do
@@ -45,4 +59,5 @@ defmodule EmailJanitor.Policy.Unlimited do
   @behaviour EmailJanitor.Policy
   def reserve(_, _, _, _, _), do: :ok
   def settle(_, _, _, _), do: :ok
+  def retire_candidate(_, _, _, _), do: :ok
 end

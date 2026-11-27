@@ -88,6 +88,7 @@ defmodule EmailJanitor.Store do
 
         case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
           :ok ->
+            retire_overlapping_candidates(scope, inbox_id, candidate, policy)
             record = struct(record, Owner.capture())
             record = %{record | lease_expires_at: DateTime.add(clock(scope), 60)}
             action = scope.repo.insert!(record, prefix: scope.prefix)
@@ -97,6 +98,7 @@ defmodule EmailJanitor.Store do
           # A block commits the host's pending-candidate metadata but never creates
           # a Gmail mutation intent. Errors roll back the entire reservation.
           {:blocked, reason} ->
+            retire_overlapping_candidates(scope, inbox_id, candidate, policy)
             {:blocked, reason}
 
           {:error, reason} ->
@@ -104,6 +106,27 @@ defmodule EmailJanitor.Store do
         end
       end
     end)
+  end
+
+  defp retire_overlapping_candidates(scope, inbox_id, current, policy) do
+    prior =
+      scope.repo.all(
+        from(c in Candidate,
+          where:
+            c.inbox_id == ^inbox_id and c.id != ^current.id and
+              fragment("? && ?::text[]", c.message_ids, ^current.message_ids)
+        ),
+        prefix: scope.prefix
+      )
+
+    for candidate <- prior do
+      case Policy.retire_candidate(policy, inbox_id, candidate.id, candidate.message_ids) do
+        :ok -> scope.repo.delete!(candidate, prefix: scope.prefix)
+        {:error, reason} -> scope.repo.rollback(reason)
+      end
+    end
+
+    :ok
   end
 
   def get(%Scope{} = scope, inbox_id, id) do
