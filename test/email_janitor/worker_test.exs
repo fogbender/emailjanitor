@@ -78,6 +78,119 @@ defmodule EmailJanitor.WorkerTest do
   defp read(state), do: Agent.get(state, & &1)
   defp pending(ctx), do: Ingestion.pending(ctx.scope, ctx.box)
 
+  defp fresh_policy(config) do
+    observer = self()
+
+    factory = fn messages ->
+      send(observer, {:policy_factory, Enum.map(messages, & &1.id)})
+      subject = messages |> hd() |> EmailJanitor.Message.header("subject")
+
+      {:ok,
+       %Policy{
+         adapter: __MODULE__.FreshPolicy,
+         context: %{base: config.policy, observer: observer, subject: subject}
+       }}
+    end
+
+    %{config | policy_for_messages: factory}
+  end
+
+  test "automatic cleanup derives one header policy and reuses it for admission and settlement",
+       ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(
+              headers: [{"From", "sales@vendor.com"}, {"Subject", "Fresh subject"}]
+            )
+          ]
+      }
+    )
+
+    assert {:ok, %{status: :done}} = Worker.step(fresh_policy(ctx.config))
+    assert_receive {:policy_factory, ["message-1"]}
+    refute_receive {:policy_factory, _}
+    assert_receive {:fresh_policy, "Fresh subject", :reserve, ["message-1"]}
+    assert_receive {:fresh_policy, "Fresh subject", :settle, _}
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == 3
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "queued Keep retirement receives the newly fetched header policy", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    [%Candidate{candidate_id: id}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | model: :keep,
+          messages: [
+            Fixtures.message(
+              headers: [{"From", "sales@vendor.com"}, {"Subject", "Changed subject"}]
+            )
+          ]
+      }
+    )
+
+    assert {:ok, %{status: :kept}} = Worker.step(fresh_policy(ctx.config))
+    assert_receive {:policy_factory, ["message-1"]}
+    assert_receive {:fresh_policy, "Changed subject", :retire, ["message-1"]}
+    assert read(ctx.state).mutations == []
+  end
+
+  test "invalid derived policies fail closed and retain arrival provenance for retry", ctx do
+    for failure <- [fn _ -> {:ok, nil} end, fn _ -> raise "PRIVATE_FACTORY_BODY" end] do
+      assert {:ok, %{status: :policy_unavailable}} =
+               Worker.step(%{ctx.config | policy_for_messages: failure})
+
+      assert {:ok, [_]} = pending(ctx)
+      assert read(ctx.state).model_inputs == []
+      assert read(ctx.state).mutations == []
+      advance(ctx.clock, 901)
+    end
+
+    assert {:ok, %{status: :done}} = Worker.step(fresh_policy(ctx.config))
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "durable settlement recovery uses the base policy without another header read", ctx do
+    Agent.update(ctx.quota, &%{&1 | failures: 1})
+    assert {:ok, %{status: :settlement_pending}} = Worker.step(fresh_policy(ctx.config))
+    assert_receive {:policy_factory, _}
+    assert_receive {:fresh_policy, _, :reserve, _}
+    assert_receive {:fresh_policy, _, :settle, _}
+    before = Enum.count(read(ctx.state).calls, &(&1 == :full_thread))
+
+    config = %{
+      ctx.config
+      | policy_for_messages: fn _ -> flunk("recovery fetched message bodies") end
+    }
+
+    assert {:ok, %{recovery: :settled}} = Worker.step(config)
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == before
+    refute_receive {:fresh_policy, _, _, _}
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "worker config accepts only a unary policy factory", ctx do
+    for factory <- [:bad, fn -> :ok end] do
+      assert {:error, :invalid_worker_config} =
+               Config.new(ctx.scope, ctx.box,
+                 gmail: ctx.config.gmail,
+                 classifier: ctx.config.classifier,
+                 preferences: ctx.config.preferences,
+                 authorize: ctx.config.authorize,
+                 topic: ctx.config.topic,
+                 policy_for_messages: factory
+               )
+    end
+  end
+
   test "install is idempotent and the first watch seeds no old-inbox cleanup", ctx do
     assert :ok = Worker.install(ctx.scope)
 
