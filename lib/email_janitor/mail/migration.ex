@@ -11,10 +11,13 @@ defmodule EmailJanitor.Mail.Migration do
       add(:dedupe_id, :uuid, null: false)
       add(:state, :text, null: false, default: "pending")
       add(:provider_id, :text)
+      add(:sender, :text)
+      add(:recipient, :text)
       timestamps(type: :utc_datetime_usec)
     end
 
     create(unique_index(:mail_outbox, [:inbox_id, :kind, :dedupe_id]))
+    create(index(:mail_outbox, [:inbox_id, :provider_id], where: "state = 'sent'"))
     create(constraint(:mail_outbox, :mail_kind, check: "kind IN ('digest', 'assistant')"))
 
     create(
