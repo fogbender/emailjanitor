@@ -17,7 +17,7 @@ inside an optional module.
 | 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
 | 9 | Conversation execution ownership | Conversation installer (in development) |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
-| 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
+| 11 | Inbox-worker recovery/settlement/deferred provenance ledger | `Worker.install/1` |
 | 12 | Staged digest action headers | `Digest.install_staging/1` |
 
 Changes to an already released schema require a new
