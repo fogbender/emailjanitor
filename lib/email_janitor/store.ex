@@ -21,6 +21,19 @@ defmodule EmailJanitor.Store do
     end
   end
 
+  def review_snapshot(%Scope{} = scope, inbox_id) do
+    case scope.repo.one(
+           from(m in Mailbox,
+             where: m.id == ^inbox_id,
+             select: {m.instruction_version, fragment("clock_timestamp()")}
+           ),
+           prefix: scope.prefix
+         ) do
+      nil -> {:error, :unknown_inbox}
+      snapshot -> {:ok, snapshot}
+    end
+  end
+
   def intent(%Scope{} = scope, inbox_id, %Proposal{} = proposal, history_id, opts \\ [])
       when is_binary(history_id) do
     if scope.repo.in_transaction?(),
@@ -69,6 +82,22 @@ defmodule EmailJanitor.Store do
       if existing do
         {:existing, existing}
       else
+        review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
+
+        # A later review may have blocked a larger batch while this executor was
+        # fetching Gmail history. Never let its older subset bypass that decision.
+        newer_candidate? =
+          scope.repo.exists?(
+            from(c in Candidate,
+              where:
+                c.inbox_id == ^inbox_id and c.updated_at > ^review_started_at and
+                  fragment("? && ?::text[]", c.message_ids, ^proposal.message_ids)
+            ),
+            prefix: scope.prefix
+          )
+
+        if newer_candidate?, do: scope.repo.rollback(:proposal_changed)
+
         ids = Enum.sort(proposal.message_ids)
         message_key = :crypto.hash(:sha256, :erlang.term_to_binary(ids))
 
@@ -77,18 +106,31 @@ defmodule EmailJanitor.Store do
             prefix: scope.prefix
           ) ||
             scope.repo.insert!(
-              %Candidate{inbox_id: inbox_id, message_key: message_key, message_ids: ids},
+              %Candidate{
+                inbox_id: inbox_id,
+                thread_id: proposal.thread_id,
+                message_key: message_key,
+                message_ids: ids,
+                inserted_at: clock(scope),
+                updated_at: clock(scope)
+              },
               prefix: scope.prefix
             )
 
         if candidate.message_ids != ids, do: scope.repo.rollback(:candidate_conflict)
+
+        candidate =
+          candidate
+          |> Ecto.Changeset.change(thread_id: proposal.thread_id, updated_at: clock(scope))
+          |> scope.repo.update!(prefix: scope.prefix)
+
         record = %{record | id: candidate.id}
         policy = Keyword.get(opts, :policy, Policy.unlimited())
         now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
 
         case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
           :ok ->
-            retire_overlapping_candidates(scope, inbox_id, candidate, policy)
+            retire_overlapping_candidates(scope, inbox_id, candidate, policy, review_started_at)
             record = struct(record, Owner.capture())
             record = %{record | lease_expires_at: DateTime.add(clock(scope), 60)}
             action = scope.repo.insert!(record, prefix: scope.prefix)
@@ -98,7 +140,7 @@ defmodule EmailJanitor.Store do
           # A block commits the host's pending-candidate metadata but never creates
           # a Gmail mutation intent. Errors roll back the entire reservation.
           {:blocked, reason} ->
-            retire_overlapping_candidates(scope, inbox_id, candidate, policy)
+            retire_overlapping_candidates(scope, inbox_id, candidate, policy, review_started_at)
             {:blocked, reason}
 
           {:error, reason} ->
@@ -108,12 +150,12 @@ defmodule EmailJanitor.Store do
     end)
   end
 
-  defp retire_overlapping_candidates(scope, inbox_id, current, policy) do
+  defp retire_overlapping_candidates(scope, inbox_id, current, policy, started_at) do
     prior =
       scope.repo.all(
         from(c in Candidate,
           where:
-            c.inbox_id == ^inbox_id and c.id != ^current.id and
+            c.inbox_id == ^inbox_id and c.id != ^current.id and c.updated_at <= ^started_at and
               fragment("? && ?::text[]", c.message_ids, ^current.message_ids)
         ),
         prefix: scope.prefix
@@ -126,7 +168,77 @@ defmodule EmailJanitor.Store do
       end
     end
 
+    cancelled =
+      scope.repo.all(
+        from(a in Action,
+          where:
+            a.inbox_id == ^inbox_id and a.state == :cancelled and a.updated_at <= ^started_at and
+              fragment("? && ?::text[]", a.message_ids, ^current.message_ids)
+        ),
+        prefix: scope.prefix
+      )
+
+    for action <- cancelled,
+        do: retire_metadata!(scope, policy, inbox_id, action.id, action.message_ids)
+
     :ok
+  end
+
+  @doc "Retire fresh keep reviews while preserving newer work and instruction edits."
+  def retire_ineligible(
+        %Scope{} = scope,
+        inbox_id,
+        thread_id,
+        version,
+        %DateTime{} = started_at,
+        opts \\ []
+      ) do
+    scope.repo.transaction(fn ->
+      mailbox =
+        scope.repo.one!(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if mailbox.instruction_version != version, do: scope.repo.rollback(:proposal_changed)
+      policy = Keyword.get(opts, :policy, Policy.unlimited())
+
+      candidates =
+        scope.repo.all(
+          from(c in Candidate,
+            where:
+              c.inbox_id == ^inbox_id and c.thread_id == ^thread_id and
+                c.updated_at <= ^started_at
+          ),
+          prefix: scope.prefix
+        )
+
+      for candidate <- candidates do
+        retire_metadata!(scope, policy, inbox_id, candidate.id, candidate.message_ids)
+        scope.repo.delete!(candidate, prefix: scope.prefix)
+      end
+
+      cancelled =
+        scope.repo.all(
+          from(a in Action,
+            where:
+              a.inbox_id == ^inbox_id and a.thread_id == ^thread_id and a.state == :cancelled and
+                a.updated_at <= ^started_at
+          ),
+          prefix: scope.prefix
+        )
+
+      for action <- cancelled,
+          do: retire_metadata!(scope, policy, inbox_id, action.id, action.message_ids)
+
+      :retired
+    end)
+  end
+
+  defp retire_metadata!(scope, policy, inbox_id, id, ids) do
+    case Policy.retire_candidate(policy, inbox_id, id, ids) do
+      :ok -> :ok
+      {:error, reason} -> scope.repo.rollback(reason)
+    end
   end
 
   def get(%Scope{} = scope, inbox_id, id) do
@@ -306,7 +418,7 @@ defmodule EmailJanitor.Store do
               a.id == ^id and a.inbox_id == ^inbox_id and a.state == ^from_state and
                 a.owner_token == ^action.owner_token
           ),
-          [set: [state: to_state, updated_at: DateTime.utc_now()] ++ outcomes],
+          [set: [state: to_state, updated_at: clock(scope)] ++ outcomes],
           prefix: scope.prefix
         )
 
@@ -351,7 +463,7 @@ defmodule EmailJanitor.Store do
                 state: next,
                 applied_message_ids: resolution.removed_ids,
                 restored_message_ids: resolution.restored_ids,
-                updated_at: DateTime.utc_now()
+                updated_at: clock(scope)
               ]
             ],
             prefix: scope.prefix

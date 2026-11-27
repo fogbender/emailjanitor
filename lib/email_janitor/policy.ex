@@ -41,7 +41,13 @@ defmodule EmailJanitor.Policy do
     _, _ -> {:error, :policy_unavailable}
   end
 
-  @doc "Retire superseded blocked-candidate metadata; this is never a Gmail/quota result."
+  @doc """
+  Retire superseded or freshly ineligible proposal metadata independently of
+  Gmail/quota outcomes. This includes proven-unapplied cancelled actions whose
+  work was superseded by fresh review. The callback must be idempotent.
+  Retirement may precede host settlement of a cancelled action; remember the
+  withdrawal across a later not-applied result without refunding quota here.
+  """
   def retire_candidate(%__MODULE__{} = policy, inbox_id, candidate_id, message_ids) do
     case policy.adapter.retire_candidate(policy.context, inbox_id, candidate_id, message_ids) do
       :ok -> :ok

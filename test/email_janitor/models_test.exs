@@ -22,7 +22,12 @@ defmodule EmailJanitor.ModelsTest do
     config
   end
 
-  defp run(provider, messages \\ [message(body: "PRIVATE_BODY_SENTINEL")], box \\ inbox()) do
+  defp run(
+         provider,
+         messages \\ [message(body: "PRIVATE_BODY_SENTINEL")],
+         box \\ inbox(),
+         instructions \\ "Keep requested customer conversations."
+       ) do
     credentials = fn "us-east-1" ->
       {:ok,
        [
@@ -41,7 +46,7 @@ defmodule EmailJanitor.ModelsTest do
          http_options: [plug: {Req.Test, __MODULE__}]
        ]},
       messages,
-      "Keep requested customer conversations.",
+      instructions,
       box
     )
   end
@@ -453,6 +458,27 @@ defmodule EmailJanitor.ModelsTest do
 
     assert {:keep, :unreadable_content} = run(:azure, messages)
     refute_receive :oversized_context_dispatched, 0
+  end
+
+  test "accumulated preferences and complete encoded context are bounded before SDK dispatch" do
+    calls = start_supervised!({Agent, fn -> 0 end})
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Agent.update(calls, &(&1 + 1))
+      azure_response(conn, @decision)
+    end)
+
+    messages = for n <- 1..4, do: message(id: "m#{n}", body: String.duplicate("b", 16_000))
+    assert {:ok, %Decision{}} = run(:azure, messages, inbox(), "Keep customers.")
+    assert Agent.get(calls, & &1) == 1
+
+    assert {:keep, :unreadable_content} =
+             run(:azure, messages, inbox(), String.duplicate("p", 32_000))
+
+    assert {:keep, :unreadable_content} =
+             run(:azure, [message()], inbox(), String.duplicate("p", 32_001))
+
+    assert Agent.get(calls, & &1) == 1
   end
 
   test "mixed targets and context retain original order without duplicate-ID expansion" do

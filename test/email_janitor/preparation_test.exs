@@ -27,6 +27,10 @@ defmodule EmailJanitor.PreparedTestGmail do
           5000 -> {:error, :profile_unavailable}
         end
 
+      :expire_window ->
+        EmailJanitor.PreparationClock.expire_window()
+        prepared(inbox, ids, opts)
+
       _ ->
         prepared(inbox, ids, opts)
     end
@@ -47,8 +51,24 @@ defmodule EmailJanitor.PreparedTestGmail do
   end
 end
 
+defmodule EmailJanitor.PreparationClock do
+  # Deterministically simulate elapsed time at adapter boundaries. Keep this
+  # test-only clock manipulation out of the production adapter/executor APIs.
+  def expire_window do
+    Process.put(
+      {EmailJanitor.Owner, :execution_deadline},
+      System.monotonic_time(:millisecond) + 1000
+    )
+  end
+end
+
 defmodule EmailJanitor.PreparationTestPolicy do
   @behaviour EmailJanitor.Policy
+  def reserve({:expire_window, pid}, inbox, proposal, ids, visible) do
+    EmailJanitor.PreparationClock.expire_window()
+    reserve(pid, inbox, proposal, ids, visible)
+  end
+
   @impl true
   def reserve(pid, _, _, _, _) do
     send(pid, :reserved)
@@ -56,7 +76,17 @@ defmodule EmailJanitor.PreparationTestPolicy do
   end
 
   @impl true
-  def settle(_, _, _, _), do: :ok
+  def settle(context, inbox, action, result) do
+    pid =
+      case context do
+        {:expire_window, pid} -> pid
+        pid -> pid
+      end
+
+    send(pid, {:settled, inbox, action, result})
+    :ok
+  end
+
   @impl true
   def retire_candidate(_, _, _, _), do: :ok
 end
@@ -91,12 +121,15 @@ defmodule EmailJanitor.PreparationTest do
   end
 
   defp execute(ctx, observer, options \\ []) do
+    policy_context =
+      if options[:expire_reservation], do: {:expire_window, observer}, else: observer
+
     Executor.execute(
       ctx.scope,
       ctx.inbox,
       ctx.proposal,
       {PreparedTestGmail, [state: ctx.state, scope: ctx.scope, observer: observer] ++ options},
-      policy: %Policy{adapter: PreparationTestPolicy, context: observer}
+      policy: %Policy{adapter: PreparationTestPolicy, context: policy_context}
     )
   end
 
@@ -115,6 +148,32 @@ defmodule EmailJanitor.PreparationTest do
     assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
     assert [] = Agent.get(ctx.state, & &1.calls)
     refute_receive :reserved, 0
+  end
+
+  test "preparation that consumes the dispatch window never reserves or creates an intent", ctx do
+    assert {:error, :dispatch_window_exhausted} = execute(ctx, self(), prepare: :expire_window)
+    assert_receive {:preparing, _, false}
+    refute_receive :reserved, 0
+    refute_receive {:mutating, _, _, _}, 0
+    refute_receive {:settled, _, _, _}, 0
+    assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+    assert [] = Agent.get(ctx.state, & &1.calls)
+    assert [%{labels: ["INBOX", "UNREAD", "IMPORTANT"]}] = Agent.get(ctx.state, & &1.messages)
+  end
+
+  test "reservation that consumes the window cancels and settles the never-dispatched intent",
+       ctx do
+    assert {:error, :dispatch_window_exhausted} = execute(ctx, self(), expire_reservation: true)
+    assert_receive :reserved
+    assert [action] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+    assert action.state == :cancelled
+    assert is_nil(action.dispatch_started_at)
+    assert action.applied_message_ids == []
+    assert_receive {:settled, _, id, {:reconciled, [], ["message-1"]}}
+    assert id == action.id
+    refute_receive {:mutating, _, _, _}, 0
+    assert [] = Agent.get(ctx.state, & &1.calls)
+    assert [%{labels: ["INBOX", "UNREAD", "IMPORTANT"]}] = Agent.get(ctx.state, & &1.messages)
   end
 
   test "termination during preparation cannot strand a dispatched action or reservation", ctx do

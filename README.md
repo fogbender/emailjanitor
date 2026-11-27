@@ -50,13 +50,26 @@ a new reservation ID. Overlapping older blocked proposals are retired atomically
 via `Policy.retire_candidate/4` when a newer proposal is blocked or admitted;
 hosts remove only that old proposal's pending metadata, without recording a Gmail
 outcome or refunding quota. Candidate markers contain IDs only, never email bodies.
+Fresh proposals also retire superseded metadata from prepared cancelled actions.
+Such work remains queued until fresh review supplies that evidence.
+
+Hosts review authenticated threads through `Executor.review/8` with their
+classifier, versioned instructions, Gmail adapter and the same `policy:` used for
+execution. A fresh keep retires obsolete pending metadata; transport/model errors
+leave it queued. Instruction-version and database snapshot checks prevent older
+reviews from discarding newer work. `execute` also retires known ineligibility
+observed during its deterministic prechecks. Public executor entry points reject
+outer transactions so a failed host settlement cannot roll back a Gmail outcome.
+Review has a 60-second budget covering Gmail reads, classification and metadata
+retirement. A timeout returns `:executor_unavailable` and keeps pending work for
+retry; configure provider request deadlines within that budget.
 
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
 - Validated classifier boundary; transient content redaction and HTML extraction.
-  Thin ReqLLM adapters target AWS Bedrock for the one supported self-host setup
-  and Azure AI for the SaaS. Bedrock uses ExAws's rotating EC2 role credentials,
-  not developer profiles or model API keys. No direct OpenAI/Anthropic adapters.
+  Thin ReqLLM adapters target AWS Bedrock for self-hosting and Azure AI for the SaaS.
+  Bedrock uses ExAws rotating EC2 role credentials, without developer profiles.
+  No direct OpenAI/Anthropic adapters.
 - Explicit repository/schema scopes, durable idempotent action intents, exact-ID
   Gmail mutation boundary and restoration protection, tested against PostgreSQL.
 - Dedicated short-lived execution owners, single-host Linux identity, bounded
@@ -77,15 +90,51 @@ outcome or refunding quota. Candidate markers contain IDs only, never email bodi
   history consumer and automatic recovery worker are not implemented yet.
 
 The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
-has separate HTTP-transport tests; no live Gmail account is connected yet. There
+has separate HTTP-transport tests; model tests exercise both real SDK pipelines
+against synthetic responses. No live Gmail account or model credentials are connected yet. There
 is no running cleanup service, email transport, chat UI, billing, or cloud
 deployment yet.
-Model HTTP tests exercise the maintained SDK against synthetic responses, not live models or credentials.
 
 The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
 scopes from model output or HTTP parameters. Query-prefix separation is covered
 here; full SaaS authorization is a later integration gate.
+
+## Model privacy boundary
+
+Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
+duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
+that never reach a model). The adapter removes the pinned SDK's
+request lifecycle telemetry before dispatch, including the upstream exception
+event that can otherwise contain raw text despite `payloads: :none`. Provider
+preparation, signing and decoding still use the SDK. Tests attach an upstream
+exporter and exercise failures for both providers. Raw payload tracing and dotenv
+loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
+are disabled (`max_retries: 0`); the durable job owner controls
+retry/backoff. Never put full SDK responses/errors into job arguments or reports.
+
+Finch, the underlying HTTP client, publishes raw bodies and credential headers in
+its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
+enable runtime HTTP tracing. The model adapter checks for Finch handlers before
+each call and fails closed if any are present; hosts must keep observer settings
+fixed during calls. Only the metadata-only Janitor event above is supported.
+Provider preparation also runs with logging disabled for that caller only,
+restoring its prior logger setting afterward. A first request step disables
+logging inside the SDK's separate short-lived dispatch/decoding task. This prevents the
+pinned Bedrock Converse decoder's malformed-tool warning from persisting raw
+model text; ordinary application logging in other processes stays available.
+Oversized or structurally excessive raw HTML passed directly to the model adapter
+is kept as `:unreadable_content` rather
+than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
+normal callers should use `Reviewer.review` to include safeguards and context.
+
+Every actionable INBOX message is included in model context, with recent
+already-done messages filling remaining context slots. More than five actionable
+messages keeps the entire thread. Each header is capped at 4096 bytes and each
+readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
+MIME, preferences above 32000 bytes, and complete encoded system/user context
+above 96000 bytes keep the conversation rather
+than submitting an incomplete or oversized review.
 
 ## Gmail SDK boundary
 
@@ -126,7 +175,9 @@ an `EmailJanitor.Gmail.Config` with the connected `Inbox` and a zero-argument
 token resolver returning `{:ok, access_token}` (or a redacted `Content` wrapper).
 Token refresh and OAuth consent belong to the host; the adapter reads no global
 credential stores. The resolver must identify that inbox, not whichever Google
-account is currently active on the machine.
+account is currently active on the machine. Refresh early: a resolved token must
+remain valid for at least the full 60-second execution budget, since preparation
+freezes its verified token before admission.
 
 Every operation verifies Google's profile email against that inbox before
 accessing messages. Mutations accept 1–1000 distinct message IDs and remove only
@@ -141,6 +192,24 @@ plus 5-second connect budget under the 30-second owner watchdog. Legacy
 `remove_inbox/3` composes preparation and invocation. Hosts must never persist
 closures, credentials, or captured environments; custom test transports must
 honor the same bounded mutation contract.
+
+Adapters that resolve credentials or verify the Google account must implement the
+optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
+and returns an opaque zero-argument mutation closure with already-resolved,
+frozen credentials valid for at least the entire 60-second execution window.
+The closure performs only the exact-ID Gmail mutation, with transport timeouts
+strictly below the 30-second watchdog; it must not refresh/resolve credentials,
+check a profile, or perform other preparatory I/O. Only invoke that closure
+inside the executor's durable dispatch fence; never persist it or its captured
+credentials in a job. Preparation failure or termination creates no intent and
+reserves no quota. Legacy lightweight adapters remain supported through
+`remove_inbox/3`.
+
+The executor also reserves a complete dispatch watchdog window inside its overall
+execution deadline. If slow preparation exhausts that window, it fails before
+admission; if database contention exhausts it after intent, the never-dispatched
+intent is cancelled and its policy settlement is retried safely.
+
 
 `history/3` fetches all pages and exposes ordered INBOX label changes plus arrival
 and deletion IDs. Expired history, failed pages, pagination loops and limits
@@ -169,6 +238,63 @@ by Tesla 1.23. A small connection middleware supplies an 8 MiB cap to that SDK
 middleware and also limits uncompressed responses before JSON decoding. This
 preserves the SDK protocol implementation without downgrading HTTP security fixes.
 
+## Metadata-only notification ingestion
+
+`EmailJanitor.Google.PubSub` uses Google's generated client for bounded,
+authenticated pull and exact acknowledgement. Supply a trusted subscription and
+an explicit short-lived service-token resolver. It reads no ambient credentials;
+the service token is separate from each Gmail user's OAuth token. SDK transport
+fixtures cover the actual generated requests. Pub/Sub IDs and acknowledgement
+tokens are never treated as Gmail message IDs. Malformed deliveries remain
+unacknowledged without blocking valid neighbors. Numeric history IDs normalize
+to strings and unknown payload fields are ignored without retaining their values.
+
+`Gmail.Ingestion.install(scope)` installs scoped migration 10. After the host calls
+`Gmail.SDK.watch/3`, `Ingestion.baseline/3` saves that watch cursor without scanning
+or cleaning existing mail. Restarting reads the existing checkpoint. Only an
+explicit `reconnect/4`, fenced by the previous connection generation, establishes
+a new baseline and discards old-generation discovery work. Watch renewal changes
+only expiration; its registration cursor never advances the processing cursor.
+OAuth refresh or reconsent after revoked credentials resumes the existing
+generation and cursor. It must never be interpreted as deliberate disconnection
+or used to call `reconnect/4` automatically.
+
+`NotificationWorker.poll_once/2` resolves each notification through the host's
+trusted email-to-scope/Inbox router, commits a coalesced history hint, and only then
+acknowledges it. Failed routes or commits remain unacknowledged. A crash after
+commit can safely redeliver the same hint. Hosts must supervise this bounded step
+outside host transactions: ingestion writes reject outer transactions so an ack
+cannot outrun its commit. Hosts must periodically call `Ingestion.catch_up/3`
+even with no notifications: Gmail can delay or drop them. Catch-up atomically
+queues discovered message IDs and advances only through closed, non-regressing
+history records, with generation/cursor CAS. `Gmail.SDK.ingestion_batch/3` reads
+one bounded API page; `more?: true` tells the host to schedule the next batch
+immediately after its committed cursor. This avoids all-history page/count stalls.
+The distinct `HistoryBatch` type has no `complete?` field and cannot authorize
+ambiguous-action reconciliation; recovery still requires complete `history/3`.
+Independent-connection tests cover commits, rollback and competing snapshots.
+
+Pending work contains IDs, cursors and timestamps only. `eligible_thread/5` reads
+thread content transiently and preserves the whole conversation if any current
+INBOX message lacks same-generation post-baseline eligibility. It returns only a
+metadata eligibility proof. `authorize_proposal/4` rejects proposals outside that
+proof and rejects proofs from a previous connection generation. Hosts must also
+honor connection-generation fencing at final execution, retain the engine's
+instruction/manual-restoration guards, and use the Executor's fresh fingerprint
+and exact-ID checks. This slice does not dispatch classification or mutations,
+and it does not implement a partial-message mask for mixed old/new conversations.
+
+Expired history enters `:gap` and pauses discovery/eligibility. This deliberately
+does **not** recover arrivals missed after Gmail's history retention expires.
+Known gap-state inboxes still durably coalesce and acknowledge notification hints
+without advancing their cursor, avoiding repeated subscription backlog. Fixed
+authorization errors reach the host for reconsent without resetting the baseline.
+An explicit reconnect leaves that missed backlog in the inbox; it is not outage
+catch-up. A reviewed metadata-only recovery strategy or a surfaced reconnect
+consequence is required before launch. Host scheduling, reconnect/forget lifecycle,
+the private workload-auth token-file bridge and autonomous cleanup wiring remain
+separate work. No service account keys or email bodies are introduced here.
+
 ## Self-host infrastructure foundation
 
 The [AWS/OpenTofu and NixOS foundation](infra/README.md) includes isolated mail
@@ -179,50 +305,3 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
-
-Adapters that resolve credentials or verify the Google account must implement the
-optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
-and returns an opaque zero-argument mutation closure. Only invoke that closure
-inside the executor's durable dispatch fence; never persist it or its captured
-credentials in a job. Preparation failure or termination creates no intent and
-reserves no quota. Legacy lightweight adapters remain supported through
-`remove_inbox/3`.
-
-The executor also reserves a complete dispatch watchdog window inside its overall
-execution deadline. If slow preparation exhausts that window, it fails before
-admission; if database contention exhausts it after intent, the never-dispatched
-intent is cancelled and its policy settlement is retried safely.
-
-## Model privacy boundary
-
-Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
-duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
-that never reach a model). The adapter removes the pinned SDK's
-request lifecycle telemetry before dispatch, including the upstream exception
-event that can otherwise contain raw text despite `payloads: :none`. Provider
-preparation, signing and decoding still use the SDK. Tests attach an upstream
-exporter and exercise failures for both providers. Raw payload tracing and dotenv
-loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
-are disabled (`max_retries: 0`); the durable job owner controls
-retry/backoff. Never put full SDK responses/errors into job arguments or reports.
-
-Finch, the underlying HTTP client, publishes raw bodies and credential headers in
-its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
-enable runtime HTTP tracing. The model adapter checks for Finch handlers before
-each call and fails closed if any are present; hosts must keep observer settings
-fixed during calls. Only the metadata-only Janitor event above is supported.
-Provider preparation also runs with logging disabled for that caller only,
-restoring its prior logger setting afterward. A first request step disables
-logging inside the SDK's separate short-lived dispatch/decoding task. This prevents the
-pinned Bedrock Converse decoder's malformed-tool warning from persisting raw
-model text; ordinary application logging in other processes stays available.
-Oversized or structurally excessive HTML is kept as `:unreadable_content` rather
-than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
-normal callers should use `Reviewer.review` to include safeguards and context.
-
-Every actionable INBOX message is included in model context, with recent
-already-done messages filling remaining context slots. More than five actionable
-messages keeps the entire thread. Each header is capped at 4096 bytes and each
-readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
-MIME and encoded email context above 96000 bytes keep the conversation rather
-than submitting an incomplete or oversized review.

@@ -42,18 +42,30 @@ defmodule EmailJanitor.Models.SDK do
     # a host trust boundary: fail closed if ANY Finch handlers are installed.
     [] = :telemetry.list_handlers([:finch])
 
+    if not is_binary(instructions) or byte_size(instructions) > 32_000,
+      do: throw(:invalid_content)
+
     payload = messages |> selected_messages() |> Enum.map(&payload/1) |> Jason.encode!()
     if byte_size(payload) > 96_000, do: throw(:invalid_content)
 
-    context = [
-      ReqLLM.Context.system(
-        @prompt <>
-          "\nSELECTED_INBOX_JSON:\n" <>
-          Jason.encode!(%{address: inbox.address, relay_addresses: inbox.relay_addresses}) <>
-          "\nUSER_PREFERENCES:\n" <> instructions
-      ),
-      ReqLLM.Context.user("UNTRUSTED_EMAIL_JSON:\n" <> payload)
-    ]
+    system_text =
+      @prompt <>
+        "\nSELECTED_INBOX_JSON:\n" <>
+        Jason.encode!(%{address: inbox.address, relay_addresses: inbox.relay_addresses}) <>
+        "\nUSER_PREFERENCES:\n" <> instructions
+
+    user_text = "UNTRUSTED_EMAIL_JSON:\n" <> payload
+
+    # Bound the entire encoded context, including accumulated preferences and
+    # trusted mailbox identity, before the SDK allocates/prepares any request.
+    encoded_context =
+      Jason.encode!([
+        %{role: "system", content: system_text},
+        %{role: "user", content: user_text}
+      ])
+
+    if byte_size(encoded_context) > 96_000, do: throw(:invalid_content)
+    context = [ReqLLM.Context.system(system_text), ReqLLM.Context.user(user_text)]
 
     options =
       [
@@ -233,6 +245,11 @@ defmodule EmailJanitor.Models.SDK do
 
     case type do
       "text/html" ->
+        source = Content.read(body)
+
+        if byte_size(source) > 262_144 or length(:binary.matches(source, "<")) > 4096,
+          do: throw(:invalid_html)
+
         case HTML.readable(body) do
           {:ok, text} -> bounded(Content.read(text), 16_000)
           _ -> throw(:invalid_html)
