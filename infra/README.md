@@ -16,7 +16,13 @@ There is no public app port until authentication and TLS are implemented.
 
 `modules/mail/` provisions SES sending/receiving identity and DKIM, a dedicated
 Route53 zone, an SSE-KMS encrypted temporary S3 mail spool, and encrypted SQS
-notifications containing object references. It does not create a Gmail inbox,
+notifications containing SES receipt metadata and object references. The S3
+action's optional SNS notification excludes MIME content; delivery headers may
+occur transiently in SNS/SQS and must be whitelisted before database persistence.
+Only the exact SES delivery role may publish to the encrypted topic, and only
+that topic may inject into the queue (including an explicit deny for other
+SendMessage grants). The incoming queue retains metadata for one day; the failed
+queue retains it for fourteen days. It does not create a Gmail inbox,
 run an SMTP server, relay through Email Janitor SaaS, or retain a mail archive.
 SES direct-body SNS delivery is deliberately avoided because its 150 KB limit
 breaks ordinary forwarded HTML messages. No SES receipt-action encryption is
@@ -131,7 +137,7 @@ does not prove the binary is a complete product or configure Google/model creden
 Do not enable automatic cleanup until an actual test account proves all of:
 Google profile identity and OAuth refresh; a new Gmail/PubSub event; a synthetic
 model classification; SES verified identity/DKIM and permitted recipient sending;
-one received feedback message through SES→S3→SQS; immediate spool deletion after
+one received feedback message through SES→S3-action SNS→SQS; immediate spool deletion after
 success and bounded deletion after failure; a response delivered back to the test
 inbox. Infrastructure output `ready_for_processing` deliberately remains false.
 Also inspect Bedrock's account/region invocation-logging configuration before
@@ -140,7 +146,8 @@ in S3 or CloudWatch. It is disabled by default; a preexisting shared-account
 setting must not be silently changed by this deployment. Use an account/region
 without text invocation logging for this service. See the
 [AWS logging documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html).
-The receiving worker must ignore/delete S3's `s3:TestEvent` notifications and SES's
+The receiving worker must reject arbitrary S3 `ObjectCreated`/`s3:TestEvent`
+payloads as provenance and ignore/delete SES's
 `AMAZON_SES_SETUP_NOTIFICATION` objects instead of treating setup probes as human
 feedback. Test those cases before declaring the transport ready.
 

@@ -163,25 +163,45 @@ resource "aws_sqs_queue_policy" "mail" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow", Principal = { Service = "s3.amazonaws.com" }, Action = "sqs:SendMessage"
+      Effect   = "Allow", Principal = { Service = "sns.amazonaws.com" }, Action = "sqs:SendMessage"
       Resource = aws_sqs_queue.mail.arn
       Condition = {
-        ArnEquals    = { "aws:SourceArn" = aws_s3_bucket.spool.arn }
+        ArnEquals    = { "aws:SourceArn" = aws_sns_topic.receipts.arn }
         StringEquals = { "aws:SourceAccount" = local.account_id }
       }
+      }, {
+      Effect    = "Deny", Principal = "*", Action = "sqs:SendMessage", Resource = aws_sqs_queue.mail.arn
+      Condition = { ArnNotEquals = { "aws:SourceArn" = aws_sns_topic.receipts.arn } }
     }]
   })
 }
 
-# S3 notifications contain only object references and event metadata, never MIME.
-resource "aws_s3_bucket_notification" "mail" {
-  bucket = aws_s3_bucket.spool.id
-  queue {
-    queue_arn     = aws_sqs_queue.mail.arn
-    events        = ["s3:ObjectCreated:*"]
-    filter_prefix = "incoming/"
-  }
-  depends_on = [aws_sqs_queue_policy.mail]
+# S3 ObjectCreated events cannot establish SES receipt/verdict provenance. The
+# S3 action's optional SNS notification carries the receipt and S3 reference,
+# excluding MIME content (unlike a standalone SES SNS action). Delivery headers
+# may occur transiently in SNS/SQS; the application whitelists database metadata.
+resource "aws_sns_topic" "receipts" {
+  name              = "${var.name}-receipts"
+  kms_master_key_id = aws_kms_key.spool.arn
+}
+
+resource "aws_sns_topic_policy" "receipts" {
+  arn = aws_sns_topic.receipts.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Deny", Principal = "*", Action = "sns:Publish", Resource = aws_sns_topic.receipts.arn
+      Condition = { ArnNotEquals = { "aws:PrincipalArn" = aws_iam_role.ses_delivery.arn } }
+    }]
+  })
+}
+
+resource "aws_sns_topic_subscription" "receipts" {
+  topic_arn            = aws_sns_topic.receipts.arn
+  protocol             = "sqs"
+  endpoint             = aws_sqs_queue.mail.arn
+  raw_message_delivery = true
+  depends_on           = [aws_sqs_queue_policy.mail]
 }
 
 resource "aws_iam_role" "ses_delivery" {
@@ -204,7 +224,8 @@ resource "aws_iam_role_policy" "ses_delivery" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.spool.arn}/incoming/*" },
-      { Effect = "Allow", Action = ["kms:GenerateDataKey"], Resource = aws_kms_key.spool.arn }
+      { Effect = "Allow", Action = ["kms:GenerateDataKey", "kms:Decrypt"], Resource = aws_kms_key.spool.arn },
+      { Effect = "Allow", Action = ["sns:Publish"], Resource = aws_sns_topic.receipts.arn }
     ]
   })
 }
@@ -223,11 +244,12 @@ resource "aws_ses_receipt_rule" "mail" {
     bucket_name       = aws_s3_bucket.spool.id
     object_key_prefix = "incoming/"
     iam_role_arn      = aws_iam_role.ses_delivery.arn
+    topic_arn         = aws_sns_topic.receipts.arn
     # No kms_key_arn here: SES client-side encryption needs a separate encryption
     # client. Bucket-default SSE-KMS is decryptable with normal GetObject.
   }
   depends_on = [aws_iam_role_policy.ses_delivery, aws_s3_bucket_server_side_encryption_configuration.spool,
-  aws_s3_bucket_notification.mail]
+  aws_sns_topic_subscription.receipts, aws_sns_topic_policy.receipts]
 }
 
 resource "aws_ses_active_receipt_rule_set" "mail" {
@@ -260,5 +282,6 @@ output "name_servers" { value = aws_route53_zone.mail.name_servers }
 output "sender" { value = local.sender }
 output "spool_bucket" { value = aws_s3_bucket.spool.id }
 output "queue_url" { value = aws_sqs_queue.mail.url }
+output "receipt_topic_arn" { value = aws_sns_topic.receipts.arn }
 output "kms_key_arn" { value = aws_kms_key.spool.arn }
 output "receiving_activated" { value = length(aws_ses_active_receipt_rule_set.mail) > 0 }

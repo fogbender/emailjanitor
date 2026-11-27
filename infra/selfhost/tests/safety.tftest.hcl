@@ -1,4 +1,10 @@
 mock_provider "aws" {
+  mock_resource "aws_sns_topic" {
+    defaults = { arn = "arn:aws:sns:us-east-1:123456789012:janitor-test-receipts" }
+  }
+  mock_resource "aws_sqs_queue" {
+    defaults = { arn = "arn:aws:sqs:us-east-1:123456789012:janitor-test-mail" }
+  }
   mock_resource "aws_ses_domain_dkim" {
     defaults = { dkim_tokens = ["token-one", "token-two", "token-three"] }
   }
