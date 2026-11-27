@@ -23,7 +23,7 @@ defmodule EmailJanitor.Conversation.Instructions do
   def edit(%Content{} = current, remove, %Content{} = addition) do
     entries = entries(current)
     allowed = Enum.map(entries, & &1.id)
-    text = Content.read(addition)
+    text = addition |> Content.read() |> String.trim()
 
     cond do
       remove == ["$clear"] and text == "" ->
