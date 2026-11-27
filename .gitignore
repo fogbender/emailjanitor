@@ -1,0 +1,10 @@
+/_build/
+/deps/
+/.local/
+/.direnv/
+/result
+/cover/
+/erl_crash.dump
+/.env
+/.env.*
+*.beam
