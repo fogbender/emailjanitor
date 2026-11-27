@@ -398,8 +398,10 @@ defmodule EmailJanitor.Worker.Ledger do
                  scope.repo.rollback(:ineligible_recheck)
 
                existing && existing.source_kind == :arrival ->
-                 # Independently verified arrivals never become a wider manual grant.
-                 if not Enum.all?(ids, &(&1 in existing.message_ids)),
+                 # An exact manual request must not silently activate the
+                 # arrival's wider independent selection. Keep its provenance
+                 # intact and require a separate exact candidate for subsets.
+                 if Enum.sort(ids) != Enum.sort(existing.message_ids),
                    do: scope.repo.rollback(:ineligible_recheck)
 
                existing ->

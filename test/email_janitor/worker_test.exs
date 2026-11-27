@@ -1616,6 +1616,41 @@ defmodule EmailJanitor.WorkerTest do
     assert Repo.all(Action, prefix: ctx.scope.prefix) == []
   end
 
+  test "manual subsets cannot silently activate a wider existing arrival candidate", ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [Fixtures.message(), Fixtures.message(id: "message-2")],
+          arrivals: %{"100" => %{through: "101", ids: ["message-1", "message-2"]}}
+      }
+    )
+
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    [candidate] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert {:error, :ineligible_recheck} =
+             Worker.queue_manual(ctx.scope, ctx.box, candidate.candidate_id, "thread-1", [
+               "message-1"
+             ])
+
+    assert [^candidate] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    assert read(ctx.state).mutations == []
+    assert Enum.all?(read(ctx.state).messages, &("INBOX" in &1.labels))
+
+    assert :ok =
+             Worker.queue_manual(ctx.scope, ctx.box, candidate.candidate_id, "thread-1", [
+               "message-1",
+               "message-2"
+             ])
+
+    assert {:ok, %{status: :done}} = Worker.step(ctx.config)
+    assert read(ctx.state).mutations == [["message-1", "message-2"]]
+  end
+
   defp manual_candidate(ctx) do
     Agent.update(
       ctx.state,
