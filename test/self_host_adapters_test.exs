@@ -52,6 +52,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       EmailJanitor.Conversation.Ledger.install(scope)
       EmailJanitor.Mail.Feedback.install(scope)
       HostStore.install(scope)
+      SelfHost.Web.install(scope)
       Ecto.Migrator.up(Repo, 102, SelfHost.AuthorityMigration, prefix: scope.prefix, log: false)
     end)
 
@@ -786,5 +787,99 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       {:ok, _} -> complete_revocations()
       error -> flunk("synthetic grant retirement failed: #{inspect(error)}")
     end
+  end
+
+  test "reply-only recovery asks to resend transient answers but reconstructs proven effects",
+       ctx do
+    alias EmailJanitor.Conversation.Receipt
+    alias EmailJanitor.SelfHost.Email
+    conversation = Ecto.UUID.generate()
+    request = Ecto.UUID.generate()
+
+    receipt =
+      Repo.insert!(
+        %Receipt{
+          id: request,
+          inbox_id: ctx.box.id,
+          conversation_id: conversation,
+          operation: :answer,
+          preference_target: :none,
+          preference_status: :none,
+          completed: true
+        },
+        prefix: ctx.scope.prefix
+      )
+
+    assert {:ok, reply} = Email.render(ctx.owner, ctx.box.id, conversation, request)
+    assert Content.read(reply) =~ "could not recover that conversational answer"
+    refute Content.read(reply) =~ "No email or instruction changes"
+
+    Repo.update!(
+      Ecto.Changeset.change(receipt,
+        operation: :done,
+        references: [%{"token" => "selected"}],
+        results: [%{"reference" => "selected", "status" => "unresolved"}]
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:ok, reply} = Email.render(ctx.owner, ctx.box.id, conversation, request)
+    assert Content.read(reply) =~ "uncertain"
+    refute Content.read(reply) =~ "could not recover"
+
+    Repo.update_all(
+      Receipt,
+      [
+        set: [
+          operation: :answer,
+          preference_target: :inbox,
+          preference_status: :failed,
+          results: [],
+          references: []
+        ]
+      ],
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:ok, reply} = Email.render(ctx.owner, ctx.box.id, conversation, request)
+    assert Content.read(reply) =~ "could not confirm your instruction update"
+  end
+
+  test "scheduled maintenance removes expired conversation metadata without hiding a cleanup failure",
+       ctx do
+    alias EmailJanitor.Conversation.Receipt
+    old = DateTime.add(DateTime.utc_now(), -8 * 86_400)
+
+    receipts =
+      for timestamp <- [old, DateTime.utc_now()] do
+        Repo.insert!(
+          %Receipt{
+            id: Ecto.UUID.generate(),
+            inbox_id: ctx.box.id,
+            conversation_id: Ecto.UUID.generate(),
+            operation: :answer,
+            preference_target: :none,
+            preference_status: :none,
+            completed: true,
+            inserted_at: timestamp,
+            updated_at: timestamp
+          },
+          prefix: ctx.scope.prefix
+        )
+      end
+
+    [expired, current] = receipts
+    run = SelfHost.Maintenance.tasks()["host_maintenance"].run
+    assert {:next, nil, 60_000} = run.(nil)
+    assert Repo.get(Receipt, expired.id, prefix: ctx.scope.prefix) == nil
+    assert Repo.get(Receipt, current.id, prefix: ctx.scope.prefix)
+
+    Repo.query!(
+      "ALTER TABLE #{ctx.scope.prefix}.conversation_receipts RENAME TO temporarily_unavailable_receipts",
+      [],
+      log: false
+    )
+
+    assert :failed = run.(nil)
   end
 end

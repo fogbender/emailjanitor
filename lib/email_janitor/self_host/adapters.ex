@@ -49,7 +49,15 @@ defmodule EmailJanitor.SelfHost.Adapters do
   def pubsub(config) do
     path = config.pubsub["JANITOR_GOOGLE_TOKEN_FILE"]
 
-    with true <- is_binary(path) and Path.type(path) == :absolute,
+    topic = config.pubsub["JANITOR_GOOGLE_TOPIC"]
+
+    with true <- is_binary(topic),
+         true <-
+           Regex.match?(
+             ~r/\Aprojects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/topics\/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}\z/,
+             topic
+           ),
+         true <- is_binary(path) and Path.type(path) == :absolute,
          {:ok, source} <-
            PubSub.Config.new(config.pubsub["JANITOR_GOOGLE_SUBSCRIPTION"], fn ->
              ServiceToken.read(path)

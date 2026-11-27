@@ -164,7 +164,7 @@ end
 
 defmodule EmailJanitor.SelfHost.Maintenance do
   @moduledoc false
-  alias EmailJanitor.{Preferences, SelfHost}
+  alias EmailJanitor.{Conversation, Preferences, SelfHost}
 
   def tasks do
     %{
@@ -177,7 +177,11 @@ defmodule EmailJanitor.SelfHost.Maintenance do
   end
 
   defp maintenance do
-    with {:ok, :ok} <- Preferences.purge_receipts(SelfHost.scope()) do
+    now = DateTime.utc_now()
+
+    with {:ok, :ok} <- Preferences.purge_receipts(SelfHost.scope(), now),
+         {count, nil} when is_integer(count) and count >= 0 <-
+           Conversation.Ledger.purge(SelfHost.scope(), now) do
       web = EmailJanitor.SelfHost.Web
 
       result =
