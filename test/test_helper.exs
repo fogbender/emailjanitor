@@ -16,6 +16,7 @@ socket = System.fetch_env!("JANITOR_TEST_SOCKET")
 for prefix <- ["ej_test_a", "ej_test_b", "ej_concurrency", "ej_recovery", "ej_policy_concurrency"] do
   {:ok, scope} = EmailJanitor.Store.Scope.new(EmailJanitor.TestRepo, prefix)
   EmailJanitor.Store.install(scope)
+  EmailJanitor.Mail.Store.install(scope)
 end
 
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)
