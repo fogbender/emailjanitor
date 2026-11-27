@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Installed release smoke test: isolated socket database, synthetic credentials,
+# loopback browser. The Nix build sandbox has no external provider network.
+set -euo pipefail
+umask 077
+janitor_fixture_dir=$(mktemp -d)
+janitor_host_pid=""
+janitor_pg_started=false
+cleanup() {
+  if [ -n "$janitor_host_pid" ]; then
+    kill "$janitor_host_pid" 2>/dev/null || true
+    wait "$janitor_host_pid" 2>/dev/null || true
+  fi
+  if "$janitor_pg_started"; then
+    pg_ctl -D "$janitor_fixture_dir/db" -m immediate -w stop >/dev/null
+  fi
+  rm -rf -- "$janitor_fixture_dir"
+}
+trap cleanup EXIT
+
+initdb -D "$janitor_fixture_dir/db" --no-locale --encoding=UTF8 \
+  --auth-local=trust --auth-host=reject >"$janitor_fixture_dir/init.log"
+pg_ctl -D "$janitor_fixture_dir/db" -l "$janitor_fixture_dir/pg.log" \
+  -o "-h '' -k $janitor_fixture_dir -p 5432 -F" -w start >/dev/null
+janitor_pg_started=true
+createdb -h "$janitor_fixture_dir" emailjanitor
+head -c 32 /dev/urandom >"$janitor_fixture_dir/key"
+head -c 64 /dev/urandom | base64 >"$janitor_fixture_dir/web-secret"
+cat >"$janitor_fixture_dir/google.json" <<'JSON'
+{"web":{"client_id":"synthetic-client.apps.googleusercontent.com","client_secret":"SYNTHETIC_ONLY_GOOGLE_SECRET","redirect_uris":["http://127.0.0.1:4000/auth/google/callback"]}}
+JSON
+
+export JANITOR_ENABLE_SELF_HOST=1
+export JANITOR_OWNER_EMAIL=owner@example.com
+export JANITOR_PUBLIC_URL=http://127.0.0.1:4000
+export JANITOR_WEB_PORT=4000
+export JANITOR_DATABASE_SOCKET="$janitor_fixture_dir"
+export JANITOR_DATABASE_NAME=emailjanitor
+export JANITOR_DATABASE_USER
+JANITOR_DATABASE_USER=$(id -un)
+export JANITOR_CREDENTIAL_KEY_FILE="$janitor_fixture_dir/key"
+export JANITOR_SECRET_KEY_BASE_FILE="$janitor_fixture_dir/web-secret"
+export JANITOR_GOOGLE_CLIENT_JSON_FILE="$janitor_fixture_dir/google.json"
+export JANITOR_REPLY_PARSER_EXECUTABLE
+JANITOR_REPLY_PARSER_EXECUTABLE=$(command -v emailjanitor-reply-parser)
+export JANITOR_GOOGLE_TOKEN_FILE="$janitor_fixture_dir/missing-service-token"
+export JANITOR_GOOGLE_SUBSCRIPTION=projects/janitor-fixture/subscriptions/gmail
+export JANITOR_GOOGLE_TOPIC=projects/janitor-fixture/topics/gmail
+export JANITOR_MAIL_SENDER=janitor@janitor.example.com
+export JANITOR_MAIL_BUCKET=janitor-synthetic-spool
+export JANITOR_MAIL_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/janitor
+export JANITOR_MAIL_TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:janitor
+export AWS_REGION=us-east-1
+
+email_janitor eval 'EmailJanitor.SelfHost.Release.migrate()' >"$janitor_fixture_dir/migrate.log" 2>&1
+# Idempotent ascending migrations must also work from the installed executable.
+email_janitor eval 'EmailJanitor.SelfHost.Release.migrate()' >>"$janitor_fixture_dir/migrate.log" 2>&1
+email_janitor start >"$janitor_fixture_dir/host.log" 2>&1 &
+janitor_host_pid=$!
+janitor_ready=false
+for _ in {1..100}; do
+  if curl --silent --fail --max-time 1 http://127.0.0.1:4000/ >"$janitor_fixture_dir/home.html"; then
+    janitor_ready=true
+    break
+  fi
+  if ! kill -0 "$janitor_host_pid" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+if ! "$janitor_ready"; then
+  cat "$janitor_fixture_dir/host.log" >&2
+  exit 1
+fi
+grep -q '/auth/google' "$janitor_fixture_dir/home.html"
+test "$(curl --silent --output "$janitor_fixture_dir/callback.html" --write-out '%{http_code}' \
+  'http://127.0.0.1:4000/auth/google/callback?code=PRIVATE_CALLBACK_CODE_SENTINEL&state=PRIVATE_CALLBACK_STATE_SENTINEL')" = 400
+! grep -Eq 'PRIVATE_CALLBACK_(CODE|STATE)_SENTINEL|SYNTHETIC_ONLY_GOOGLE_SECRET' "$janitor_fixture_dir/host.log"
+# No connection exists and no provider callback ran: only the transport anchor
+# may be present. This is local startup verification, never cloud readiness.
+test "$(psql -h "$janitor_fixture_dir" -d emailjanitor -Atc 'SELECT count(*) FROM ej_selfhost.self_host_bindings')" = 0
+test "$(psql -h "$janitor_fixture_dir" -d emailjanitor -Atc 'SELECT count(*) FROM ej_selfhost.inboxes')" = 1

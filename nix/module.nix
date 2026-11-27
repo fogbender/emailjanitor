@@ -34,7 +34,9 @@ in {
       description = "Runtime Google Web OAuth client JSON with the exact public /auth/google/callback redirect.";
     };
     publicHostname = lib.mkOption {
-      type = lib.types.nullOr (lib.types.strMatching "[a-z0-9]([a-z0-9.-]*[a-z0-9])?");
+      type = lib.types.nullOr (lib.types.addCheck
+        (lib.types.strMatching "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+        (value: builtins.stringLength value <= 253));
       default = null;
       description = "Public HTTPS hostname for the reference Nginx/ACME proxy. Null leaves web access closed for the SSH pilot; no DNS or cloud firewall is changed by this option.";
     };

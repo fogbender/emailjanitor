@@ -77,6 +77,9 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert builtins.elem "-/run/credentials" tokenService.serviceConfig.InaccessiblePaths;
    assert tokenHost.config.systemd.timers.emailjanitor-google-token.timerConfig.OnUnitActiveSec == "60s";
    assert proxy.forceSSL && proxy.enableACME;
+   assert host.options.services.emailjanitor.publicHostname.type.check "janitor.example.com";
+   assert !(host.options.services.emailjanitor.publicHostname.type.check "janitor..example.com");
+   assert !(host.options.services.emailjanitor.publicHostname.type.check "-janitor.example.com");
    assert pkgs.lib.hasInfix "access_log off;" proxy.extraConfig;
    assert pkgs.lib.hasInfix "error_log /dev/null;" proxy.extraConfig;
    assert pkgs.lib.hasInfix "proxy_set_header X-Real-IP $remote_addr;" proxy.locations."/".extraConfig;

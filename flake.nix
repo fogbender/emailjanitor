@@ -117,7 +117,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           release = pkgs.runCommand "emailjanitor-release-check" {
-            nativeBuildInputs = [ self.packages.${system}.emailjanitor pkgs.python3 ];
+            nativeBuildInputs = [ self.packages.${system}.emailjanitor self.packages.${system}.reply-parser pkgs.python3 pkgs.postgresql_17 pkgs.curl ];
           } ''
             export HOME="$TMPDIR"
             export ERL_CRASH_DUMP=/dev/null
@@ -127,12 +127,14 @@
               true = is_pid(Process.whereis(EmailJanitor.Supervisor))
               true = File.regular?(Application.app_dir(:email_janitor, "priv/prompts/classify.txt"))
               true = Code.ensure_loaded?(EmailJanitor.Mail.SDK)
+              true = Code.ensure_loaded?(:mimemail)
               true = Code.ensure_loaded?(EmailJanitor.SelfHost.Web)
               true = Code.ensure_loaded?(EmailJanitor.SelfHostWeb.Endpoint)
               true = File.regular?(Application.app_dir(:email_janitor, "priv/static/selfhost.js"))
             '
             python3 ${./scripts/check-release-cookie.py} \
               ${self.packages.${system}.emailjanitor} email_janitor ${pkgs.coreutils}/bin/base64
+            ${pkgs.lib.optionalString pkgs.stdenv.isLinux "bash ${./scripts/check-release-selfhost}"}
             touch "$out"
           '';
         });

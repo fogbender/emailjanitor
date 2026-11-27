@@ -2,8 +2,13 @@
 
 `nix build .#emailjanitor` builds a production Mix release from the pinned
 nixpkgs toolchain and `mix.lock`. `nix flake check` boots that installed artifact
-inside the Nix sandbox and checks the packaged prompt and transport module. It
-requires no mailbox credentials and makes no provider calls. The dependency
+inside the Nix sandbox and checks the packaged prompt, Phoenix browser, MIME
+encoder and transport modules. On Linux it also installs the complete ascending
+migrations twice into a temporary Unix-socket PostgreSQL database and starts the
+actual opt-in host with synthetic credentials. A loopback browser smoke test
+checks the sign-in page, exact `/auth/google/callback` path, callback log privacy,
+and absence of connected inboxes. The sandbox has no external provider network;
+this does not test a Google authorization, SES delivery or a live model. The dependency
 fixed-output hash must be regenerated and reviewed when `mix.lock` changes.
 Only `mix.exs`, `mix.lock`, `config`, `lib` and `priv` enter the application
 source closure; local OAuth/SOPS files, test data and build artifacts are excluded.
@@ -27,8 +32,8 @@ whole directory into the store before our source filter runs. Untracked or ignor
 files under `config`, `lib` or `priv` can then enter the built release's store
 closure and be deployed to the host. That route does not provide the tracked-file
 privacy guarantee. The release contains
-the reviewed engine and SDK transport; merely starting it does not configure an
-inbox or establish that supervised host workers are ready. Single-user host
-startup, Google connection/chat, exact scoped migrations, runtime secrets and
-live sending/receiving remain application and launch integration gates. This
-packaging change provisions no infrastructure and sends no mail.
+the engine, SDK transports and opt-in host. Merely starting it does not configure
+an inbox or establish live cloud readiness. Google authorization, IAM/federation,
+model access, SES production readiness and sending/receiving remain explicit
+launch integration gates. This packaging change provisions no infrastructure
+and sends no mail.
