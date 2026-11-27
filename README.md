@@ -45,6 +45,16 @@ a new reservation ID. Overlapping older blocked proposals are retired atomically
 via `Policy.retire_candidate/4` when a newer proposal is blocked or admitted;
 hosts remove only that old proposal's pending metadata, without recording a Gmail
 outcome or refunding quota. Candidate markers contain IDs only, never email bodies.
+Fresh proposals also retire superseded metadata from prepared cancelled actions.
+Such work remains queued until fresh review supplies that evidence.
+
+Hosts review authenticated threads through `Executor.review/8` with their
+classifier, versioned instructions, Gmail adapter and the same `policy:` used for
+execution. A fresh keep retires obsolete pending metadata; transport/model errors
+leave it queued. Instruction-version and database snapshot checks prevent older
+reviews from discarding newer work. `execute` also retires known ineligibility
+observed during its deterministic prechecks. Public executor entry points reject
+outer transactions so a failed host settlement cannot roll back a Gmail outcome.
 
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
