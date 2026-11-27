@@ -53,19 +53,29 @@ defmodule EmailJanitor.WorkerTest.Gmail do
 
   def thread_snapshot(_, thread, options) do
     Agent.get_and_update(options[:state], fn state ->
-      {{:ok, %ThreadSnapshot{thread_id: thread, fingerprint: state.revision}},
-       %{state | calls: state.calls ++ [:snapshot]}}
+      result =
+        if thread in Keyword.get(options, :snapshot_failures, []),
+          do: {:error, :gmail_unavailable},
+          else: {:ok, %ThreadSnapshot{thread_id: thread, fingerprint: state.revision}}
+
+      {result, %{state | calls: state.calls ++ [:snapshot]}}
     end)
   end
 
   def thread(_, thread, options) do
     Agent.get_and_update(options[:state], fn state ->
-      {{:ok, Enum.filter(state.messages, &(&1.thread_id == thread))},
-       %{state | calls: state.calls ++ [:full_thread]}}
+      result =
+        if thread in Keyword.get(options, :thread_failures, []),
+          do: {:error, :invalid_thread},
+          else: {:ok, Enum.filter(state.messages, &(&1.thread_id == thread))}
+
+      {result, %{state | calls: state.calls ++ [:full_thread]}}
     end)
   end
 
-  def contacted(_, _, _), do: {:ok, MapSet.new()}
+  def contacted(_, _, options),
+    do: Agent.get(options[:state], &{:ok, Map.get(&1, :contacts, MapSet.new())})
+
   def history_id(_, _), do: {:ok, "200"}
 
   def remove_inbox(_, ids, options) do
@@ -103,35 +113,42 @@ end
 defmodule EmailJanitor.WorkerTest.Classifier do
   @behaviour EmailJanitor.Classifier
   def classify(messages, _instructions, options) do
-    Agent.get_and_update(options[:state], fn state ->
-      result =
-        case state.model do
-          :unreadable ->
-            {:keep, :unreadable_content}
+    result =
+      Agent.get_and_update(options[:state], fn state ->
+        result =
+          case state.model do
+            :unreadable ->
+              {:keep, :unreadable_content}
 
-          :error ->
-            {:error, "PRIVATE_MODEL_ERROR_SENTINEL"}
+            :error ->
+              {:error, "PRIVATE_MODEL_ERROR_SENTINEL"}
 
-          mode ->
-            action = if mode == :keep, do: "keep", else: "done"
-            category = if mode == :keep, do: "legitimate", else: "cold_outreach"
+            :invalid ->
+              {:ok, %{}}
 
-            {:ok,
-             %{
-               "decisions" =>
-                 Enum.map(options[:target_ids], fn id ->
-                   %{
-                     "message_id" => id,
-                     "action" => action,
-                     "confidence" => "high",
-                     "category" => category
-                   }
-                 end)
-             }}
-        end
+            mode ->
+              action = if mode == :keep, do: "keep", else: "done"
+              category = if mode == :keep, do: "legitimate", else: "cold_outreach"
 
-      {result, %{state | model_inputs: state.model_inputs ++ [Enum.map(messages, & &1.id)]}}
-    end)
+              {:ok,
+               %{
+                 "decisions" =>
+                   Enum.map(options[:target_ids], fn id ->
+                     %{
+                       "message_id" => id,
+                       "action" => action,
+                       "confidence" => "high",
+                       "category" => category
+                     }
+                   end)
+               }}
+          end
+
+        {result, %{state | model_inputs: state.model_inputs ++ [Enum.map(messages, & &1.id)]}}
+      end)
+
+    if hook = options[:after_model], do: hook.()
+    result
   end
 end
 
@@ -157,5 +174,12 @@ defmodule EmailJanitor.WorkerTest.Policy do
     end)
   end
 
+  def retire_candidate(_, _, _, _), do: :ok
+end
+
+defmodule EmailJanitor.WorkerTest.LegacyPolicy do
+  @behaviour EmailJanitor.Policy
+  def reserve(_, _, _, _, _), do: :ok
+  def settle(_, _, _, _), do: :ok
   def retire_candidate(_, _, _, _), do: :ok
 end

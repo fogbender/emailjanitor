@@ -121,7 +121,7 @@ defmodule EmailJanitor.Worker.Ledger do
         old.status == status
 
     attempts = min(if(unchanged, do: old.attempts, else: 0) + 1, 16)
-    seconds = if status == :unreadable, do: 900, else: delay(attempts)
+    seconds = if status in [:unreadable, :blocked], do: 900, else: delay(attempts)
 
     row = %{
       inbox_id: inbox.id,
@@ -203,6 +203,7 @@ defmodule EmailJanitor.Worker.Ledger do
           message_ids: proposal.message_ids,
           status: :pending,
           requested: requested,
+          attempts: 0,
           next_attempt_at: nil,
           inserted_at: now,
           updated_at: now
@@ -257,7 +258,7 @@ defmodule EmailJanitor.Worker.Ledger do
           from(c in Candidate,
             where: c.inbox_id == ^inbox.id and c.candidate_id == ^uuid and c.status == :pending
           ),
-          [set: [requested: true, next_attempt_at: nil]],
+          [set: [requested: true, attempts: 0, next_attempt_at: nil]],
           prefix: scope.prefix,
           log: false
         )
@@ -341,7 +342,7 @@ defmodule EmailJanitor.Worker.Ledger do
         from(p in Candidate,
           where: p.inbox_id == ^inbox.id and p.candidate_id in subquery(candidates)
         ),
-        [set: [requested: true, next_attempt_at: nil]],
+        [set: [requested: true, attempts: 0, next_attempt_at: nil]],
         prefix: scope.prefix,
         log: false
       )
@@ -351,7 +352,10 @@ defmodule EmailJanitor.Worker.Ledger do
 
   def finish_candidate(scope, inbox, candidate, result, now) do
     case result do
-      status when status in [:retry, :unreadable] ->
+      status when status in [:retry, :unreadable, :invalid_decision] ->
+        attempts = min(candidate.attempts + 1, 16)
+        capped = status == :invalid_decision and attempts >= 8
+
         scope.repo.update_all(
           from(c in Candidate,
             where:
@@ -360,7 +364,10 @@ defmodule EmailJanitor.Worker.Ledger do
           ),
           [
             set: [
-              next_attempt_at: DateTime.add(now, if(status == :unreadable, do: 900, else: 60))
+              attempts: attempts,
+              requested: not capped,
+              next_attempt_at:
+                DateTime.add(now, if(status == :unreadable, do: 900, else: delay(attempts)))
             ]
           ],
           prefix: scope.prefix,

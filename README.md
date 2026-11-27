@@ -124,8 +124,8 @@ pending metadata and stable marker. No new model metadata contains email bodies.
   Do not wrap execution in a host transaction: it is rejected so the intent is
   committed before Gmail is called. Low-level store ownership APIs are internal
   executor primitives; hosts use the policy-aware Executor APIs above.
-- Pure history-based ambiguous-action reconciliation decisions. Its live Gmail
-  history consumer and automatic recovery worker are not implemented yet.
+- Pure history-based ambiguous-action reconciliation and the shared bounded
+  worker below, backed by the authenticated Gmail history adapter.
 
 The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
 has separate HTTP-transport tests; model tests exercise both real SDK pipelines
@@ -415,7 +415,14 @@ Worker rows retain only IDs, revision hashes, versions, timestamps and fixed
 outcomes, never bodies, credentials or raw model/provider responses. Stable
 `:unreadable_content` keeps arrivals pending and probes only minimal thread
 revision metadata every fifteen minutes until the revision or instructions
-change; transient failures remain retryable. Terminal policy settlement retries
+change; transient failures remain retryable with exponential backoff. Invalid
+model output stops automatic candidate retries after eight attempts while keeping
+provenance for an explicit requeue. Unsupported policy contracts stay pending and
+probe only revision metadata until content/instruction versions change; hosts must
+bump the mailbox version when correcting a policy/configuration incompatibility.
+Notification wake-ups preserve failure backoff. Due local work schedules another
+bounded step promptly instead of waiting the ordinary polling interval.
+Terminal policy settlement retries
 across restarts. Ambiguous mutations require fresh complete ordered history and
 are never blindly sent again. Expired ingestion history explicitly pauses in
 `:gap`; rebaselining cannot recover the unobserved outage backlog.

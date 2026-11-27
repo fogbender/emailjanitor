@@ -73,7 +73,12 @@ defmodule EmailJanitor.Worker.Server do
   @impl true
   def handle_cast(:wake, state) do
     now = System.monotonic_time(:millisecond)
-    entries = Map.new(state.entries, fn {key, entry} -> {key, %{entry | due: now}} end)
+
+    entries =
+      Map.new(state.entries, fn {key, entry} ->
+        {key, if(entry.attempts == 0, do: %{entry | due: now}, else: entry)}
+      end)
+
     send(self(), :tick)
     {:noreply, %{state | entries: entries}}
   end
@@ -94,7 +99,7 @@ defmodule EmailJanitor.Worker.Server do
           state.entries
       end
 
-    {:noreply, dispatch(%{state | entries: entries}, now)}
+    {:noreply, schedule_next(dispatch(%{state | entries: entries}, now))}
   end
 
   def handle_info({ref, outcome}, state) when is_reference(ref) do
@@ -106,7 +111,7 @@ defmodule EmailJanitor.Worker.Server do
         Process.cancel_timer(timer)
         Process.demonitor(ref, [:flush])
         state = finish(%{state | running: running}, key, outcome)
-        {:noreply, dispatch(state, System.monotonic_time(:millisecond))}
+        {:noreply, schedule_next(dispatch(state, System.monotonic_time(:millisecond)))}
     end
   end
 
@@ -118,7 +123,7 @@ defmodule EmailJanitor.Worker.Server do
       {%{task: task, key: key}, running} ->
         Task.shutdown(task, :brutal_kill)
         state = finish(%{state | running: running}, key, :failed)
-        {:noreply, dispatch(state, System.monotonic_time(:millisecond))}
+        {:noreply, schedule_next(dispatch(state, System.monotonic_time(:millisecond)))}
     end
   end
 
@@ -130,7 +135,7 @@ defmodule EmailJanitor.Worker.Server do
       {%{key: key, timer: timer}, running} ->
         Process.cancel_timer(timer)
         state = finish(%{state | running: running}, key, :failed)
-        {:noreply, dispatch(state, System.monotonic_time(:millisecond))}
+        {:noreply, schedule_next(dispatch(state, System.monotonic_time(:millisecond)))}
     end
   end
 
@@ -176,6 +181,25 @@ defmodule EmailJanitor.Worker.Server do
               })
         }
     end
+  end
+
+  defp schedule_next(state) do
+    if state.timer, do: Process.cancel_timer(state.timer)
+    now = System.monotonic_time(:millisecond)
+    busy = MapSet.new(Enum.map(state.running, fn {_, value} -> value.key end))
+
+    delay =
+      if map_size(state.running) < state.max_concurrency do
+        state.entries
+        |> Enum.reject(fn {key, _} -> MapSet.member?(busy, key) end)
+        |> Enum.map(fn {_, entry} -> max(1, entry.due - now) end)
+        |> Enum.min(fn -> state.interval_ms end)
+        |> min(state.interval_ms)
+      else
+        state.interval_ms
+      end
+
+    %{state | timer: Process.send_after(self(), :tick, delay)}
   end
 
   defp run(resolve, step, key) do

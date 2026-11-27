@@ -348,7 +348,7 @@ defmodule EmailJanitor.WorkerTest do
       }
     )
 
-    assert {:ok, %{status: :done}} = Worker.step(ctx.config)
+    assert {:ok, %{status: :done, more?: true}} = Worker.step(ctx.config)
     assert [ids] = read(ctx.state).mutations
     assert length(ids) == 5
     assert {:ok, remaining} = pending(ctx)
@@ -421,6 +421,132 @@ defmodule EmailJanitor.WorkerTest do
              Repo.all(Candidate, prefix: ctx.scope.prefix)
 
     assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+  end
+
+  test "pre-review failures defer the oldest arrival instead of starving newer threads", ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(id: "a-old", thread_id: "bad-thread"),
+            Fixtures.message(id: "z-new", thread_id: "good-thread")
+          ],
+          arrivals: %{"100" => %{through: "101", ids: ["a-old", "z-new"]}}
+      }
+    )
+
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, thread_failures: ["bad-thread"]]}}
+    assert {:ok, %{status: :eligibility_unavailable, more?: true}} = Worker.step(config)
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert read(ctx.state).mutations == [["z-new"]]
+    assert {:ok, [%{message_id: "a-old"}]} = pending(ctx)
+  end
+
+  test "snapshot errors also release the queue for other due arrivals", ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(id: "a-old", thread_id: "bad-thread"),
+            Fixtures.message(id: "z-new", thread_id: "good-thread")
+          ],
+          arrivals: %{"100" => %{through: "101", ids: ["a-old", "z-new"]}}
+      }
+    )
+
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_failures: ["bad-thread"]]}}
+    assert {:ok, %{status: :worker_unavailable, more?: true}} = Worker.step(config)
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert read(ctx.state).mutations == [["z-new"]]
+  end
+
+  test "seven pending siblings cannot bypass a transient review deferral", ctx do
+    messages = Enum.map(1..7, &Fixtures.message(id: "arrival-#{&1}"))
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          model: :error,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    assert {:ok, %{status: :model_unavailable, more?: false}} = Worker.step(ctx.config)
+    assert length(read(ctx.state).model_inputs) == 1
+    assert {:ok, %{status: :idle, more?: false}} = Worker.step(ctx.config)
+    assert length(read(ctx.state).model_inputs) == 1
+    assert [%Deferral{message_ids: ids}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
+    assert length(ids) == 7
+  end
+
+  test "unsupported policy admission pauses stable content without repeated model calls", ctx do
+    Agent.update(
+      ctx.state,
+      &%{&1 | messages: [Fixtures.message(id: "old-context"), Fixtures.message()]}
+    )
+
+    config = %{ctx.config | policy: %Policy{adapter: __MODULE__.LegacyPolicy, context: nil}}
+    assert {:ok, %{status: :blocked}} = Worker.step(config)
+    assert [%Deferral{status: :blocked}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
+    assert read(ctx.state).mutations == []
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert length(read(ctx.state).model_inputs) == 1
+    assert {:ok, [_]} = pending(ctx)
+  end
+
+  test "invalid candidate output exponentially backs off then waits for explicit requeue", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.state, &%{&1 | model: :invalid})
+
+    for attempt <- 1..8 do
+      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+
+      assert [%Candidate{attempts: ^attempt, requested: requested}] =
+               Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+      assert requested == attempt < 8
+      advance(ctx.clock, 901)
+    end
+
+    count = length(read(ctx.state).model_inputs)
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    assert length(read(ctx.state).model_inputs) == count
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+
+    assert [%Candidate{attempts: 0, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "deterministic late correspondence guard is processed without repeating classification",
+       ctx do
+    hook = fn -> Agent.update(ctx.state, &Map.put(&1, :contacts, MapSet.new(["vendor.com"]))) end
+    config = %{ctx.config | classifier: {Classifier, [state: ctx.state, after_model: hook]}}
+    assert {:ok, %{status: :skipped}} = Worker.step(config)
+    assert read(ctx.state).mutations == []
+    assert {:ok, []} = pending(ctx)
+    assert {:ok, %{status: :idle}} = Worker.step(config)
+    assert length(read(ctx.state).model_inputs) == 1
+  end
+
+  test "invalid arrival decisions stop model retries after eight unchanged attempts", ctx do
+    Agent.update(ctx.state, &%{&1 | model: :invalid})
+
+    for _ <- 1..8 do
+      assert {:ok, %{status: :invalid_decision}} = Worker.step(ctx.config)
+      advance(ctx.clock, 901)
+    end
+
+    assert [%Deferral{status: :blocked}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+    assert length(read(ctx.state).model_inputs) == 8
+    assert {:ok, [_]} = pending(ctx)
   end
 
   defp await_blocked(_backend, 0),

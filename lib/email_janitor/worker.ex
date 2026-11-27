@@ -48,7 +48,13 @@ defmodule EmailJanitor.Worker do
         # Reports have fixed atoms only; never report raw SDK/model envelopes.
         status = status(result)
         report(config, status)
-        {:ok, %{status: status, recovery: recovery, more?: more?(result)}}
+
+        {:ok,
+         %{
+           status: status,
+           recovery: recovery,
+           more?: more?(result) or local_work_due?(config, now)
+         }}
       end)
     end
   end
@@ -150,38 +156,67 @@ defmodule EmailJanitor.Worker do
     {gmail, options} = config.gmail
 
     with :ok <- authorized(config),
-         {:ok, thread} <- gmail.thread_id(config.inbox.id, id, options),
-         {:ok, %ThreadSnapshot{thread_id: ^thread} = snapshot} <-
-           gmail.thread_snapshot(config.inbox.id, thread, options) do
-      deferred = Ledger.deferral(config.scope, config.inbox, checkpoint.generation, thread)
+         {:ok, thread} <- gmail.thread_id(config.inbox.id, id, options) do
+      case gmail.thread_snapshot(config.inbox.id, thread, options) do
+        {:ok, %ThreadSnapshot{thread_id: ^thread} = snapshot} ->
+          deferred = Ledger.deferral(config.scope, config.inbox, checkpoint.generation, thread)
 
-      if match?(
-           %Deferral{status: :unreadable, instruction_version: ^version, fingerprint: fingerprint}
-           when fingerprint == snapshot.fingerprint,
-           deferred
-         ) do
-        ids = Enum.uniq([id | deferred.message_ids])
+          if stable_deferral?(deferred, snapshot, version) do
+            ids = Enum.uniq([id | deferred.message_ids])
 
-        Ledger.defer(
-          config.scope,
-          config.inbox,
-          checkpoint.generation,
-          thread,
-          snapshot.fingerprint,
-          version,
-          ids,
-          :unreadable,
-          now
-        )
+            Ledger.defer(
+              config.scope,
+              config.inbox,
+              checkpoint.generation,
+              thread,
+              snapshot.fingerprint,
+              version,
+              ids,
+              deferred.status,
+              now
+            )
 
-        :deferred
-      else
-        review_targets(config, checkpoint, id, snapshot, instructions, version, now)
+            :deferred
+          else
+            review_targets(config, checkpoint, id, snapshot, instructions, version, now)
+          end
+
+        {:error, :not_found} ->
+          processed(config, checkpoint, [id], :skipped)
+
+        error ->
+          pre_review_failure(config, checkpoint, id, thread, version, now, error)
       end
     else
       {:error, :not_found} -> processed(config, checkpoint, [id], :skipped)
-      error -> error
+      error -> pre_review_failure(config, checkpoint, id, "arrival:" <> id, version, now, error)
     end
+  end
+
+  defp stable_deferral?(
+         %Deferral{status: status, instruction_version: version, fingerprint: fp},
+         %ThreadSnapshot{fingerprint: fp},
+         version
+       )
+       when status in [:unreadable, :blocked],
+       do: true
+
+  defp stable_deferral?(_, _, _), do: false
+
+  defp pre_review_failure(config, checkpoint, id, key, version, now, error) do
+    Ledger.defer(
+      config.scope,
+      config.inbox,
+      checkpoint.generation,
+      key,
+      "metadata-unavailable",
+      version,
+      [id],
+      :transient,
+      now
+    )
+
+    error
   end
 
   defp review_targets(config, checkpoint, id, snapshot, instructions, version, now) do
@@ -224,6 +259,18 @@ defmodule EmailJanitor.Worker do
         processed(config, checkpoint, [id], :skipped)
 
       error ->
+        Ledger.defer(
+          config.scope,
+          config.inbox,
+          checkpoint.generation,
+          snapshot.thread_id,
+          snapshot.fingerprint,
+          version,
+          [id],
+          :transient,
+          now
+        )
+
         error
     end
   end
@@ -290,12 +337,30 @@ defmodule EmailJanitor.Worker do
           eligible.thread_id,
           snapshot.fingerprint,
           version,
-          targets,
+          eligible.message_ids,
           :transient,
           now
         )
 
         :deferred
+
+      {:error, :partial_admission_unsupported} ->
+        Ledger.defer(
+          config.scope,
+          config.inbox,
+          checkpoint.generation,
+          eligible.thread_id,
+          snapshot.fingerprint,
+          version,
+          eligible.message_ids,
+          :blocked,
+          now
+        )
+
+        :blocked
+
+      {:skip, reason} when reason != :proposal_changed ->
+        processed(config, checkpoint, targets, :skipped)
 
       {:blocked, _} ->
         processed(config, checkpoint, targets, :blocked)
@@ -317,7 +382,7 @@ defmodule EmailJanitor.Worker do
           eligible.thread_id,
           snapshot.fingerprint,
           version,
-          targets,
+          eligible.message_ids,
           :transient,
           now
         )
@@ -326,7 +391,13 @@ defmodule EmailJanitor.Worker do
     end
   end
 
-  defp finish_review(config, checkpoint, eligible, targets, snapshot, version, now, error) do
+  defp finish_review(config, checkpoint, eligible, _targets, snapshot, version, now, error) do
+    old = Ledger.deferral(config.scope, config.inbox, checkpoint.generation, eligible.thread_id)
+
+    capped =
+      error == {:error, :invalid_decision} and not is_nil(old) and old.attempts >= 7 and
+        old.instruction_version == version and old.fingerprint == snapshot.fingerprint
+
     Ledger.defer(
       config.scope,
       config.inbox,
@@ -334,8 +405,8 @@ defmodule EmailJanitor.Worker do
       eligible.thread_id,
       snapshot.fingerprint,
       version,
-      targets,
-      :transient,
+      eligible.message_ids,
+      if(capped, do: :blocked, else: :transient),
       now
     )
 
@@ -469,6 +540,14 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :existing
 
+      {:skip, reason} when reason != :proposal_changed ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
+        :skipped
+
+      {:error, :partial_admission_unsupported} ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
+        :blocked
+
       {:blocked, reason} when reason not in [:already_reserved, :action_settled] ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :blocked
@@ -479,8 +558,9 @@ defmodule EmailJanitor.Worker do
     end
   end
 
-  defp finish_recheck(config, _checkpoint, candidate, _snapshot, _version, now, _error) do
-    Ledger.finish_candidate(config.scope, config.inbox, candidate, :retry, now)
+  defp finish_recheck(config, _checkpoint, candidate, _snapshot, _version, now, error) do
+    reason = if error == {:error, :invalid_decision}, do: :invalid_decision, else: :retry
+    Ledger.finish_candidate(config.scope, config.inbox, candidate, reason, now)
     :deferred
   end
 
@@ -555,6 +635,23 @@ defmodule EmailJanitor.Worker do
 
   defp authorized(config),
     do: if(config.authorize.() == :ok, do: :ok, else: {:error, :connection_changed})
+
+  defp local_work_due?(config, now) do
+    action_due = not is_nil(Ledger.action_due(config.scope, config.inbox, now))
+
+    inbox_due =
+      with :ok <- authorized(config),
+           {:ok, %{status: :active} = checkpoint} <-
+             Ingestion.checkpoint(config.scope, config.inbox.id),
+           {:ok, version} <- Store.instruction_version(config.scope, config.inbox.id) do
+        not is_nil(Ledger.candidate_due(config.scope, config.inbox, now)) or
+          not is_nil(Ledger.arrival_due(config.scope, config.inbox, checkpoint, version, now))
+      else
+        _ -> false
+      end
+
+    action_due or inbox_due
+  end
 
   defp utc(time), do: DateTime.from_unix!(DateTime.to_unix(time, :microsecond), :microsecond)
   defp more?({_, more}) when is_boolean(more), do: more

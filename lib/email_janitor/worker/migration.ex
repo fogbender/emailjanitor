@@ -35,7 +35,7 @@ defmodule EmailJanitor.Worker.Migration do
     create(
       constraint(:janitor_worker_deferrals, :worker_deferral_status,
         check:
-          "status IN ('unreadable', 'transient') AND attempts >= 0 AND instruction_version > 0"
+          "status IN ('unreadable', 'transient', 'blocked') AND attempts >= 0 AND instruction_version > 0"
       )
     )
 
@@ -49,13 +49,14 @@ defmodule EmailJanitor.Worker.Migration do
       add(:message_ids, {:array, :text}, null: false)
       add(:status, :text, null: false, default: "pending")
       add(:requested, :boolean, null: false, default: false)
+      add(:attempts, :integer, null: false, default: 0)
       add(:next_attempt_at, :utc_datetime_usec)
       timestamps(type: :utc_datetime_usec)
     end
 
     create(
       constraint(:janitor_worker_candidates, :worker_candidate_status,
-        check: "status IN ('pending', 'retired')"
+        check: "status IN ('pending', 'retired') AND attempts >= 0"
       )
     )
 
@@ -93,7 +94,7 @@ defmodule EmailJanitor.Worker.Deferral do
     field(:fingerprint, :string)
     field(:instruction_version, :integer)
     field(:message_ids, {:array, :string})
-    field(:status, Ecto.Enum, values: [:unreadable, :transient])
+    field(:status, Ecto.Enum, values: [:unreadable, :transient, :blocked])
     field(:attempts, :integer, default: 0)
     field(:next_attempt_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
@@ -122,6 +123,7 @@ defmodule EmailJanitor.Worker.Candidate do
     field(:message_ids, {:array, :string})
     field(:status, Ecto.Enum, values: [:pending, :retired], default: :pending)
     field(:requested, :boolean, default: false)
+    field(:attempts, :integer, default: 0)
     field(:next_attempt_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
   end

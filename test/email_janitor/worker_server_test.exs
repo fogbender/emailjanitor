@@ -103,4 +103,58 @@ defmodule EmailJanitor.WorkerServerTest do
 
     refute logs =~ "PRIVATE_RESOLVER_SECRET"
   end
+
+  test "notification wake does not bypass failure backoff", _ctx do
+    owner = self()
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, ["a"]} end,
+         resolve: fn ref -> {:ok, config(ref)} end,
+         step: fn _ ->
+           send(owner, :attempted)
+           {:ok, %{status: :rate_limited, more?: false}}
+         end,
+         interval_ms: 1_000}
+      )
+
+    assert_receive :attempted, 1_000
+    # The completion is serialized through this same server before the wake.
+    wait_failed(server, 100)
+    for _ <- 1..5, do: Server.wake(server)
+    refute_receive :attempted, 100
+  end
+
+  test "due backlog runs again promptly without waiting the normal poll interval" do
+    owner = self()
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    start_supervised!(
+      {Server,
+       list: fn -> {:ok, ["a"]} end,
+       resolve: fn ref -> {:ok, config(ref)} end,
+       step: fn _ ->
+         count = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+         send(owner, {:slice, count})
+         {:ok, %{status: :done, more?: count == 1}}
+       end,
+       interval_ms: 5_000}
+    )
+
+    assert_receive {:slice, 1}, 1_000
+    assert_receive {:slice, 2}, 1_000
+    refute_receive {:slice, 3}, 100
+  end
+
+  defp wait_failed(_server, 0), do: flunk("step did not enter failure backoff")
+
+  defp wait_failed(server, left) do
+    if :sys.get_state(server).entries["a"].attempts > 0 do
+      :ok
+    else
+      Process.sleep(5)
+      wait_failed(server, left - 1)
+    end
+  end
 end
