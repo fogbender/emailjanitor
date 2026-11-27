@@ -1,0 +1,72 @@
+mock_provider "aws" {
+  mock_resource "aws_ses_domain_dkim" {
+    defaults = { dkim_tokens = ["token-one", "token-two", "token-three"] }
+  }
+  mock_resource "aws_iam_role" {
+    defaults = { arn = "arn:aws:iam::123456789012:role/janitor-test" }
+  }
+  mock_data "aws_caller_identity" {
+    defaults = { account_id = "123456789012" }
+  }
+  mock_data "aws_region" {
+    defaults = { region = "us-east-1", name = "us-east-1" }
+  }
+  mock_data "aws_partition" {
+    defaults = { partition = "aws" }
+  }
+  mock_data "aws_availability_zones" {
+    defaults = { names = ["us-east-1a"] }
+  }
+}
+mock_provider "google" {
+  mock_resource "google_service_account" {
+    defaults = {
+      email = "janitor-test-gmail@janitor-test-project.iam.gserviceaccount.com"
+      name  = "projects/janitor-test-project/serviceAccounts/janitor-test-gmail@janitor-test-project.iam.gserviceaccount.com"
+    }
+  }
+}
+
+variables {
+  name              = "janitor-test"
+  mail_domain       = "janitor.example.com"
+  google_project_id = "janitor-test-project"
+  nixos_ami         = "ami-0123456789abcdef0"
+  ssh_key_name      = "test-only"
+  ssh_source_cidr   = "203.0.113.1/32"
+}
+
+run "safe_defaults" {
+  command = plan
+  assert {
+    condition     = !module.mail.receiving_activated
+    error_message = "A default plan must not replace the account's active SES receiving rules."
+  }
+  assert {
+    condition     = aws_instance.service.metadata_options[0].http_tokens == "required" && aws_instance.service.root_block_device[0].encrypted
+    error_message = "The host must require IMDSv2 and encrypted storage."
+  }
+  assert {
+    condition     = length(aws_security_group.service.ingress) == 1 && one(aws_security_group.service.ingress).from_port == 22 && length(one(aws_security_group.service.ingress).cidr_blocks) == 1 && contains(one(aws_security_group.service.ingress).cidr_blocks, "203.0.113.1/32")
+    error_message = "The initial host may expose only restricted operator SSH."
+  }
+  assert {
+    condition     = output.ready_for_processing == false
+    error_message = "A successful infrastructure plan is not an application readiness check."
+  }
+}
+
+run "reject_public_ssh" {
+  command = plan
+  variables { ssh_source_cidr = "0.0.0.0/0" }
+  expect_failures = [var.ssh_source_cidr]
+}
+
+run "receiving_requires_explicit_opt_in" {
+  command = plan
+  variables { activate_receiving = true }
+  assert {
+    condition     = module.mail.receiving_activated
+    error_message = "Explicit activation must produce exactly one receiving rule set assignment."
+  }
+}

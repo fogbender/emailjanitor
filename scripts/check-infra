@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+mkdir -p .local/tofu-provider-cache
+export TF_PLUGIN_CACHE_DIR="$PWD/.local/tofu-provider-cache"
+tofu fmt -recursive -check infra
+for janitor_stack in infra/modules/mail infra/modules/gmail_notifications infra/selfhost; do
+  tofu -chdir="$janitor_stack" init -backend=false -input=false -lockfile=readonly
+  tofu -chdir="$janitor_stack" validate
+  tofu -chdir="$janitor_stack" test
+done
+nix-instantiate --eval --strict --json nix/check-module.nix
