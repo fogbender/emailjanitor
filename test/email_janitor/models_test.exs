@@ -181,6 +181,13 @@ defmodule EmailJanitor.ModelsTest do
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       assert body =~ "PRIVATE_BODY_SENTINEL"
       request = Jason.decode!(body)
+      system = hd(request["messages"])["content"]
+
+      assert system =~
+               "USER_PREFERENCES:\nKeep requested customer conversations.\nOUTPUT_SCHEMA_JSON:"
+
+      assert system =~ "SELECTED_INBOX_JSON:"
+
       assert request["store"] in [nil, false]
       assert get_in(request, ["tool_choice", "function", "name"]) == "structured_output"
       assert [tool] = request["tools"]

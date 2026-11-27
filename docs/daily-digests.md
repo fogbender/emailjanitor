@@ -25,8 +25,10 @@ config :tzdata, :autoupdate, :disabled
 
 `Event.new(action_or_candidate_uuid, gmail_message_id, :done | :would_have_done,
 sender_header, subject, occurred_at)` validates a stable typed source ID, exact
-Gmail ID, the first parsed sender address and bounded UTF-8 subject. Multiple
-addresses in the From header are accepted like the cleanup identity parser. It stores only
+Gmail ID, the first parsed sender address and bounded UTF-8 subject. The message
+ID uses the shared Gmail parser's opaque-ID validation, so admission and metadata
+settlement accept exactly the same provider IDs. Multiple addresses in the From
+header are accepted like the cleanup identity parser. It stores only
 minimal sender/subject metadata, never a thread, body, reply or rendered email.
 `Digest.record(scope, inbox_id, event)` is idempotent and transaction-compatible.
 It does not require a schedule: an unavailable browser timezone or delayed
@@ -39,6 +41,34 @@ retry from a body-free durable workflow, so a crash after cleanup cannot lose
 the activity. A hypothetical is recorded once per Gmail message; a later actual
 Done retires an unlisted hypothetical. `retire_hypotheticals/3` lets the trusted
 host retire remaining extras after a restore or other final decision.
+
+For actions whose headers would otherwise disappear before settlement, install
+`Digest.install_staging(scope)` (migration 12, after the other enabled modules).
+In the admission transaction, after host policy accepts the exact targets and
+before Gmail is called, construct a Done `Event` per target and call
+`Digest.stage(scope, inbox_id, event)`. The action UUID is already known then,
+but the core action row is inserted after the policy admission callback. Staging
+therefore has no immediate action foreign key. Capture only each selected
+message's sender and subject, never its body or an entire thread.
+
+In the durable settlement transaction call
+`Digest.confirm_staged(scope, inbox_id, action_uuid)`. Both APIs return `:ok`
+or a fixed `{:error, reason}` and share the caller's Repo transaction. Confirmation
+locks the scoped mailbox and exact action, reads its durable applied message IDs,
+then promotes only those IDs into activity at the action's dispatch time. A
+cancelled action proven unapplied discards its original staged targets; intent
+and unresolved outcomes retain staging and do not appear in a digest. A later
+restoration does not erase the historical fact that an action was applied.
+
+No Gmail fetch, headers, bodies or render call is needed to retry confirmation
+after a process crash or host settlement failure. Repeated confirmations are
+idempotent; a missing staged applied target fails atomically with
+`:missing_digest_stage` instead of dropping a report entry. A trusted recovery
+path may re-stage the missing minimal headers and retry. Replaying already
+confirmed metadata does not recreate a stage; incompatible unconfirmed metadata
+returns `:digest_stage_conflict`. Unknown actions never authorize promotion.
+Staging and confirmation take the scoped mailbox first, so the same-inbox digest
+claim/settlement paths preserve the shared lock order.
 
 `Digest.tick(scope, inbox_id, now, claim_extras)` locks the schedule and chooses
 the latest passed local 21:00 cutoff. It includes only unlisted activity at or
