@@ -29,4 +29,12 @@ for prefix <- [
   EmailJanitor.Digest.install(scope)
 end
 
+for prefix <- ["ej_digest_stage", "ej_digest_stage_other", "ej_digest_stage_concurrency"] do
+  {:ok, scope} = EmailJanitor.Store.Scope.new(EmailJanitor.TestRepo, prefix)
+  EmailJanitor.Store.install(scope)
+  EmailJanitor.Mail.Store.install(scope)
+  EmailJanitor.Digest.install(scope)
+  EmailJanitor.Digest.install_staging(scope)
+end
+
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)

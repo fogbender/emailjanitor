@@ -14,7 +14,8 @@ inside an optional module.
 | 5 | Daily digest metadata | `Digest.install/1` |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
+| 12 | Staged digest action headers | `Digest.install_staging/1` |
 
-Versions 6–9 are unallocated. Changes to an already released schema require a new
+Versions 6–9 are reserved for active core/conversation work. Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's
 global `public` schema has its own independent registry and migration table.
