@@ -7,10 +7,12 @@ defmodule EmailJanitor.Gmail.Parser do
 
   def message(%Google.Message{} = value) do
     with true <- valid_id?(value.id) and valid_id?(value.threadId),
-         true <- is_list(value.labelIds) and Enum.all?(value.labelIds, &is_binary/1),
+         labels = value.labelIds || [],
+         true <- is_list(labels) and Enum.all?(labels, &is_binary/1),
          %Google.MessagePart{} = payload <- value.payload,
          {:ok, headers} <- headers(payload.headers),
          {:ok, fragments} <- parts(payload, 0),
+         true <- fragments != [],
          body = Enum.join(fragments, "\n"),
          true <- byte_size(body) <= @max_text,
          {:ok, date} <- date(value.internalDate) do
@@ -22,7 +24,7 @@ defmodule EmailJanitor.Gmail.Parser do
        %Message{
          id: value.id,
          thread_id: value.threadId,
-         labels: value.labelIds,
+         labels: labels,
          headers: [{"Content-Type", "text/plain"} | headers],
          body: Content.new(body),
          received_at: date
@@ -78,7 +80,10 @@ defmodule EmailJanitor.Gmail.Parser do
 
   defp parts(_, _), do: {:error, :invalid_mime}
 
-  defp text(%Google.MessagePart{mimeType: type, body: %Google.MessagePartBody{data: data}})
+  defp text(%Google.MessagePart{
+         mimeType: type,
+         body: %Google.MessagePartBody{data: data, attachmentId: nil}
+       })
        when type in ["text/plain", "text/html"] and is_binary(data) do
     with true <- byte_size(data) <= @max_encoded_part,
          {:ok, decoded} <- Base.url_decode64(data, padding: false),
@@ -96,7 +101,17 @@ defmodule EmailJanitor.Gmail.Parser do
     end
   end
 
-  defp text(_), do: {:ok, []}
+  # A body delivered by reference is not an empty body. Preserve mail rather
+  # than classify partial input while referenced-body fetching is unsupported.
+  defp text(%Google.MessagePart{
+         mimeType: type,
+         body: %Google.MessagePartBody{data: nil, attachmentId: nil, size: size}
+       })
+       when type in ["text/plain", "text/html"] and size in [nil, 0],
+       do: {:ok, [""]}
+
+  defp text(%Google.MessagePart{mimeType: "multipart/" <> _}), do: {:ok, []}
+  defp text(_), do: {:error, :invalid_mime}
 
   defp date(nil), do: {:ok, nil}
 

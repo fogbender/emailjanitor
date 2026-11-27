@@ -157,7 +157,10 @@ defmodule EmailJanitor.Gmail.SDK do
       case Address.normalize(value) do
         {:ok, address} ->
           normalized = if String.contains?(key, "@"), do: address, else: Address.domain(address)
-          {:cont, {:ok, Enum.uniq([normalized | acc])}}
+
+          if not String.contains?(key, "@") and Address.shared?(normalized),
+            do: {:halt, {:error, :invalid_contact_keys}},
+            else: {:cont, {:ok, Enum.uniq([normalized | acc])}}
 
         _ ->
           {:halt, {:error, :invalid_contact_keys}}
@@ -210,9 +213,15 @@ defmodule EmailJanitor.Gmail.SDK do
                )
              end),
            {:ok, addresses} <- recipients(headers) do
-        if Enum.any?(addresses, &(key in Address.contact_keys(&1))),
-          do: {:halt, {:ok, true}},
-          else: {:cont, {:ok, false}}
+        if Enum.any?(
+             addresses,
+             &if(String.contains?(key, "@"),
+               do: key == &1,
+               else: key in Address.contact_keys(&1)
+             )
+           ),
+           do: {:halt, {:ok, true}},
+           else: {:cont, {:ok, false}}
       else
         {:error, _} = error -> {:halt, error}
         _ -> {:halt, {:error, :invalid_correspondence}}

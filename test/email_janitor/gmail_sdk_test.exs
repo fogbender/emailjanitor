@@ -187,6 +187,69 @@ defmodule EmailJanitor.GmailSDKTest do
     assert {:error, :invalid_thread} = SDK.thread("inbox-1", "thread-1", options())
   end
 
+  test "body-by-reference and unsupported leaf MIME never produce empty classification input" do
+    for payload <- [
+          %{
+            "mimeType" => "text/plain",
+            "body" => %{"attachmentId" => "body-reference", "size" => 100}
+          },
+          %{
+            "mimeType" => "text/plain",
+            "body" => %{"attachmentId" => "body-reference", "data" => "", "size" => 100}
+          },
+          %{"mimeType" => "text/html", "body" => %{"size" => 100}},
+          part("text/calendar", "Calendar details"),
+          part("text/enriched", "Important context"),
+          %{
+            "mimeType" => "multipart/alternative",
+            "parts" => [
+              part("text/plain", "Partial context"),
+              part("text/calendar", "Missing context")
+            ]
+          }
+        ] do
+      mock(fn _ ->
+        Tesla.Mock.json(%{"id" => "thread-1", "messages" => [gmail_message(payload)]})
+      end)
+
+      assert {:error, :invalid_message} = SDK.thread("inbox-1", "thread-1", options())
+    end
+  end
+
+  test "archived read messages with omitted labelIds remain valid thread context" do
+    mock(fn _ ->
+      old = gmail_message() |> Map.put("id", "old-message") |> Map.delete("labelIds")
+      Tesla.Mock.json(%{"id" => "thread-1", "messages" => [old, gmail_message()]})
+    end)
+
+    assert {:ok, [old, current]} = SDK.thread("inbox-1", "thread-1", options())
+    assert old.labels == []
+    assert current.labels == ["INBOX", "UNREAD", "IMPORTANT"]
+  end
+
+  test "exact addresses at company domains match exactly, not via domain keys" do
+    mock(fn env ->
+      if String.ends_with?(env.url, "/messages"),
+        do: Tesla.Mock.json(%{"messages" => [%{"id" => "sent-1"}]}),
+        else: Tesla.Mock.json(sent_metadata("Bob <bob@vendor.com>"))
+    end)
+
+    assert {:ok, keys} = SDK.contacted("inbox-1", ["bob@vendor.com"], options())
+    assert keys == MapSet.new(["bob@vendor.com"])
+    assert {:ok, keys} = SDK.contacted("inbox-1", ["alice@vendor.com"], options())
+    assert MapSet.size(keys) == 0
+  end
+
+  test "small gzipped valid Google responses succeed through the bounded middleware" do
+    body = Jason.encode!(%{"emailAddress" => "owner@acme.com", "historyId" => "100"})
+
+    Tesla.Mock.mock(fn _ ->
+      %Tesla.Env{status: 200, body: :zlib.gzip(body), headers: [{"content-encoding", "gzip"}]}
+    end)
+
+    assert {:ok, "100"} = SDK.history_id("inbox-1", options())
+  end
+
   test "shared-provider correspondence is verified against exact To/Cc/Bcc recipients" do
     for header <- ["To", "Cc", "Bcc"] do
       mock(fn env ->
@@ -263,7 +326,12 @@ defmodule EmailJanitor.GmailSDKTest do
   test "malformed query keys cannot inject Gmail search operators" do
     Tesla.Mock.mock(fn _ -> flunk("invalid key must not contact Google") end)
 
-    for key <- [~s(friend@gmail.com" OR in:anywhere), "vendor.com} {from:me", "co.uk"] do
+    for key <- [
+          ~s(friend@gmail.com" OR in:anywhere),
+          "vendor.com} {from:me",
+          "co.uk",
+          "gmail.com"
+        ] do
       assert {:error, :invalid_contact_keys} = SDK.contacted("inbox-1", [key], options())
     end
   end
@@ -394,17 +462,25 @@ defmodule EmailJanitor.GmailSDKTest do
   end
 
   test "compressed and uncompressed oversized responses stop before SDK JSON decoding" do
-    body = String.duplicate("PRIVATE_BODY_SENTINEL", 450_000)
+    body =
+      Jason.encode!(%{
+        "emailAddress" => "owner@acme.com",
+        "historyId" => "100",
+        "padding" => String.duplicate("PRIVATE_BODY_SENTINEL", 450_000)
+      })
+
+    assert {:ok, %GoogleApi.Gmail.V1.Model.Profile{emailAddress: "owner@acme.com"}} =
+             Poison.decode(body, as: %GoogleApi.Gmail.V1.Model.Profile{})
 
     for response <- [
           %Tesla.Env{status: 200, body: body},
           %Tesla.Env{status: 200, body: :zlib.gzip(body), headers: [{"content-encoding", "gzip"}]}
         ] do
-      mock(fn _ -> response end)
+      Tesla.Mock.mock(fn _ -> response end)
 
       log =
         capture_log(fn ->
-          assert {:error, :gmail_unavailable} = SDK.thread("inbox-1", "thread-1", options())
+          assert {:error, :gmail_unavailable} = SDK.history_id("inbox-1", options())
         end)
 
       refute log =~ "PRIVATE_BODY_SENTINEL"
