@@ -17,7 +17,12 @@ defmodule EmailJanitor.Conversation.Outcome do
     blocked = Enum.count(results, &(&1["status"] == "blocked"))
     protected = Enum.count(results, &(&1["status"] == "protected"))
     missing = max(0, length(receipt.references) - length(results))
-    uncertain = Enum.count(results, &(&1["status"] == "unresolved")) + missing
+
+    uncertain =
+      Enum.count(results, &(&1["status"] == "unresolved")) +
+        if(receipt.completed, do: missing, else: 0)
+
+    awaiting = if receipt.completed, do: 0, else: missing
     unavailable = Enum.count(results, &(&1["status"] == "unavailable"))
     unchanged = Enum.count(results, &(&1["status"] == "unchanged"))
     not_found = Enum.count(results, &(&1["status"] == "missing"))
@@ -41,6 +46,7 @@ defmodule EmailJanitor.Conversation.Outcome do
         do:
           "The result for #{count(uncertain)} is uncertain. I will not repeat that Gmail request automatically."
       ),
+      if(awaiting > 0, do: "I haven't confirmed the result for #{count(awaiting)} yet."),
       if(unavailable > 0,
         do: "I could not finish processing #{count(unavailable)}. Please try again."
       ),

@@ -54,6 +54,11 @@ defmodule EmailJanitor.ConversationFixtureRestore do
   def apply(_, _, effect_id, _, _, _, opts), do: opts[:fixture_restore].(effect_id)
 end
 
+defmodule EmailJanitor.ConversationFixtureCancelledRestore do
+  def apply(_, _, _, _, _, _, _), do: {:error, :rate_limited}
+  def outcome(_, _, effect_id), do: {:cancelled, effect_id}
+end
+
 defmodule EmailJanitor.ConversationFixtureFailedSettlement do
   @behaviour EmailJanitor.Policy
   def reserve(_, _, _, _, _), do: :ok
@@ -1200,5 +1205,125 @@ defmodule EmailJanitor.ConversationTest do
     assert Content.read(reply) == "No email or instruction changes were made."
     assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
     assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "a later clear preserves interruption proof without asking to revive the instruction", t do
+    ctx = context(t.ctx)
+    {:ok, ref} = Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+    id = Ecto.UUID.generate()
+    {:ok, initial} = Preferences.snapshot(ctx.scope, ctx.inbox.id)
+
+    plan = %Plan{
+      operation: :done,
+      references: [ref.token],
+      preference_target: :inbox,
+      search_complete: true
+    }
+
+    assert {:ok, _} =
+             EmailJanitor.Owner.workflow(fn ->
+               {:ok, receipt} =
+                 Ledger.reserve(
+                   ctx.scope,
+                   ctx.inbox.id,
+                   ctx.conversation_id,
+                   id,
+                   plan,
+                   [ref],
+                   ctx.guard
+                 )
+
+               assert {:ok, _} =
+                        Preferences.replace(
+                          ctx.scope,
+                          {:inbox, ctx.inbox.id},
+                          initial,
+                          Content.new("Keep receipts."),
+                          id
+                        )
+
+               {:ok, receipt}
+             end)
+
+    {:ok, changed} = Preferences.snapshot(ctx.scope, ctx.inbox.id)
+
+    assert {:ok, _} =
+             Preferences.replace(
+               ctx.scope,
+               {:inbox, ctx.inbox.id},
+               changed,
+               Content.new(""),
+               Ecto.UUID.generate()
+             )
+
+    assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Retry original."))
+    assert Content.read(reply) =~ "have since been changed"
+    refute Content.read(reply) =~ "send that instruction again"
+    {:ok, current} = Preferences.snapshot(ctx.scope, ctx.inbox.id)
+    assert Content.read(current.local) == ""
+  end
+
+  test "an unprocessed predecessor has no false claim that a Gmail request was sent", t do
+    ctx = t.ctx
+    {:ok, ref} = Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+    id = Ecto.UUID.generate()
+
+    assert {:ok, _} =
+             EmailJanitor.Owner.workflow(fn ->
+               Ledger.reserve(
+                 ctx.scope,
+                 ctx.inbox.id,
+                 ctx.conversation_id,
+                 id,
+                 %Plan{
+                   operation: :done,
+                   references: [ref.token],
+                   preference_target: :none,
+                   search_complete: true
+                 },
+                 [ref],
+                 ctx.guard
+               )
+             end)
+
+    script = fn _, _, _ ->
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new("A transient answer"),
+         search_complete: true
+       }}
+    end
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               %{ctx | model: [script: script]},
+               Ecto.UUID.generate(),
+               Content.new("Status?")
+             )
+
+    assert Content.read(reply) =~ "haven't confirmed"
+    refute Content.read(reply) =~ "uncertain"
+    refute Content.read(reply) =~ "will not repeat"
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "a durable cancelled restore is reported immediately without asking for a useless retry",
+       t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+
+    ctx = %{
+      context(ctx, operation: :restore, target: :none)
+      | execution_options: [restore_adapter: EmailJanitor.ConversationFixtureCancelledRestore]
+    }
+
+    assert {:ok, reply} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Undo."))
+    assert Content.read(reply) =~ "could not restore"
+    refute Content.read(reply) =~ "try again"
   end
 end

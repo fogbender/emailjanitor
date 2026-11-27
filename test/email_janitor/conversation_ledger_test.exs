@@ -303,12 +303,12 @@ defmodule EmailJanitor.ConversationLedgerTest do
              Ledger.record_preference(ctx.scope, ctx.box.id, ctx.conversation, id, :updated, 1)
   end
 
-  test "unrecorded effects stay uncertain and a foreign snapshot cannot make completion claims",
+  test "unrecorded effects await confirmation and a foreign snapshot cannot make completion claims",
        ctx do
     {:ok, receipt} = reserve(ctx)
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.box.id)
     text = Outcome.render(receipt, snapshot) |> Content.read()
-    assert text =~ "uncertain"
+    assert text =~ "haven't confirmed"
     assert text =~ "still being verified"
     refute text =~ "No email or instruction changes"
 

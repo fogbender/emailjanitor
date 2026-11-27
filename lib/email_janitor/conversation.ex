@@ -463,7 +463,7 @@ defmodule EmailJanitor.Conversation do
                 _, _ -> {:unresolved, effect_id}
               end
 
-            restore_result(result)
+            restore_result(ctx, restore, effect_id, result)
         end
 
       case record_results(ctx, receipt, remaining, status, id) do
@@ -570,6 +570,34 @@ defmodule EmailJanitor.Conversation do
        do: {"unsupported", nil}
 
   defp restore_result(_), do: {"unavailable", nil}
+
+  defp restore_result(ctx, restore, effect_id, {:error, reason} = result)
+       when reason not in [
+              :invalid_restore_selection,
+              :effect_conflict,
+              :unconfirmed_suppression,
+              :restore_unsupported,
+              :unconfirmed_restoration,
+              :wrong_inbox,
+              :restore_pending
+            ] do
+    if Code.ensure_loaded?(restore) and function_exported?(restore, :outcome, 3) do
+      case apply(restore, :outcome, [ctx.scope, ctx.inbox, effect_id]) do
+        {:done, ^effect_id} -> {"restored", effect_id}
+        {:cancelled, ^effect_id} -> {"unsupported", nil}
+        {:unresolved, ^effect_id} -> {"unresolved", effect_id}
+        _ -> restore_result(result)
+      end
+    else
+      restore_result(result)
+    end
+  rescue
+    _ -> {"unavailable", nil}
+  catch
+    _, _ -> {"unavailable", nil}
+  end
+
+  defp restore_result(_, _, _, result), do: restore_result(result)
 
   defp record_results(ctx, receipt, refs, status, effect_id) do
     Enum.reduce_while(refs, :ok, fn ref, :ok ->

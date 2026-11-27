@@ -162,14 +162,9 @@ defmodule EmailJanitor.Preferences do
       )
     end
 
-    if instruction == "",
-      do:
-        scope.repo.delete_all(from(c in Change, where: c.target_key == ^key),
-          prefix: scope.prefix,
-          log: false,
-          telemetry_event: nil
-        )
-
+    # These are text-free idempotency/recovery receipts. Keep them for the
+    # normal retry window even after a clear, so an old request cannot revive
+    # removed instructions and interrupted work can report supersession.
     scope.repo.insert!(
       %Change{
         id: id,
