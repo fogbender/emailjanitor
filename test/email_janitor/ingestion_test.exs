@@ -821,8 +821,19 @@ defmodule EmailJanitor.IngestionTest do
          thread: fn "thread-1" -> {:ok, messages} end
        ]}
 
-    assert {:skip, :prebaseline_inbox} =
+    assert {:ok, eligible} =
              Ingestion.eligible_thread(scope, box, checkpoint.generation, "new-message", adapter)
+
+    assert eligible.message_ids == ["new-message"]
+    assert :ok = Ingestion.authorize_proposal(scope, box, eligible, proposal(["new-message"]))
+
+    assert {:error, :ineligible_proposal} =
+             Ingestion.authorize_proposal(
+               scope,
+               box,
+               eligible,
+               proposal(["old-message", "new-message"])
+             )
 
     assert {:ok, [%Arrival{message_id: "new-message"}]} = Ingestion.pending(scope, box)
   end
@@ -863,6 +874,99 @@ defmodule EmailJanitor.IngestionTest do
 
     assert {:error, :generation_changed} =
              Ingestion.mark_processed(scope, box, checkpoint.generation, ["message-1"])
+  end
+
+  test "Done and evaluated selections must both remain inside durable eligible targets", %{
+    scope: scope,
+    box: box
+  } do
+    checkpoint = baseline(scope, box)
+
+    assert {:ok, _} =
+             Ingestion.catch_up(
+               scope,
+               box,
+               gmail(fn _ -> {:ok, history(["message-1", "message-2"])} end)
+             )
+
+    adapter =
+      {Gmail,
+       [
+         thread_id: fn _ -> {:ok, "thread-1"} end,
+         thread: fn _ ->
+           {:ok,
+            [
+              Fixtures.message(id: "old-message"),
+              Fixtures.message(),
+              Fixtures.message(id: "message-2")
+            ]}
+         end
+       ]}
+
+    assert {:ok, eligible} =
+             Ingestion.eligible_thread(scope, box, checkpoint.generation, "message-1", adapter)
+
+    assert eligible.message_ids == ["message-1", "message-2"]
+    partial = Map.put(proposal(["message-1"]), :evaluated_message_ids, ["message-1", "message-2"])
+    assert :ok = Ingestion.authorize_proposal(scope, box, eligible, partial)
+
+    for ids <- [
+          [],
+          ["message-1", "message-1"],
+          ["message-2"],
+          ["message-1", "old-message"],
+          ["message-1", "bad id"],
+          false,
+          "message-1"
+        ] do
+      assert {:error, :ineligible_proposal} =
+               Ingestion.authorize_proposal(
+                 scope,
+                 box,
+                 eligible,
+                 Map.put(partial, :evaluated_message_ids, ids)
+               )
+    end
+
+    for ids <- [[], ["message-1", "message-1"], ["old-message"], nil] do
+      assert {:error, :ineligible_proposal} =
+               Ingestion.authorize_proposal(scope, box, %{eligible | message_ids: ids}, partial)
+    end
+
+    Ecto.Adapters.SQL.query!(
+      TestRepo,
+      ~s(DELETE FROM "#{scope.prefix}".gmail_arrivals WHERE message_id = $1),
+      ["message-2"],
+      log: false
+    )
+
+    assert {:error, :ineligible_proposal} =
+             Ingestion.authorize_proposal(scope, box, eligible, partial)
+
+    # A legacy single-target proposal still proves only its own evaluated ID.
+    assert :ok = Ingestion.authorize_proposal(scope, box, eligible, proposal(["message-1"]))
+  end
+
+  test "archived arrivals never make unknown old INBOX context eligible", %{
+    scope: scope,
+    box: box
+  } do
+    checkpoint = baseline(scope, box)
+
+    assert {:ok, _} =
+             Ingestion.catch_up(scope, box, gmail(fn _ -> {:ok, history(["message-1"])} end))
+
+    adapter =
+      {Gmail,
+       [
+         thread_id: fn _ -> {:ok, "thread-1"} end,
+         thread: fn _ ->
+           {:ok, [Fixtures.message(labels: ["UNREAD"]), Fixtures.message(id: "old-message")]}
+         end
+       ]}
+
+    assert {:skip, :prebaseline_inbox} =
+             Ingestion.eligible_thread(scope, box, checkpoint.generation, "message-1", adapter)
   end
 
   test "deleted arrivals and archive-only threads are skipped without fetching more content", %{
