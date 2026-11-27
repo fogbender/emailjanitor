@@ -13,9 +13,17 @@ socket = System.fetch_env!("JANITOR_TEST_SOCKET")
     log: false
   )
 
-for prefix <- ["ej_test_a", "ej_test_b", "ej_concurrency", "ej_recovery", "ej_policy_concurrency"] do
+for prefix <- [
+      "ej_test_a",
+      "ej_test_b",
+      "ej_concurrency",
+      "ej_recovery",
+      "ej_policy_concurrency",
+      "ej_preferences_concurrency"
+    ] do
   {:ok, scope} = EmailJanitor.Store.Scope.new(EmailJanitor.TestRepo, prefix)
   EmailJanitor.Store.install(scope)
+  EmailJanitor.Preferences.install(scope)
   EmailJanitor.Mail.Store.install(scope)
 end
 
