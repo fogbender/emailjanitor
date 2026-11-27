@@ -158,6 +158,9 @@ defmodule EmailJanitor.MailSDKTest do
   test "SQS pull returns only redacted transient notification and receipt handle" do
     config =
       F.config(fn conn ->
+        {:ok, request, conn} = Plug.Conn.read_body(conn)
+        assert URI.decode_query(request)["WaitTimeSeconds"] == "20"
+
         Plug.Conn.send_resp(
           conn,
           200,
