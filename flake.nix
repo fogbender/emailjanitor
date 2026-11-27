@@ -195,6 +195,7 @@
             export HOME="$TMPDIR"
             export ERL_CRASH_DUMP=/dev/null
             export RELEASE_TMP="$TMPDIR/release"
+            test ! -e ${self.packages.${system}.emailjanitor.src}/vendor
             email_janitor eval '
               {:ok, _} = Application.ensure_all_started(:email_janitor)
               true = is_pid(Process.whereis(EmailJanitor.Supervisor))
@@ -203,6 +204,9 @@
               true = Code.ensure_loaded?(:mimemail)
               true = Code.ensure_loaded?(EmailJanitor.SelfHost.Web)
               true = Code.ensure_loaded?(EmailJanitor.SelfHostWeb.Endpoint)
+              true = Code.ensure_loaded?(Oban)
+              false = Code.ensure_loaded?(Oban.Pro.Engine)
+              "2.24.1" = to_string(Application.spec(:oban, :vsn))
               true = File.regular?(Application.app_dir(:email_janitor, "priv/static/selfhost.js"))
             '
             python3 ${./scripts/check-release-cookie.py} \

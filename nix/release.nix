@@ -23,7 +23,7 @@ in (beam.mixRelease {
     pname = "emailjanitor-deps";
     version = "0.1.0-dev";
     src = source;
-    hash = "sha256-FNdtGdzAMeMR/yfRHITC+0LO+OEPtfIaQcEd5app770=";
+    hash = "sha256-fGCt1oALgF1XGCmqLaO5ILEg655vRoMjb2QSxx1aIdI=";
   };
   meta = {
     description = "Single-user Email Janitor Elixir release";

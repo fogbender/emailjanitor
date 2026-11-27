@@ -13,6 +13,9 @@ fixed-output hash must be regenerated and reviewed when `mix.lock` changes.
 Only `mix.exs`, `mix.lock`, `config`, `lib` and `priv` enter the application
 source closure; local OAuth/SOPS files, test data and build artifacts are excluded.
 Do not put plaintext credentials inside those source directories.
+The installed artifact includes OSS Oban 2.24.1. Its check verifies that the
+commercial Pro engine and every `vendor` directory are absent from this MIT
+release. The dependency hash is pinned only after the reviewed lockfile is final.
 
 The package always disables distributed Erlang and generates a fresh random
 cookie for each command. No shared cookie is stored in the Nix closure. Distributed
