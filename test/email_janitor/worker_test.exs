@@ -1002,6 +1002,84 @@ defmodule EmailJanitor.WorkerTest do
              Repo.all(Candidate, prefix: ctx.scope.prefix)
   end
 
+  test "partial Keep retires exact worker and host metadata without withdrawing its sibling",
+       ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [Fixtures.message(), Fixtures.message(id: "message-2")],
+          arrivals: %{"100" => %{through: "101", ids: ["message-1", "message-2"]}}
+      }
+    )
+
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    Agent.update(ctx.state, &%{&1 | model: :keep})
+
+    assert {:keep, :classifier_kept} =
+             EmailJanitor.Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               ctx.config.gmail,
+               ctx.config.classifier,
+               "Synthetic instructions",
+               1,
+               cleanup_target_ids: ["message-1"],
+               policy: %Policy{adapter: EmailJanitor.Worker.Gate, context: %{config: ctx.config}}
+             )
+
+    assert [%Candidate{message_ids: ["message-2"]}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert [%{remaining_message_ids: ["message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    assert {:retire_exact, ["message-1"]} in read(ctx.quota).calls
+    refute {:retire_whole, ["message-1"]} in read(ctx.quota).calls
+    assert read(ctx.state).mutations == []
+  end
+
+  test "Gate never sends a partial retirement to a whole-only host callback", ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [Fixtures.message(), Fixtures.message(id: "message-2")],
+          arrivals: %{"100" => %{through: "101", ids: ["message-1", "message-2"]}}
+      }
+    )
+
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    Agent.update(ctx.state, &%{&1 | model: :keep})
+    config = %{ctx.config | policy: %Policy{adapter: __MODULE__.WholeOnlyPolicy, context: self()}}
+
+    assert {:error, :policy_unavailable} =
+             EmailJanitor.Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               config.gmail,
+               config.classifier,
+               "Synthetic instructions",
+               1,
+               cleanup_target_ids: ["message-1"],
+               policy: %Policy{adapter: EmailJanitor.Worker.Gate, context: %{config: config}}
+             )
+
+    refute_received {:legacy_whole_retired, _}
+    assert [%Candidate{message_ids: ids}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert ids == ["message-1", "message-2"]
+
+    assert [%{remaining_message_ids: remaining}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    assert remaining == ids
+    assert read(ctx.state).mutations == []
+  end
+
   defp await_blocked(_backend, 0),
     do: flunk("disconnect must queue behind the mailbox admission lock")
 

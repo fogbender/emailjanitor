@@ -61,4 +61,10 @@ defmodule EmailJanitor.Worker.Gate do
     with :ok <- Policy.retire_candidate(config.policy, inbox_id, id, ids),
          do: Ledger.retire_candidate(config.scope, config.inbox, id, ids)
   end
+
+  @impl true
+  def retire_candidate_messages(%{config: config}, inbox_id, id, ids) do
+    with :ok <- Policy.retire_candidate_messages(config.policy, inbox_id, id, ids),
+         do: Ledger.retire_candidate(config.scope, config.inbox, id, ids)
+  end
 end

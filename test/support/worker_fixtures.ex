@@ -197,7 +197,15 @@ defmodule EmailJanitor.WorkerTest.Policy do
     end)
   end
 
-  def retire_candidate(_, _, _, _), do: :ok
+  def retire_candidate(state, _, _, ids), do: retire(state, :retire_whole, ids)
+  def retire_candidate_messages(state, _, _, ids), do: retire(state, :retire_exact, ids)
+
+  defp retire(state, kind, ids) do
+    Agent.get_and_update(state, fn value ->
+      result = if Map.get(value, :retire_error, false), do: {:error, :temporary}, else: :ok
+      {result, %{value | calls: value.calls ++ [{kind, ids}]}}
+    end)
+  end
 end
 
 defmodule EmailJanitor.WorkerTest.LegacyPolicy do
@@ -205,4 +213,17 @@ defmodule EmailJanitor.WorkerTest.LegacyPolicy do
   def reserve(_, _, _, _, _), do: :ok
   def settle(_, _, _, _), do: :ok
   def retire_candidate(_, _, _, _), do: :ok
+end
+
+defmodule EmailJanitor.WorkerTest.WholeOnlyPolicy do
+  @behaviour EmailJanitor.Policy
+  def reserve(_, _, _, _, _), do: :ok
+  def settle(_, _, _, _), do: :ok
+
+  def retire_candidate(observer, _, _, ids),
+    do:
+      (
+        send(observer, {:legacy_whole_retired, ids})
+        :ok
+      )
 end
