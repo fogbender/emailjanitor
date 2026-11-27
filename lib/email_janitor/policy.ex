@@ -45,6 +45,8 @@ defmodule EmailJanitor.Policy do
   Retire superseded or freshly ineligible proposal metadata independently of
   Gmail/quota outcomes. This includes proven-unapplied cancelled actions whose
   work was superseded by fresh review. The callback must be idempotent.
+  Retirement may precede host settlement of a cancelled action; remember the
+  withdrawal across a later not-applied result without refunding quota here.
   """
   def retire_candidate(%__MODULE__{} = policy, inbox_id, candidate_id, message_ids) do
     case policy.adapter.retire_candidate(policy.context, inbox_id, candidate_id, message_ids) do

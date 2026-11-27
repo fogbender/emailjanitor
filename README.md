@@ -55,6 +55,9 @@ leave it queued. Instruction-version and database snapshot checks prevent older
 reviews from discarding newer work. `execute` also retires known ineligibility
 observed during its deterministic prechecks. Public executor entry points reject
 outer transactions so a failed host settlement cannot roll back a Gmail outcome.
+Review has a 60-second budget covering Gmail reads, classification and metadata
+retirement. A timeout returns `:executor_unavailable` and keeps pending work for
+retry; configure provider request deadlines within that budget.
 
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
