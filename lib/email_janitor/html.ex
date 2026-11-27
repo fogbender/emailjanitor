@@ -3,7 +3,9 @@ defmodule EmailJanitor.HTML do
   alias EmailJanitor.Content
 
   def readable(%Content{} = content, limit \\ 16_000) when is_integer(limit) and limit > 0 do
-    with {:ok, document} <- Floki.parse_document(Content.read(content)) do
+    with true <- byte_size(Content.read(content)) <= 262_144,
+         true <- length(:binary.matches(Content.read(content), "<")) <= 4096,
+         {:ok, document} <- Floki.parse_document(Content.read(content)) do
       document
       |> Floki.filter_out("script, style, title, head, template")
       |> fragments(:visible)
