@@ -23,8 +23,10 @@ the image. The lower-level path module `nix/module.nix` still requires an explic
 operator can supply another reviewed package. Direct source imports also filter
 Git working trees outside the store to tracked files, excluding ignored/untracked
 files. Use `git+file:` refs for local working-tree flake inputs; `path:` copies the
-whole directory into the store before our source filter runs, so its copy cannot
-provide that privacy guarantee. The release contains
+whole directory into the store before our source filter runs. Untracked or ignored
+files under `config`, `lib` or `priv` can then enter the built release's store
+closure and be deployed to the host. That route does not provide the tracked-file
+privacy guarantee. The release contains
 the reviewed engine and SDK transport; merely starting it does not configure an
 inbox or establish that supervised host workers are ready. Single-user host
 startup, Google connection/chat, exact scoped migrations, runtime secrets and
