@@ -3,9 +3,21 @@ defmodule EmailJanitor.Application do
   use Application
 
   def start(_, _) do
-    Supervisor.start_link([{Task.Supervisor, name: EmailJanitor.ExecutorSupervisor}],
-      strategy: :one_for_one,
-      name: EmailJanitor.Supervisor
-    )
+    children = [{Task.Supervisor, name: EmailJanitor.ExecutorSupervisor}]
+
+    if EmailJanitor.SelfHost.Config.enabled?() do
+      case EmailJanitor.SelfHost.Config.load() do
+        {:ok, config} ->
+          Supervisor.start_link(children ++ [{EmailJanitor.SelfHost.Supervisor, config}],
+            strategy: :one_for_one,
+            name: EmailJanitor.Supervisor
+          )
+
+        _ ->
+          {:error, :invalid_self_host_config}
+      end
+    else
+      Supervisor.start_link(children, strategy: :one_for_one, name: EmailJanitor.Supervisor)
+    end
   end
 end

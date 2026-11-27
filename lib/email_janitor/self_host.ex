@@ -17,6 +17,9 @@ defmodule EmailJanitor.SelfHost do
   defdelegate inbox(subject, id), to: Store
   defdelegate disconnect(subject, id), to: Store
 
+  defdelegate respond(subject, inbox, conversation, request, content),
+    to: EmailJanitor.SelfHost.Runtime
+
   @doc "Database-only authenticated host status; never calls a provider."
   def status(subject) do
     with {:ok, inboxes} <- inboxes(subject) do

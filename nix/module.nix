@@ -2,6 +2,7 @@
 let
   cfg = config.services.emailjanitor;
 in {
+  imports = [ ./google-token-module.nix ];
   options.services.emailjanitor = {
     enable = lib.mkEnableOption "the single-user Email Janitor service";
     package = lib.mkOption {
@@ -13,6 +14,21 @@ in {
       default = "/run/secrets/emailjanitor/environment";
       description = "Absolute runtime SOPS-decrypted environment file; never a Nix path or plaintext store value.";
     };
+    credentialKeyFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/secrets/emailjanitor/credential-key";
+      description = "Stable 32 raw-byte credential encryption key, decrypted by SOPS at runtime.";
+    };
+    webSecretFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/secrets/emailjanitor/web-secret";
+      description = "Stable runtime Phoenix signing secret of at least 64 bytes.";
+    };
+    googleClientFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/secrets/emailjanitor/google-client.json";
+      description = "Runtime Google Web OAuth client JSON with the exact public /auth/google/callback redirect.";
+    };
     bedrockModelId = lib.mkOption {
       type = lib.types.str;
       default = "amazon.nova-micro-v1:0";
@@ -22,7 +38,8 @@ in {
 
   config = lib.mkIf cfg.enable {
     assertions = [{
-      assertion = lib.hasPrefix "/run/" cfg.environmentFile;
+      assertion = builtins.all (path: lib.hasPrefix "/run/" path)
+        [ cfg.environmentFile cfg.credentialKeyFile cfg.webSecretFile cfg.googleClientFile ];
       message = "Email Janitor secrets must be supplied at a runtime /run path, not put into the Nix store.";
     }];
     users.groups.emailjanitor = {};
@@ -44,19 +61,31 @@ in {
         JANITOR_DATABASE_SOCKET = "/run/postgresql";
         JANITOR_DATABASE_NAME = "emailjanitor";
         JANITOR_DATABASE_USER = "emailjanitor";
+        JANITOR_ENABLE_SELF_HOST = "1";
+        JANITOR_CREDENTIAL_KEY_FILE = "%d/credential-key";
+        JANITOR_SECRET_KEY_BASE_FILE = "%d/web-secret";
+        JANITOR_GOOGLE_CLIENT_JSON_FILE = "%d/google-client.json";
         ERL_CRASH_DUMP = "/dev/null";
         RELEASE_TMP = "/run/emailjanitor/release";
         RELEASE_DISTRIBUTION = "none";
         AWS_REGION = "us-east-1";
         JANITOR_MODEL_PROVIDER = "bedrock";
         JANITOR_MODEL_ID = cfg.bedrockModelId;
+      } // lib.optionalAttrs config.services.emailjanitor-google-token.enable {
+        JANITOR_GOOGLE_TOKEN_FILE = "/run/emailjanitor-google-token/token.json";
       };
       serviceConfig = {
         Type = "simple";
         User = "emailjanitor";
         Group = "emailjanitor";
         ExecStart = "${cfg.package}/bin/email_janitor start";
+        ExecStartPre = "${cfg.package}/bin/email_janitor eval 'EmailJanitor.SelfHost.Release.migrate()'";
         EnvironmentFile = cfg.environmentFile;
+        LoadCredential = [
+          "credential-key:${cfg.credentialKeyFile}"
+          "web-secret:${cfg.webSecretFile}"
+          "google-client.json:${cfg.googleClientFile}"
+        ];
         WorkingDirectory = "/var/lib/emailjanitor";
         StateDirectory = "emailjanitor";
         StateDirectoryMode = "0700";

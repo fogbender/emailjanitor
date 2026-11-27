@@ -12,6 +12,13 @@
         imports = [ ./nix/module.nix ];
         services.emailjanitor.package =
           lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.emailjanitor;
+        services.emailjanitor-google-token.package =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.google-auth-bridge;
+      };
+      nixosModules.google-token = { lib, pkgs, ... }: {
+        imports = [ ./nix/google-token-module.nix ];
+        services.emailjanitor-google-token.package =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.google-auth-bridge;
       };
       packages = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
@@ -84,6 +91,9 @@
               true = is_pid(Process.whereis(EmailJanitor.Supervisor))
               true = File.regular?(Application.app_dir(:email_janitor, "priv/prompts/classify.txt"))
               true = Code.ensure_loaded?(EmailJanitor.Mail.SDK)
+              true = Code.ensure_loaded?(EmailJanitor.SelfHost.Web)
+              true = Code.ensure_loaded?(EmailJanitor.SelfHostWeb.Endpoint)
+              true = File.regular?(Application.app_dir(:email_janitor, "priv/static/selfhost.js"))
             '
             python3 ${./scripts/check-release-cookie.py} \
               ${self.packages.${system}.emailjanitor} email_janitor ${pkgs.coreutils}/bin/base64

@@ -19,10 +19,12 @@ inside an optional module.
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
 | 12 | Staged digest action headers | `Digest.install_staging/1` |
+| 13 | Authenticated incoming feedback metadata | Feedback installer (in development) |
 | 100 | Opt-in single-user owner and encrypted bindings | `SelfHost.Store.install/1` |
 | 101 | Single-user browser attempts and sessions | `SelfHost.Web.install/1` (in development) |
+| 102 | Single-user authenticated manual retry authority | Single-user release migrator |
 
 Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's
 global `public` schema has its own independent registry and migration table.
-Versions 100–101 apply only to the opt-in fixed `ej_selfhost` scope.
+Versions 100–102 apply only to the opt-in fixed `ej_selfhost` scope.
