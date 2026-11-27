@@ -243,7 +243,7 @@ defmodule EmailJanitor.Jobs do
           definition.timeout_ms
         )
 
-      checkpoint(conf.name, job, result)
+      checkpoint(conf.name, job, result, definition)
     else
       _ -> {:cancel, :invalid_job}
     end
@@ -253,7 +253,7 @@ defmodule EmailJanitor.Jobs do
     _, _ -> {:snooze, 60}
   end
 
-  defp checkpoint(name, job, result) do
+  defp checkpoint(name, job, result, definition) do
     conf = Oban.config(name)
 
     case conf.repo.transaction(
@@ -269,6 +269,9 @@ defmodule EmailJanitor.Jobs do
                  :ok
 
                {metadata, delay, failed?} ->
+                 # This trusted host callback is DB-only. The job-row lock also
+                 # serializes it with deletion's metadata purge.
+                 metadata = guarded_metadata(conf.repo, definition, metadata)
                  repair? = current.args["repair"] == true
                  wake? = current.args["wake"] == true and (not failed? or repair?)
 
@@ -292,6 +295,18 @@ defmodule EmailJanitor.Jobs do
          ) do
       {:ok, result} -> result
       _ -> {:snooze, 60}
+    end
+  end
+
+  defp guarded_metadata(repo, definition, metadata) do
+    guard = Map.get(definition, :metadata_guard, fn marker -> {:ok, marker} end)
+
+    case guard.(metadata) do
+      {:ok, marker} ->
+        if valid_marker?(marker), do: marker, else: repo.rollback(:invalid_job_metadata)
+
+      _ ->
+        repo.rollback(:invalid_job_metadata)
     end
   end
 
@@ -361,7 +376,9 @@ defmodule EmailJanitor.Jobs do
     Enum.all?(tasks, fn {name, definition} ->
       valid_key?(name) and is_function(definition[:run], 1) and
         is_integer(definition[:timeout_ms]) and definition.timeout_ms in 1..1_200_000 and
-        is_atom(Map.get(definition, :queue, :mail))
+        is_atom(Map.get(definition, :queue, :mail)) and
+        (not Map.has_key?(definition, :metadata_guard) or
+           is_function(definition.metadata_guard, 1))
     end)
   end
 
