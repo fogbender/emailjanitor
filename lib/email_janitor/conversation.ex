@@ -36,6 +36,7 @@ defmodule EmailJanitor.Conversation do
 
   defp plan(ctx, request_id, request, snapshot, pending) do
     previous = pending || Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id)
+    ctx = %{ctx | model: Keyword.put(ctx.model, :previous_effects, previous_effects(previous))}
 
     evidence =
       case previous do
@@ -100,7 +101,7 @@ defmodule EmailJanitor.Conversation do
              request_id,
              proposal,
              selected,
-             ctx.guard
+             fn -> admit_plan(ctx, request_id, proposal.operation, selected) end
            ) do
       if receipt.completed do
         {:ok, Outcome.render(receipt, snapshot)}
@@ -164,10 +165,10 @@ defmodule EmailJanitor.Conversation do
         {:cont, :ok}
       else
         ids = Enum.map(remaining, & &1.message_id)
-        opts = execution_options(ctx) |> Keyword.put(:cleanup_target_ids, ids)
 
         result =
-          with :ok <- ctx.guard.(),
+          with {:ok, opts} <- cleanup_options(ctx, remaining, ids),
+               :ok <- ctx.guard.(),
                {:ok, proposal} <-
                  Executor.review(
                    ctx.scope,
@@ -323,6 +324,51 @@ defmodule EmailJanitor.Conversation do
   defp execution_options(ctx),
     do:
       ctx.execution_options |> Keyword.put(:policy, ctx.policy) |> Keyword.put(:guard, ctx.guard)
+
+  defp admit_plan(ctx, request_id, operation, refs) do
+    with :ok <- ctx.guard.() do
+      case Keyword.get(ctx.execution_options, :on_plan_admitted) do
+        nil -> :ok
+        callback when is_function(callback, 3) -> callback.(request_id, operation, refs)
+        _ -> {:error, :invalid_plan_hook}
+      end
+    end
+  end
+
+  defp cleanup_options(ctx, refs, ids) do
+    policy =
+      case Keyword.get(ctx.execution_options, :policy_for_references) do
+        nil -> ctx.policy
+        factory when is_function(factory, 1) -> factory.(refs)
+      end
+
+    case policy do
+      %EmailJanitor.Policy{} ->
+        {:ok,
+         execution_options(ctx)
+         |> Keyword.put(:policy, policy)
+         |> Keyword.put(:cleanup_target_ids, ids)}
+
+      _ ->
+        {:error, :policy_unavailable}
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  catch
+    _, _ -> {:error, :policy_unavailable}
+  end
+
+  defp previous_effects(nil), do: nil
+
+  defp previous_effects(receipt) do
+    %{
+      "operation" => Atom.to_string(receipt.operation),
+      "preference_scope" => Atom.to_string(receipt.preference_target),
+      "preference_status" => Atom.to_string(receipt.preference_status),
+      "completed" => receipt.completed,
+      "results" => Enum.map(receipt.results, &Map.take(&1, ["reference", "status"]))
+    }
+  end
 
   defp effect_id(request_id, action_id) do
     <<a::48, _::4, b::12, _::2, c::62, _::binary>> =

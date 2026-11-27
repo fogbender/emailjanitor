@@ -38,6 +38,7 @@ defmodule EmailJanitor.Conversation.Planner do
              "inbox" => Enum.map(instructions.inbox, &instruction/1)
            },
            "USER_MESSAGE" => Content.read(request),
+           "PREVIOUS_EFFECTS" => Keyword.get(opts, :previous_effects),
            "SEARCH_RESULTS" => Enum.map(references, &reference/1),
            "SEARCH_TRUNCATED" => truncated,
            "UNTRUSTED_EMAILS" => Enum.map(messages, &message(&1, references))

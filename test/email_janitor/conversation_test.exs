@@ -211,4 +211,77 @@ defmodule EmailJanitor.ConversationTest do
     assert {:ok, _} = Conversation.respond(ctx, id, Content.new("retry"))
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
+
+  test "manual-origin admission is transactional and the trusted reference policy cannot be bypassed",
+       t do
+    ctx = context(t.ctx, target: :none, instruction: "")
+    observer = self()
+
+    policy = fn refs ->
+      assert Enum.map(refs, & &1.message_id) == ["message-1"]
+      assert Enum.all?(refs, &(not Map.has_key?(&1, :body)))
+      %Policy{adapter: EmailJanitor.ConversationFixtureBlockedPolicy, context: ctx.scope}
+    end
+
+    admitted = fn id, operation, refs ->
+      assert TestRepo.in_transaction?()
+      send(observer, {:manual_origin, id, operation, Enum.map(refs, & &1.message_id)})
+      :ok
+    end
+
+    id = Ecto.UUID.generate()
+    ctx = %{ctx | execution_options: [on_plan_admitted: admitted, policy_for_references: policy]}
+    assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Mark that offer Done"))
+    assert_receive {:manual_origin, ^id, :done, ["message-1"]}
+    assert Content.read(reply) =~ "$3/month"
+    assert Agent.get(t.state, & &1.calls) == []
+
+    failed = fn _, _, _ ->
+      TestRepo.update_all(EmailJanitor.Store.Mailbox, [set: [instruction_version: 99]],
+        prefix: ctx.scope.prefix
+      )
+
+      {:error, :manual_origin_unavailable}
+    end
+
+    ctx = %{ctx | execution_options: [on_plan_admitted: failed]}
+    assert {:error, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Try again"))
+    assert {:ok, 1} = Store.instruction_version(ctx.scope, ctx.inbox.id)
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "follow-up planning receives prior effect facts without retaining the user conversation",
+       t do
+    ctx = context(t.ctx)
+
+    assert {:ok, _} =
+             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("PRIVATE_FIRST_TURN"))
+
+    script = fn _refs, _messages, opts ->
+      previous = opts[:previous_effects]
+      assert previous["operation"] == "done"
+      assert previous["preference_status"] == "updated"
+      assert Enum.map(previous["results"], & &1["status"]) == ["done"]
+      refute Jason.encode!(previous) =~ "PRIVATE_FIRST_TURN"
+
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new("The earlier action was confirmed."),
+         search_complete: true
+       }}
+    end
+
+    ctx = %{ctx | model: [script: script]}
+
+    assert {:ok, reply} =
+             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("What happened?"))
+
+    assert Content.read(reply) == "The earlier action was confirmed."
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
 end

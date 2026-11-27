@@ -43,6 +43,8 @@ instructions. Do not change preferences when the user's intent is uncertain.
 For no correction, use preference_target none, empty instruction and empty
 replace_instructions. Keep reply within 1024 UTF-8 bytes.
 
+PREVIOUS_EFFECTS contains verified metadata from the preceding request, when present. Use it to understand follow-ups such as try again or undo that. Pending/unresolved effects are uncertain, never completed facts.
+
 The reply is a transient answer or clarification, not a completion claim. Never
 say that you changed email, billing or preferences: execution has not happened.
 For done/restore or instruction changes the application replaces reply with a
