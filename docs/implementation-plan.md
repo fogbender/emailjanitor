@@ -128,12 +128,20 @@ per-inbox identity configuration, not model-editable prompt text; migrate Andrei
 hello/support relays at cutover. Sanitized mistakes become regression fixtures.
 Never copy live mailbox bodies or credentials into the MIT repository or fixtures.
 
-TNA inspiration, read-only: service/mix.exs, AGENTS.md, infra/nixos/README.md,
-infra/aws/README.md, and infra/azure/README.md under ~/src/tna. Reuse the principles
-of small functional modules, OTP supervision, Ash where domain actions need it,
-PostgreSQL, Oban jobs, Nix builds, SOPS, and separate host/app deployment. Do not
-copy its business code, deployment controller, private credentials, Azure resource
-identifiers, paid vendored libraries, or unrelated blue/green machinery.
+The private SaaS starts from a fresh copy of TNA's actual controller foundation:
+LiveView shell, direct Oban Pro supervision, private deployment/operator UI and
+blue/green target protocol. Record exact source paths and the reference commit;
+adapt product auth, role/node identity, worker handoff and current security fixes.
+Read and copy from ~/src/tna without modifying TNA itself. Keep verified Janitor
+engine/domain logic and tests; do not carry the previous application/runtime/job
+registry shell into the fresh SaaS foundation. Product auth uses Google sessions;
+Tailscale identity belongs only to the separate private operator app.
+
+TNA's licensed vendored Oban Pro and deployment code may be copied into the
+PRIVATE repository only. The MIT engine/reference host uses OSS Oban and contains
+no commercial Pro source. Never copy credentials, host inventories, live bodies,
+cloud resource identifiers or unrelated TNA business features. This explicit
+copy/restart direction replaces the earlier inspiration-only restriction.
 
 ## Repository and application structure
 
@@ -506,7 +514,7 @@ No Outlook, new email client, scheduling assistant, arbitrary send-as-user tool,
 annual pricing, customer CLI subscription authentication, configurable digest
 schedule, per-email chat UI, self-hosted multitenancy, account-group merging,
 old-inbox bulk cleanup on first connection, body archive, custom provider protocol,
-general-purpose deployment controller, or parallel Python/Elixir mailbox writers.
+new generic deployment controller, or parallel Python/Elixir mailbox writers.
 
 ## Reference constraints
 
