@@ -92,7 +92,6 @@ defmodule EmailJanitor.ContentTest do
     for attrs <- [
           "hidden",
           "hidden='false'",
-          "aria-hidden='true'",
           "style='display:none'",
           "style='DISPLAY : NONE !important; color:red'",
           "style='color:red; visibility: hidden'"
@@ -106,6 +105,37 @@ defmodule EmailJanitor.ContentTest do
       assert Content.read(result) =~ "Visible development pitch"
       refute Content.read(result) =~ "HIDDEN_SENTINEL"
       refute Content.read(result) =~ "hidden.example.com"
+    end
+  end
+
+  test "accessibility hints and explicitly visible hidden elements keep their text" do
+    for attrs <- [
+          "aria-hidden='true'",
+          "hidden style='display:block'",
+          "hidden style='display:inline !important'",
+          "style='display:none;display:block'",
+          "style='display:block!important;display:none'"
+        ] do
+      assert {:ok, result} = HTML.readable(Content.new("<p #{attrs}>Visible pitch</p>"))
+      assert Content.read(result) == "Visible pitch"
+    end
+  end
+
+  test "comments and common hidden preheaders are removed before the text budget" do
+    for style <- [
+          "/*comment*/display:none",
+          "display:/*comment*/none",
+          "opacity:0",
+          "mso-hide:all",
+          "max-height:0px;overflow:hidden",
+          "display:none!important;display:block"
+        ] do
+      source =
+        "<div style='#{style}'>" <>
+          String.duplicate("HIDDEN_SENTINEL", 5000) <> "</div><p>Visible pitch</p>"
+
+      assert {:ok, result} = HTML.readable(Content.new(source), 100)
+      assert Content.read(result) == "Visible pitch"
     end
   end
 
