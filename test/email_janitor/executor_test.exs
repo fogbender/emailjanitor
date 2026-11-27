@@ -167,6 +167,21 @@ defmodule EmailJanitor.ExecutorTest do
     assert {:existing, _, :unresolved} = execute(ctx)
   end
 
+  test "reconciliation cannot cancel a mutation still in flight", ctx do
+    before = fn ->
+      [%Action{id: id, state: :intent}] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+
+      assert {:error, :state_changed} =
+               Store.reconcile(ctx.scope, ctx.inbox.id, id, %{complete?: true, events: []})
+    end
+
+    assert {:done, id} = execute(ctx, before: before)
+    assert %Action{state: :done} = Store.get(ctx.scope, ctx.inbox.id, id)
+    Agent.update(ctx.state, &%{&1 | messages: [message()]})
+    assert {:existing, ^id, :done} = execute(ctx)
+    assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+  end
+
   test "record IDs are scoped by both schema and inbox", ctx do
     assert {:done, id} = execute(ctx)
     assert nil == Store.get(ctx.other, ctx.inbox.id, id)
