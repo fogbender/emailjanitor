@@ -19,6 +19,7 @@ inside an optional module.
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement/deferred provenance ledger | `Worker.install/1` |
 | 12 | Staged digest action headers | `Digest.install_staging/1` |
+| 13 | Body-free incoming feedback/reply receipts | Feedback installer (in development) |
 
 Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's

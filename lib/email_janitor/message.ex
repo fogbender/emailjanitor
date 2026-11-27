@@ -3,7 +3,17 @@ defmodule EmailJanitor.Message do
   alias EmailJanitor.Content
   @enforce_keys [:id, :thread_id, :headers, :labels]
   @derive {Inspect, only: [:id, :thread_id, :labels]}
-  defstruct [:id, :thread_id, :headers, :labels, :received_at, :cleanup_target, body: nil]
+  defstruct [
+    :id,
+    :thread_id,
+    :headers,
+    :labels,
+    :received_at,
+    :cleanup_target,
+    :feedback_format,
+    body: nil
+  ]
+
   @type t :: %__MODULE__{}
 
   def header(%__MODULE__{headers: headers}, name) do

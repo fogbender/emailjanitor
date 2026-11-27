@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../bridge/reply-parser"
+npm ci --ignore-scripts --no-audit --no-fund
+node --check parser.mjs
+node --check cli.mjs
+npm test
+npm audit
