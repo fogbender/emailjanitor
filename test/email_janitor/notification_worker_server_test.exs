@@ -56,7 +56,7 @@ defmodule EmailJanitor.NotificationWorkerServerTest do
     monitor = Process.monitor(task)
     assert_receive {:DOWN, ^monitor, :process, ^task, reason}, 1_000
     assert reason in [:killed, :noproc]
-    state = :sys.get_state(server)
+    state = await_state(server, &(&1.running == nil and &1.attempts == 1))
     assert state.running == nil and state.attempts == 1
     refute_receive {:polling, _}, 100
   end
@@ -80,7 +80,7 @@ defmodule EmailJanitor.NotificationWorkerServerTest do
 
         assert_receive :called, 1_000
         refute_receive :wake, 50
-        state = :sys.get_state(server)
+        state = await_state(server, &(&1.running == nil and &1.attempts == 1))
         assert state.attempts == 1 and state.running == nil
       end)
 
@@ -102,7 +102,27 @@ defmodule EmailJanitor.NotificationWorkerServerTest do
       )
 
     assert_receive :polled_disconnected, 1_000
+    await_state(server, &is_nil(&1.running))
     refute_receive :incorrect_cleanup_wake, 100
     assert :sys.get_state(server).attempts == 0
+  end
+
+  defp await_state(server, predicate),
+    do: await_state(server, predicate, System.monotonic_time(:millisecond) + 2_000)
+
+  defp await_state(server, predicate, deadline) do
+    state = :sys.get_state(server)
+
+    cond do
+      predicate.(state) ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("notification task did not settle")
+
+      true ->
+        Process.sleep(1)
+        await_state(server, predicate, deadline)
+    end
   end
 end

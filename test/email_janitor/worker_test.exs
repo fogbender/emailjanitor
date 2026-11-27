@@ -1413,45 +1413,55 @@ defmodule EmailJanitor.WorkerTest do
     refute "INBOX" in new.labels
   end
 
-  test "unreadable manual/backlog threads use metadata probes and do not block healthy arrivals",
-       ctx do
-    id = manual_candidate(ctx)
-    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
-    Agent.update(ctx.quota, &%{&1 | block: nil})
+  for reason <- [
+        :invalid_thread,
+        :invalid_message,
+        :invalid_mime,
+        :invalid_headers,
+        :invalid_date
+      ] do
+    test "unreadable #{reason} manual/backlog threads use metadata probes and do not block healthy arrivals",
+         ctx do
+      id = manual_candidate(ctx)
+      assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+      Agent.update(ctx.quota, &%{&1 | block: nil})
 
-    Agent.update(
-      ctx.state,
-      &%{
-        &1
-        | messages: &1.messages ++ [Fixtures.message(id: "healthy", thread_id: "thread-2")],
-          arrivals: %{"100" => %{through: "101", ids: ["healthy"]}}
+      Agent.update(
+        ctx.state,
+        &%{
+          &1
+          | messages: &1.messages ++ [Fixtures.message(id: "healthy", thread_id: "thread-2")],
+            arrivals: %{"100" => %{through: "101", ids: ["healthy"]}}
+        }
+      )
+
+      config = %{
+        ctx.config
+        | allow_manual_recheck: fn _, _ -> :ok end,
+          gmail:
+            {Gmail,
+             [state: ctx.state, thread_failures: ["thread-1"], thread_error: unquote(reason)]}
       }
-    )
 
-    config = %{
-      ctx.config
-      | allow_manual_recheck: fn _, _ -> :ok end,
-        gmail: {Gmail, [state: ctx.state, thread_failures: ["thread-1"]]}
-    }
+      before = read(ctx.state)
+      assert {:ok, %{status: :deferred}} = Worker.step(config)
+      assert read(ctx.state).model_inputs == before.model_inputs
+      assert [%Deferral{status: :unreadable}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
+      assert {:ok, %{status: :done}} = Worker.step(config)
+      assert read(ctx.state).mutations == [["healthy"]]
+      before = read(ctx.state)
+      advance(ctx.clock, 901)
+      assert {:ok, %{status: :deferred}} = Worker.step(config)
+      assert read(ctx.state).model_inputs == before.model_inputs
 
-    before = read(ctx.state)
-    assert {:ok, %{status: :deferred}} = Worker.step(config)
-    assert read(ctx.state).model_inputs == before.model_inputs
-    assert [%Deferral{status: :unreadable}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
-    assert {:ok, %{status: :done}} = Worker.step(config)
-    assert read(ctx.state).mutations == [["healthy"]]
-    before = read(ctx.state)
-    advance(ctx.clock, 901)
-    assert {:ok, %{status: :deferred}} = Worker.step(config)
-    assert read(ctx.state).model_inputs == before.model_inputs
+      assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) ==
+               Enum.count(before.calls, &(&1 == :full_thread))
 
-    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) ==
-             Enum.count(before.calls, &(&1 == :full_thread))
-
-    Agent.update(ctx.state, &%{&1 | revision: "revision-repaired"})
-    advance(ctx.clock, 901)
-    assert {:ok, %{status: :done}} = Worker.step(%{config | gmail: ctx.config.gmail})
-    assert read(ctx.state).mutations == [["healthy"], ["message-1"]]
+      Agent.update(ctx.state, &%{&1 | revision: "revision-repaired"})
+      advance(ctx.clock, 901)
+      assert {:ok, %{status: :done}} = Worker.step(%{config | gmail: ctx.config.gmail})
+      assert read(ctx.state).mutations == [["healthy"], ["message-1"]]
+    end
   end
 
   for mode <- [:keep, :invalid] do
@@ -1561,6 +1571,29 @@ defmodule EmailJanitor.WorkerTest do
                )
       end
     end
+  end
+
+  test "arrival provenance changed at final admission is a connection change, never a policy outage",
+       ctx do
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             history_hook: fn ->
+               {:ok, cp} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+
+               assert {:ok, :ok} =
+                        Ingestion.mark_processed(ctx.scope, ctx.box, cp.generation, ["message-1"])
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :connection_changed}} = Worker.step(config)
+    assert read(ctx.state).mutations == []
+    assert read(ctx.quota).calls == []
+    assert Repo.all(Action, prefix: ctx.scope.prefix) == []
   end
 
   defp manual_candidate(ctx) do

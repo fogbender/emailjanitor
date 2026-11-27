@@ -55,8 +55,12 @@ defmodule EmailJanitor.Worker.Gate do
          do: EmailJanitor.Worker.Config.recheck(config, source)
   end
 
-  defp proof(%{config: config, eligible: eligible, proposal: proposal}),
-    do: Ingestion.authorize_proposal(config.scope, config.inbox, eligible, proposal)
+  defp proof(%{config: config, eligible: eligible, proposal: proposal}) do
+    case Ingestion.authorize_proposal(config.scope, config.inbox, eligible, proposal) do
+      :ok -> :ok
+      _ -> {:error, :connection_changed}
+    end
+  end
 
   @impl true
   def settle(%{config: config}, inbox_id, action_id, result),
