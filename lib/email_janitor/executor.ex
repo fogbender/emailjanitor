@@ -32,38 +32,115 @@ defmodule EmailJanitor.Executor do
         version,
         opts \\ []
       ) do
-    if scope.repo.in_transaction?() do
-      {:error, :outer_transaction}
+    if Keyword.keyword?(opts) do
+      {result, _policy} =
+        review_with_context(
+          scope,
+          inbox,
+          thread_id,
+          {gmail, options},
+          classifier,
+          instructions,
+          version,
+          Keyword.delete(opts, :context_factory)
+        )
+
+      result
     else
-      Owner.run(fn ->
-        with {:ok, {context, current}} <-
-               fetch_review(scope, inbox, thread_id, gmail, options, version, opts),
-             {:ok, contacted} <- current_contacts(context, current, gmail, options) do
-          restored = Store.restored_ids(scope, inbox.id)
+      {:error, :executor_unavailable}
+    end
+  end
 
-          result =
-            if exact_inbox_ids(current) == [],
-              do: {:keep, :no_matching_inbox_messages},
-              else:
-                Reviewer.review(
-                  current,
-                  inbox,
-                  contacted,
-                  classifier,
-                  instructions,
-                  version,
-                  restored,
-                  context.opts
-                )
-
-          case result do
-            {:ok, proposal} -> {:ok, %{proposal | review_started_at: context.started_at}}
-            {:keep, :unreadable_content} -> result
-            {:keep, reason} -> retire_keep(context, reason)
-            result -> result
+  @doc """
+  Review with a trusted, transient policy derived from the already fetched thread.
+  `context_factory` is a pure host callback accepting fresh messages and returning
+  `{:ok, %Policy{}}`. Extract only needed metadata; never retain bodies. It runs
+  outside database locks, before contacts/classification and Keep retirement.
+  Returns `{normal_review_result, derived_policy}`. A failure before a policy is
+  derived returns `{error, nil}` and never falls back to admission with the base.
+  Legacy `review/8` ignores this callback and keeps its existing return contract.
+  """
+  def review_with_context(
+        scope,
+        %Inbox{} = inbox,
+        thread_id,
+        {gmail, options},
+        classifier,
+        instructions,
+        version,
+        opts
+      ) do
+    if scope.repo.in_transaction?() do
+      {{:error, :outer_transaction}, nil}
+    else
+      result =
+        Owner.run(fn ->
+          with {:ok, {context, current}} <-
+                 fetch_review(scope, inbox, thread_id, gmail, options, version, opts),
+               {:ok, context} <- derive_policy(context, current) do
+            reviewed = review_current(context, current, gmail, options, classifier, instructions)
+            {:context_review, reviewed, Keyword.get(context.opts, :policy, Policy.unlimited())}
+          else
+            error -> {:context_review, error, nil}
           end
+        end)
+
+      case result do
+        {:context_review, reviewed, policy} -> {reviewed, policy}
+        {:error, _} = error -> {error, nil}
+        _ -> {{:error, :executor_unavailable}, nil}
+      end
+    end
+  end
+
+  defp derive_policy(context, current) do
+    case Keyword.fetch(context.opts, :context_factory) do
+      :error ->
+        {:ok, context}
+
+      {:ok, factory} when is_function(factory, 1) ->
+        case factory.(current) do
+          {:ok, %Policy{} = policy} ->
+            {:ok, %{context | opts: Keyword.put(context.opts, :policy, policy)}}
+
+          _ ->
+            {:error, :policy_unavailable}
         end
-      end)
+
+      _ ->
+        {:error, :policy_unavailable}
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  catch
+    _, _ -> {:error, :policy_unavailable}
+  end
+
+  defp review_current(context, current, gmail, options, classifier, instructions) do
+    with {:ok, contacted} <- current_contacts(context, current, gmail, options) do
+      restored = Store.restored_ids(context.scope, context.inbox.id)
+
+      result =
+        if exact_inbox_ids(current) == [],
+          do: {:keep, :no_matching_inbox_messages},
+          else:
+            Reviewer.review(
+              current,
+              context.inbox,
+              contacted,
+              classifier,
+              instructions,
+              context.version,
+              restored,
+              context.opts
+            )
+
+      case result do
+        {:ok, proposal} -> {:ok, %{proposal | review_started_at: context.started_at}}
+        {:keep, :unreadable_content} -> result
+        {:keep, reason} -> retire_keep(context, reason)
+        result -> result
+      end
     end
   end
 
@@ -104,6 +181,12 @@ defmodule EmailJanitor.Executor do
   end
 
   defp current_contacts(context, current, gmail, options) do
+    with {:ok, current} <- Reviewer.filter_self_mail(current, context.opts) do
+      contact_filtered(context, current, gmail, options)
+    end
+  end
+
+  defp contact_filtered(context, current, gmail, options) do
     if exact_inbox_ids(current) == [] do
       {:ok, MapSet.new()}
     else
@@ -152,12 +235,18 @@ defmodule EmailJanitor.Executor do
              proposal.instruction_version,
              opts
            ),
-         {:ok, contacted} <- current_contacts(context, current, gmail, options) do
+         {:ok, contacted} <- current_contacts(context, current, gmail, options),
+         {:ok, safeguard_messages} <- Reviewer.filter_self_mail(current, context.opts) do
       reason =
         if exact_inbox_ids(current) == [],
           do: {:keep, :no_matching_inbox_messages},
           else:
-            Safeguards.evaluate(current, inbox, contacted, Store.restored_ids(scope, inbox.id))
+            Safeguards.evaluate(
+              safeguard_messages,
+              inbox,
+              contacted,
+              Store.restored_ids(scope, inbox.id)
+            )
 
       case reason do
         {:keep, reason} ->
@@ -381,6 +470,9 @@ defmodule EmailJanitor.Executor do
     case fun.() do
       {:ok, _} = result ->
         result
+
+      {:error, :thread_not_found} = error ->
+        error
 
       {:error, reason}
       when reason in [

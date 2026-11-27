@@ -2,6 +2,9 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
   @moduledoc false
   import Ecto.Query, except: [update: 2, update: 3]
   alias EmailJanitor.Mail.Feedback.Record
+  # Shared Receiver's 1,100s watchdog exceeds Sent readback + the 900s core
+  # conversation + reply dispatch; keep its durable claim beyond that budget.
+  @claim_lease_seconds 1200
 
   def get(scope, id), do: scope.repo.get(Record, id, prefix: scope.prefix)
 
@@ -17,6 +20,52 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
        else: {:error, :feedback_reference_conflict}
   end
 
+  # These are abuse/resource ceilings for unverified SMTP hints, not product
+  # suppression allowances. A failed DMARC verdict is rejected even earlier.
+  def admit(scope, %Record{kind: :feedback} = row) do
+    case scope.repo.transaction(fn ->
+           Ecto.Adapters.SQL.query!(
+             scope.repo,
+             "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+             ["feedback-admission:" <> scope.prefix],
+             log: false
+           )
+
+           if get(scope, row.id) do
+             insert(scope, row)
+           else
+             now = DateTime.utc_now()
+
+             pending =
+               from(r in Record,
+                 where:
+                   r.kind == :feedback and
+                     r.state in [
+                       :pending,
+                       :processing,
+                       :waiting_sent,
+                       :workflow_retry,
+                       :reply_pending
+                     ] and
+                     ((is_nil(r.authenticated_at) and r.expires_at > ^now) or
+                        (not is_nil(r.authenticated_at) and
+                           r.authenticated_at > ^DateTime.add(now, -3600)))
+               )
+
+             sender = from(r in pending, where: r.sender_inbox_id == ^row.sender_inbox_id)
+
+             if scope.repo.aggregate(sender, :count, prefix: scope.prefix) >= 20 or
+                  scope.repo.aggregate(pending, :count, prefix: scope.prefix) >= 1000,
+                do: scope.repo.rollback(:feedback_rate_limited)
+
+             insert(scope, row)
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   def due(scope, now) do
     scope.repo.one(
       from(r in Record,
@@ -24,11 +73,34 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
           (r.state in [:pending, :waiting_sent, :workflow_retry, :reply_pending] and
              (is_nil(r.next_attempt_at) or r.next_attempt_at <= ^now)) or
             (r.state == :processing and r.lease_until < ^now),
-        order_by: [asc: r.inserted_at, asc: r.id],
+        order_by: [asc_nulls_last: r.authenticated_at, asc: r.inserted_at, asc: r.id],
         limit: 1
       ),
       prefix: scope.prefix
     )
+  end
+
+  def claim_next(scope, now) do
+    case scope.repo.transaction(fn ->
+           query =
+             from(r in Record,
+               where:
+                 (r.state in [:pending, :waiting_sent, :workflow_retry, :reply_pending] and
+                    (is_nil(r.next_attempt_at) or r.next_attempt_at <= ^now)) or
+                   (r.state == :processing and r.lease_until < ^now),
+               order_by: [asc_nulls_last: r.authenticated_at, asc: r.inserted_at, asc: r.id],
+               limit: 1,
+               lock: "FOR UPDATE SKIP LOCKED"
+             )
+
+           case scope.repo.one(query, prefix: scope.prefix) do
+             nil -> :idle
+             row -> claim(scope, row.id, now)
+           end
+         end) do
+      {:ok, result} -> result
+      _ -> {:error, :feedback_unavailable}
+    end
   end
 
   def claim(scope, id, now) do
@@ -53,7 +125,7 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
                set: [
                  state: :processing,
                  claim_id: token,
-                 lease_until: DateTime.add(now, 1000),
+                 lease_until: DateTime.add(now, @claim_lease_seconds),
                  updated_at: now
                ]
              ],
@@ -100,14 +172,65 @@ defmodule EmailJanitor.Mail.Feedback.Ledger do
   def purge(scope, now) do
     cutoff = DateTime.add(now, -7 * 86400)
 
-    ids =
+    query =
       from(r in Record,
-        where: r.inserted_at < ^cutoff and r.state != :processing,
+        where:
+          r.inserted_at < ^cutoff and
+            (r.state != :processing or is_nil(r.lease_until) or r.lease_until < ^now),
         limit: 1000,
-        select: r.id
+        lock: "FOR UPDATE SKIP LOCKED",
+        select: {r.id, r.kind, r.sender_inbox_id}
       )
 
-    scope.repo.delete_all(from(r in Record, where: r.id in subquery(ids)), prefix: scope.prefix)
-    :ok
+    result =
+      scope.repo.transaction(fn ->
+        rows = scope.repo.all(query, prefix: scope.prefix)
+        ids = Enum.map(rows, &elem(&1, 0))
+        # Signup recipients have no Google identity/actions. Remove their exact old
+        # reply metadata first, then the unused synthetic transport-only mailbox.
+
+        for inbox_id <-
+              rows
+              |> Enum.flat_map(fn {_, kind, inbox} ->
+                if kind == :signup, do: [inbox], else: []
+              end)
+              |> Enum.uniq()
+              |> Enum.sort() do
+          scope.repo.one(
+            from(m in EmailJanitor.Store.Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+            prefix: scope.prefix
+          )
+        end
+
+        for {id, :signup, inbox_id} <- rows do
+          scope.repo.delete_all(
+            from(o in EmailJanitor.Mail.Outgoing,
+              where: o.inbox_id == ^inbox_id and o.kind == :assistant and o.dedupe_id == ^id
+            ),
+            prefix: scope.prefix
+          )
+        end
+
+        scope.repo.delete_all(from(r in Record, where: r.id in ^ids), prefix: scope.prefix)
+
+        for {_, :signup, inbox_id} <- rows do
+          unless scope.repo.exists?(from(r in Record, where: r.sender_inbox_id == ^inbox_id),
+                   prefix: scope.prefix
+                 ) or
+                   scope.repo.exists?(
+                     from(o in EmailJanitor.Mail.Outgoing, where: o.inbox_id == ^inbox_id),
+                     prefix: scope.prefix
+                   ) do
+            scope.repo.delete_all(from(m in EmailJanitor.Store.Mailbox, where: m.id == ^inbox_id),
+              prefix: scope.prefix
+            )
+          end
+        end
+      end)
+
+    case result do
+      {:ok, _} -> :ok
+      _ -> {:error, :feedback_cleanup_unavailable}
+    end
   end
 end

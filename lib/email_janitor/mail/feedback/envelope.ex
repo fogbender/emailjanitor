@@ -7,6 +7,7 @@ defmodule EmailJanitor.Mail.Feedback.Envelope do
 
   def new(%Incoming{} = incoming, %Content{} = raw, expected_recipient) do
     with true <- expected_recipient in incoming.recipients,
+         false <- incoming.verdicts["dmarcVerdict"] == "FAIL",
          false <- incoming.envelope_from == "",
          {:ok, headers} <- headers(Content.read(raw)),
          {:ok, [from]} <- Address.parse(one(headers, "from")),
@@ -25,12 +26,14 @@ defmodule EmailJanitor.Mail.Feedback.Envelope do
          ses_id: incoming.id,
          from: from,
          rfc_message_id: rfc_id,
-         received_at: DateTime.add(incoming.expires_at, -3600),
+         received_at:
+           DateTime.add(incoming.expires_at, -EmailJanitor.Mail.Spool.processing_ttl_seconds()),
          expires_at: incoming.expires_at,
          signup_allowed: allowed
        }}
     else
       false -> :ignored
+      true -> :ignored
       _ -> :rejected
     end
   rescue
