@@ -101,31 +101,72 @@ defmodule EmailJanitor.Store do
           prefix: scope.prefix
         )
 
-      if existing do
-        {:existing, existing}
-      else
-        review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
-        evaluated_ids = Proposal.evaluated_ids(proposal)
+      review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
+      evaluated_ids = Proposal.evaluated_ids(proposal)
 
-        # A later review may have blocked a larger batch while this executor was
-        # fetching Gmail history. Never let its older subset bypass that decision.
-        newer_candidate? =
-          scope.repo.exists?(
-            from(c in Candidate,
-              where:
-                c.inbox_id == ^inbox_id and c.updated_at > ^review_started_at and
-                  fragment(
-                    "COALESCE(?, ?) && ?::text[]",
-                    c.evaluated_message_ids,
-                    c.message_ids,
-                    ^evaluated_ids
-                  )
-            ),
-            prefix: scope.prefix
+      # Every accepted evaluation is authoritative, including Keep targets when
+      # its Done subset already belongs to a durable action. Older retries may
+      # still settle that action, but must not overwrite newer review evidence.
+      newer_candidate? =
+        scope.repo.exists?(
+          from(c in Candidate,
+            where:
+              c.inbox_id == ^inbox_id and c.updated_at > ^review_started_at and
+                fragment(
+                  "COALESCE(?, ?) && ?::text[]",
+                  c.evaluated_message_ids,
+                  c.message_ids,
+                  ^evaluated_ids
+                )
+          ),
+          prefix: scope.prefix
+        )
+
+      stale? =
+        newer_candidate? or newer_review?(scope, inbox_id, evaluated_ids, review_started_at)
+
+      if existing do
+        unless stale? do
+          policy = Keyword.get(opts, :policy, Policy.unlimited())
+
+          retire_overlapping_candidates(
+            scope,
+            inbox_id,
+            existing,
+            policy,
+            review_started_at,
+            proposal,
+            # An overlapping action may cover only a subset of fresh Done IDs.
+            # Retire covered work and fresh Keeps, retaining uncovered Done work.
+            Enum.filter(
+              evaluated_ids,
+              &(&1 in existing.message_ids or &1 not in proposal.message_ids)
+            )
           )
 
-        if newer_candidate? or newer_review?(scope, inbox_id, evaluated_ids, review_started_at),
-          do: scope.repo.rollback(:proposal_changed)
+          # A fence for uncovered Done work needs a durable pending owner;
+          # otherwise an agreeing cached executor must remain able to admit it.
+          uncovered = proposal.message_ids -- existing.message_ids
+
+          pending_ids =
+            scope.repo.all(
+              from(c in Candidate,
+                where:
+                  c.inbox_id == ^inbox_id and
+                    fragment("? && ?::text[]", c.message_ids, ^uncovered),
+                select: {c.remaining_message_ids, c.message_ids}
+              ),
+              prefix: scope.prefix
+            )
+            |> Enum.flat_map(fn {remaining, original} -> remaining || original end)
+
+          fence_ids = Enum.filter(evaluated_ids, &(&1 not in uncovered or &1 in pending_ids))
+          record_review(scope, inbox_id, review_ids(fence_ids, opts))
+        end
+
+        {:existing, existing}
+      else
+        if stale?, do: scope.repo.rollback(:proposal_changed)
 
         ids = Enum.sort(proposal.message_ids)
         message_key = :crypto.hash(:sha256, :erlang.term_to_binary(ids))
@@ -205,9 +246,17 @@ defmodule EmailJanitor.Store do
     end)
   end
 
-  defp retire_overlapping_candidates(scope, inbox_id, current, policy, started_at, proposal) do
+  defp retire_overlapping_candidates(
+         scope,
+         inbox_id,
+         current,
+         policy,
+         started_at,
+         proposal,
+         evaluated_ids \\ nil
+       ) do
     opts = [
-      evaluated_message_ids: Proposal.evaluated_ids(proposal),
+      evaluated_message_ids: evaluated_ids || Proposal.evaluated_ids(proposal),
       inbox_message_ids: Proposal.inbox_ids(proposal)
     ]
 
