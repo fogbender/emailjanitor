@@ -73,7 +73,7 @@ defmodule EmailJanitor.WorkerTest.Gmail do
     Agent.get_and_update(options[:state], fn state ->
       result =
         if thread in Keyword.get(options, :thread_failures, []),
-          do: {:error, :invalid_thread},
+          do: {:error, Keyword.get(options, :thread_error, :invalid_thread)},
           else: {:ok, Enum.filter(state.messages, &(&1.thread_id == thread))}
 
       {result, %{state | calls: state.calls ++ [:full_thread]}}

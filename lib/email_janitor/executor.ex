@@ -383,7 +383,15 @@ defmodule EmailJanitor.Executor do
         result
 
       {:error, reason}
-      when reason in [:invalid_thread, :unreadable_content, :response_too_large] ->
+      when reason in [
+             :invalid_thread,
+             :invalid_message,
+             :invalid_mime,
+             :invalid_headers,
+             :invalid_date,
+             :unreadable_content,
+             :response_too_large
+           ] ->
         {:error, :unreadable_content}
 
       _ ->
