@@ -103,7 +103,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
             Agent.update(state, &%{&1 | deliveries: &1.deliveries ++ [URI.decode_query(body)]})
 
             if Agent.get(state, & &1.ses) == :ready,
-              do: F.ses_response(conn),
+              do: ses_response(conn, URI.decode_query(body)),
               else: Plug.Conn.send_resp(conn, 503, "PRIVATE_PROVIDER_ERROR")
         end
       end)
@@ -196,6 +196,34 @@ defmodule EmailJanitor.FeedbackFlowTest do
     }
   end
 
+  defp ses_response(conn, %{"Action" => "SendRawEmail"}) do
+    Plug.Conn.send_resp(
+      conn,
+      200,
+      "<SendRawEmailResponse><SendRawEmailResult><MessageId>ses-outgoing-123</MessageId></SendRawEmailResult><ResponseMetadata><RequestId>request</RequestId></ResponseMetadata></SendRawEmailResponse>"
+    )
+  end
+
+  defp ses_response(conn, _), do: F.ses_response(conn)
+
+  defp delivery_recipient(%{"RawMessage.Data" => raw}) do
+    {headers, _} = raw |> Base.decode64!() |> :mimemail.parse_headers()
+    :mimemail.get_header_value("To", headers)
+  end
+
+  defp delivery_recipient(params), do: params["Destination.ToAddresses.member.1"]
+
+  defp delivery_text(%{"RawMessage.Data" => raw}) do
+    raw
+    |> Base.decode64!()
+    |> Mail.parse()
+    |> Mail.get_text()
+    |> Map.fetch!(:body)
+    |> String.replace("\r\n", "\n")
+  end
+
+  defp delivery_text(params), do: params["Message.Body.Text.Data"]
+
   defp raw(from, id \\ "command-1@example.com"),
     do:
       "From: " <>
@@ -227,8 +255,11 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert [{_request, "AUTHORED_SENT_INSTRUCTION", nil}] = Agent.get(ctx.state, & &1.commands)
     assert Ledger.get(ctx.scope, id).state == :completed
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Destination.ToAddresses.member.1"] == ctx.sender.address
-    assert delivery["Message.Body.Text.Data"] == "MODEL_REPLY_PROSE_SENTINEL"
+
+    assert delivery_recipient(delivery) ==
+             ctx.sender.address
+
+    assert delivery_text(delivery) == "MODEL_REPLY_PROSE_SENTINEL"
 
     columns =
       Repo.all(Record, prefix: ctx.scope.prefix) |> Enum.map(&Map.from_struct/1) |> inspect()
@@ -296,7 +327,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Agent.get(ctx.state, & &1.gmail_calls) == 1
     assert [{_, "AUTHORED_SENT_INSTRUCTION", nil}] = Agent.get(ctx.state, & &1.commands)
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Message.Body.Text.Data"] == "VERIFIED_DURABLE_RESULT"
+    assert delivery_text(delivery) == "VERIFIED_DURABLE_RESULT"
   end
 
   test "ambiguous SES acceptance is terminal and never resent", ctx do
@@ -314,7 +345,7 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert {:ok, :completed} = Feedback.process(ctx.config, id)
     assert Agent.get(ctx.state, & &1.commands) == []
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Message.Body.Text.Data"] =~ "separate your note"
+    assert delivery_text(delivery) =~ "separate your note"
   end
 
   test "authenticated missing context clarifies without running a guessed conversation", ctx do
@@ -369,8 +400,11 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert {:ok, :completed} = Feedback.process(ctx.config, id)
     assert Agent.get(ctx.state, & &1.gmail_calls) == 0
     assert [delivery] = Agent.get(ctx.state, & &1.deliveries)
-    assert delivery["Destination.ToAddresses.member.1"] == stranger
-    assert delivery["Message.Body.Text.Data"] =~ "https://emailjanitor.net"
+
+    assert delivery_recipient(delivery) ==
+             stranger
+
+    assert delivery_text(delivery) =~ "https://emailjanitor.net"
 
     assert :ignored =
              accept(
@@ -620,5 +654,61 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert Ledger.get(ctx.scope, id).state == :waiting_sent
     assert Agent.get(ctx.state, & &1.commands) == []
     assert Agent.get(ctx.state, & &1.deliveries) == []
+  end
+
+  test "replies preserve the authenticated subject and exact RFC parent, including metadata-only recovery",
+       ctx do
+    Agent.update(ctx.state, &%{&1 | credentials: :unavailable})
+    {:ok, id} = accept(ctx)
+    assert {:ok, :deferred} = Feedback.process(ctx.config, id)
+    Agent.update(ctx.state, &%{&1 | credentials: :ready, gmail: :not_indexed})
+    due(ctx, id)
+    assert {:ok, :completed} = Feedback.process(ctx.config, id)
+    assert [params] = Agent.get(ctx.state, & &1.deliveries)
+    assert params["Action"] == "SendRawEmail"
+    raw = Base.decode64!(params["RawMessage.Data"])
+    {headers, _} = :mimemail.parse_headers(raw)
+    assert :mimemail.get_header_value("In-Reply-To", headers) == "<command-1@example.com>"
+    assert :mimemail.get_header_value("References", headers) == "<command-1@example.com>"
+    assert Mail.get_subject(Mail.parse(raw)) == "Janitor"
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 1
+  end
+
+  test "empty subject threading is preserved and excessive subject metadata uses the bounded unthreaded fallback",
+       ctx do
+    for {subject, action} <- [{"", "SendRawEmail"}, {String.duplicate("X", 981), "SendEmail"}] do
+      Agent.update(ctx.state, fn state ->
+        headers = List.keystore(state.sent.headers, "Subject", 0, {"Subject", subject})
+
+        headers =
+          List.keystore(
+            headers,
+            "Message-ID",
+            0,
+            {"Message-ID", "<subject-#{byte_size(subject)}@example.com>"}
+          )
+
+        %{state | sent: %{state.sent | headers: headers}, deliveries: []}
+      end)
+
+      {:ok, id} =
+        accept(
+          ctx,
+          %{ctx.incoming | id: "ses-subject-#{byte_size(subject)}"},
+          raw(ctx.sender.address, "subject-#{byte_size(subject)}@example.com")
+        )
+
+      assert {:ok, :completed} = Feedback.process(ctx.config, id)
+      assert [params] = Agent.get(ctx.state, & &1.deliveries)
+      assert params["Action"] == action
+
+      if subject == "" do
+        {headers, _} = params["RawMessage.Data"] |> Base.decode64!() |> :mimemail.parse_headers()
+        assert :mimemail.get_header_value("Subject", headers) == ""
+        assert Ledger.get(ctx.scope, id).original_subject == ""
+      else
+        assert params["Message.Subject.Data"] == "Email Janitor"
+      end
+    end
   end
 end

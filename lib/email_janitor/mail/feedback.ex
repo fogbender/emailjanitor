@@ -341,7 +341,7 @@ defmodule EmailJanitor.Mail.Feedback do
 
     render = fn _ ->
       reply = live_reply || render_reply(row, context)
-      Message.new("Email Janitor", reply)
+      reply_message(row, reply)
     end
 
     with {:ok, outgoing} <-
@@ -355,6 +355,13 @@ defmodule EmailJanitor.Mail.Feedback do
       _ -> retry(config, row, :reply_pending)
     end
   end
+
+  defp reply_message(%{original_subject: subject, rfc_message_id: source}, reply)
+       when is_binary(subject) and byte_size(subject) <= 980 do
+    Message.new(subject, reply, in_reply_to: source)
+  end
+
+  defp reply_message(_, reply), do: Message.new("Email Janitor", reply)
 
   defp render_reply(%{outcome: reason}, _)
        when reason in [:clarify_ambiguous, :clarify_unsupported],
@@ -429,7 +436,7 @@ defmodule EmailJanitor.Mail.Feedback do
 
   defp safe_subject(sent) do
     case EmailJanitor.Message.header(sent, "subject") do
-      subject when is_binary(subject) and byte_size(subject) in 1..1024 ->
+      subject when is_binary(subject) and byte_size(subject) in 0..1024 ->
         if String.valid?(subject) and not String.contains?(subject, ["\r", "\n", <<0>>]),
           do: subject,
           else: "Email Janitor"
