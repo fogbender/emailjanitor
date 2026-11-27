@@ -144,7 +144,7 @@ resource "aws_s3_bucket_policy" "spool" {
 resource "aws_sqs_queue" "failed" {
   name                      = "${var.name}-mail-failed"
   sqs_managed_sse_enabled   = true
-  message_retention_seconds = 1209600
+  message_retention_seconds = 5400
 }
 
 resource "aws_sqs_queue" "mail" {
@@ -152,7 +152,7 @@ resource "aws_sqs_queue" "mail" {
   sqs_managed_sse_enabled    = true
   visibility_timeout_seconds = 300
   receive_wait_time_seconds  = 20
-  message_retention_seconds  = 86400
+  message_retention_seconds  = 5400
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.failed.arn, maxReceiveCount = 5
   })

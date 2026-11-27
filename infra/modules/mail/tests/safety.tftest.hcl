@@ -59,7 +59,7 @@ run "safe_transport_defaults" {
     error_message = "Only the SES receipt topic can inject messages, including when another IAM policy grants SendMessage."
   }
   assert {
-    condition     = jsondecode(aws_sns_topic_policy.receipts.policy).Statement[0].Condition.ArnNotEquals["aws:PrincipalArn"] == aws_iam_role.ses_delivery.arn && jsondecode(aws_iam_role_policy.ses_delivery.policy).Statement[2].Resource == aws_sns_topic.receipts.arn && aws_sqs_queue.mail.message_retention_seconds == 86400
+    condition     = jsondecode(aws_sns_topic_policy.receipts.policy).Statement[0].Condition.ArnNotEquals["aws:PrincipalArn"] == aws_iam_role.ses_delivery.arn && jsondecode(aws_iam_role_policy.ses_delivery.policy).Statement[2].Resource == aws_sns_topic.receipts.arn && aws_sqs_queue.mail.message_retention_seconds == 5400 && aws_sqs_queue.failed.message_retention_seconds == 5400
     error_message = "Only the exact SES delivery role can publish bounded-retention receipt metadata."
   }
   assert {

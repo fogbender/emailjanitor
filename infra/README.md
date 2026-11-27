@@ -21,8 +21,8 @@ action's optional SNS notification excludes MIME content; delivery headers may
 occur transiently in SNS/SQS and must be whitelisted before database persistence.
 Only the exact SES delivery role may publish to the encrypted topic, and only
 that topic may inject into the queue (including an explicit deny for other
-SendMessage grants). The incoming queue retains metadata for one day; the failed
-queue retains it for fourteen days. It does not create a Gmail inbox,
+SendMessage grants). Both queues retain metadata for ninety minutes (the one-hour
+processing TTL plus a delivery margin). It does not create a Gmail inbox,
 run an SMTP server, relay through Email Janitor SaaS, or retain a mail archive.
 SES direct-body SNS delivery is deliberately avoided because its 150 KB limit
 breaks ordinary forwarded HTML messages. No SES receipt-action encryption is
