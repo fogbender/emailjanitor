@@ -17,7 +17,7 @@ defmodule EmailJanitor.Gmail.SDK do
       with true <- Parser.valid_id?(thread_id),
            {:ok, connection, _} <- verified(inbox_id, opts),
            {:ok, %Model.Thread{id: ^thread_id, messages: messages}} <-
-             call(fn ->
+             thread_call(fn ->
                Users.gmail_users_threads_get(connection, "me", thread_id, format: "full")
              end),
            true <- is_list(messages) and length(messages) <= 200,
@@ -38,7 +38,7 @@ defmodule EmailJanitor.Gmail.SDK do
       with true <- Parser.valid_id?(thread_id),
            {:ok, connection, _} <- verified(inbox_id, opts),
            {:ok, %Model.Thread{id: ^thread_id, historyId: revision}} <-
-             call(fn ->
+             thread_call(fn ->
                Users.gmail_users_threads_get(connection, "me", thread_id,
                  format: "minimal",
                  fields: "id,historyId"
@@ -57,6 +57,20 @@ defmodule EmailJanitor.Gmail.SDK do
         _ -> {:error, :invalid_thread_snapshot}
       end
     end)
+  end
+
+  defp thread_call(fun) do
+    case call(fun) do
+      {:error, :not_found} -> {:error, :thread_not_found}
+      result -> result
+    end
+  end
+
+  defp message_call(fun) do
+    case call(fun) do
+      {:error, :not_found} -> {:error, :message_not_found}
+      result -> result
+    end
   end
 
   @impl true
@@ -200,7 +214,7 @@ defmodule EmailJanitor.Gmail.SDK do
       with true <- Parser.valid_id?(message_id),
            {:ok, connection, _} <- verified(inbox_id, opts),
            {:ok, %Model.Message{id: ^message_id, threadId: thread_id}} <-
-             call(fn ->
+             message_call(fn ->
                Users.gmail_users_messages_get(connection, "me", message_id,
                  format: "minimal",
                  fields: "id,threadId"

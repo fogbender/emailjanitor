@@ -6,7 +6,6 @@ defmodule EmailJanitor.Worker.Server do
   Durable arrival/receipt/defer state makes scheduler restarts resume safely.
   """
   use GenServer
-  alias EmailJanitor.Gmail.Parser
   alias EmailJanitor.Worker
 
   @good [
@@ -75,7 +74,7 @@ defmodule EmailJanitor.Worker.Server do
 
   @impl true
   def handle_cast({:wake, ref}, state) do
-    if Parser.valid_id?(ref) do
+    if valid_ref?(ref) do
       now = System.monotonic_time(:millisecond)
 
       entries =
@@ -102,6 +101,8 @@ defmodule EmailJanitor.Worker.Server do
 
     entries =
       Map.new(state.entries, fn {key, entry} ->
+        busy = Enum.any?(state.running, fn {_, running} -> running.key == key end)
+        entry = if busy, do: Map.put(entry, :pending_wake, true), else: entry
         {key, if(entry.attempts == 0, do: %{entry | due: now}, else: entry)}
       end)
 
@@ -195,6 +196,7 @@ defmodule EmailJanitor.Worker.Server do
         delay =
           cond do
             repaired -> 0
+            outcome != :failed and Map.get(entry, :pending_wake, false) -> 0
             outcome == :more -> 100
             outcome == :failed -> min(state.interval_ms * Integer.pow(2, attempts), 300_000)
             true -> state.interval_ms
@@ -256,7 +258,7 @@ defmodule EmailJanitor.Worker.Server do
     try do
       case list.() do
         {:ok, refs} when is_list(refs) and length(refs) <= 10_000 ->
-          if Enum.all?(refs, &Parser.valid_id?/1), do: {:ok, Enum.uniq(refs)}, else: :error
+          if Enum.all?(refs, &valid_ref?/1), do: {:ok, Enum.uniq(refs)}, else: :error
 
         _ ->
           :error
@@ -267,4 +269,6 @@ defmodule EmailJanitor.Worker.Server do
       _, _ -> :error
     end
   end
+
+  defp valid_ref?(ref), do: is_binary(ref) and byte_size(ref) in 1..256
 end
