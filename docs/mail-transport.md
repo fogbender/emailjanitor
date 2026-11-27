@@ -12,8 +12,19 @@ spool bucket, SQS URL, SES receipt topic ARN and a zero-argument credentials res
 The resolver returns temporary `access_key_id`, `secret_access_key`, `security_token`
 keywords. `Mail.Credentials.instance_role/1` uses the maintained ExAws EC2 role
 chain with IMDSv2 and rotating cache; it reads no shared developer profile or
-personal environment key. An Azure host instead supplies its own isolated,
-short-lived runtime credential-file resolver. Do not grant the web/app process
+personal environment key. An Azure host supplies `fn -> Mail.Credentials.read(path) end`
+for its isolated root helper's atomic runtime file. The file contains exactly
+`access_key_id`, `secret_access_key`, `security_token` and epoch-second `expires_at`,
+with 15-minute STS credentials. The reader bounds input, rejects non-regular or
+symlinked files and group-writable/world-readable modes, and requires at least
+60 seconds of validity. The SDK accepts the same 16 KiB session-token bound.
+It rereads on every SDK preparation; it never falls back
+to a developer profile or metadata endpoint. The host must own the parent
+directory as root, allow the application group read/traverse only, and atomically
+replace mode-0640 files.
+The metadata precheck and file open are separate; this API does not make an
+attacker-writable path safe or eliminate replacement races. Only the trusted
+root helper may replace the file. Do not grant the web/app process
 unrestricted instance-metadata access just for this adapter.
 
 SDK operation construction, XML parsing and SigV4 signing belong to ExAws. The
@@ -51,6 +62,14 @@ A proven deadline exhaustion before the SES closure runs also restores `pending`
 it is distinct from ambiguous acceptance after a request may have started.
 This intentionally favors a missing email over a duplicate after ambiguous SES
 acceptance. Calling from an outer database transaction is rejected.
+
+An optional sixth `Outbox.deliver` argument is a trusted DB-only admission callback.
+It executes after rendering/credential resolution, inside the short transaction
+that locks the pending outbox row and commits its send fence. A rejected check
+rolls back both host metadata and the fence; the provider remains outside SQL.
+The digest layer uses this to reserve its current local dispatch day atomically.
+Outgoing plain text is bounded to 3 MiB; maintained-SDK wire and conservative MIME
+size tests keep it below SES v1's 10 MB message limit. Incoming MIME remains 1 MiB.
 
 Confirmed sends also record the actual sender and connected recipient alongside
 the returned bare SES MessageId. `Outbox.self_delivery?(scope, inbox_id, sender,

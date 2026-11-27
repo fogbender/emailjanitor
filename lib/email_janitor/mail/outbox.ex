@@ -99,16 +99,23 @@ defmodule EmailJanitor.Mail.Outbox do
         do: value
   end
 
-  def deliver(%Scope{} = scope, id, %Config{} = config, authorize, render)
-      when is_function(authorize, 1) and is_function(render, 1) do
+  def deliver(
+        %Scope{} = scope,
+        id,
+        %Config{} = config,
+        authorize,
+        render,
+        admission \\ fn _ -> :ok end
+      )
+      when is_function(authorize, 1) and is_function(render, 1) and is_function(admission, 1) do
     if scope.repo.in_transaction?() do
       {:error, :outer_transaction}
     else
-      Owner.run(fn -> do_deliver(scope, id, config, authorize, render) end)
+      Owner.run(fn -> do_deliver(scope, id, config, authorize, render, admission) end)
     end
   end
 
-  defp do_deliver(scope, id, config, authorize, render) do
+  defp do_deliver(scope, id, config, authorize, render, admission) do
     with %Outgoing{state: :pending} = row <- get(scope, id),
          {:ok, %Inbox{id: inbox_id, address: address} = inbox} <- authorize.(row.inbox_id),
          true <- inbox_id == row.inbox_id,
@@ -116,7 +123,7 @@ defmodule EmailJanitor.Mail.Outbox do
          {:ok, %Message{} = message} <- render.(row),
          {:ok, prepared} <- SDK.prepare(config),
          :ok <- Owner.dispatch_window(),
-         {:ok, :claimed} <- claim_dispatch(scope, row, inbox, authorize) do
+         {:ok, :claimed} <- claim_dispatch(scope, row, inbox, authorize, admission) do
       result = Owner.bounded(fn -> SDK.send(config, prepared, inbox, message) end)
 
       if result == {:error, :dispatch_window_exhausted} do
@@ -155,13 +162,14 @@ defmodule EmailJanitor.Mail.Outbox do
     else
       %Outgoing{state: :sent} -> :ok
       %Outgoing{} -> {:error, :unresolved_delivery}
+      {:error, :mail_admission_rejected} -> {:error, :mail_admission_rejected}
       _ -> {:error, :mail_unavailable}
     end
   end
 
   # Match host settlement/disconnect order: scoped mailbox precedes public host
   # authorization locks and outgoing state. The authorizer is DB-only here.
-  defp claim_dispatch(scope, row, inbox, authorize) do
+  defp claim_dispatch(scope, row, inbox, authorize, admission) do
     scope.repo.transaction(fn ->
       mailbox =
         scope.repo.one(from(m in Mailbox, where: m.id == ^row.inbox_id, lock: "FOR UPDATE"),
@@ -172,6 +180,15 @@ defmodule EmailJanitor.Mail.Outbox do
         do: scope.repo.rollback(:mail_unavailable)
 
       if authorize.(row.inbox_id) != {:ok, inbox}, do: scope.repo.rollback(:mail_unavailable)
+
+      current =
+        scope.repo.one(
+          from(o in Outgoing, where: o.id == ^row.id and o.state == :pending, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if is_nil(current), do: scope.repo.rollback(:already_dispatched)
+      if admission.(current) != :ok, do: scope.repo.rollback(:mail_admission_rejected)
 
       case scope.repo.update_all(
              from(o in Outgoing, where: o.id == ^row.id and o.state == :pending),

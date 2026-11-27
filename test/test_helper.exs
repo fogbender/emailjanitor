@@ -19,12 +19,14 @@ for prefix <- [
       "ej_concurrency",
       "ej_recovery",
       "ej_policy_concurrency",
+      "ej_digest_concurrency",
       "ej_preferences_concurrency"
     ] do
   {:ok, scope} = EmailJanitor.Store.Scope.new(EmailJanitor.TestRepo, prefix)
   EmailJanitor.Store.install(scope)
   EmailJanitor.Preferences.install(scope)
   EmailJanitor.Mail.Store.install(scope)
+  EmailJanitor.Digest.install(scope)
 end
 
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)
