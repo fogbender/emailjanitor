@@ -37,53 +37,84 @@ defmodule EmailJanitor.SelfHost.Services do
 
   @impl true
   def init({config, feedback}) do
-    children = [{SelfHost.Maintenance, config}, SelfHost.Revocations.child_spec(config)]
+    jobs = SelfHost.Oban
 
-    children =
+    cleanup_opts = [
+      jobs: jobs,
+      name: SelfHost.CleanupServer,
+      list: &Store.worker_refs/0,
+      resolve: &SelfHost.Runtime.worker_config/1
+    ]
+
+    {tasks, facades} =
       case Adapters.mail(config) do
         {:ok, mail} ->
-          cleanup =
-            if config.google_oauth && is_binary(config.pubsub["JANITOR_GOOGLE_TOPIC"]),
-              do: [
-                {EmailJanitor.Worker.Server,
-                 name: SelfHost.CleanupServer,
-                 list: &Store.worker_refs/0,
-                 resolve: &SelfHost.Runtime.worker_config/1,
-                 max_concurrency: 2}
-              ],
-              else: []
+          digest_opts = [
+            jobs: jobs,
+            mail: mail,
+            inboxes: &active_inboxes/0,
+            authorize: &authorize/2
+          ]
 
-          digest =
-            {Digest.Worker,
-             name: SelfHost.DigestServer,
-             mail: mail,
-             inboxes: &active_inboxes/0,
-             authorize: &authorize/2}
+          tasks = Digest.Worker.tasks(digest_opts)
 
-          children ++ cleanup ++ [digest]
+          if config.google_oauth && is_binary(config.pubsub["JANITOR_GOOGLE_TOPIC"]),
+            do:
+              {Map.merge(tasks, EmailJanitor.Worker.Server.tasks(cleanup_opts)),
+               [{EmailJanitor.Worker.Server, cleanup_opts}]},
+            else: {tasks, []}
 
         _ ->
-          children
+          {%{}, []}
       end
 
-    children =
+    tasks =
       case Adapters.pubsub(config) do
         {:ok, source} ->
-          children ++
-            [
-              {Gmail.NotificationWorker.Server,
-               name: SelfHost.NotificationServer,
-               source: source,
-               router: &Adapters.route/1,
-               wake: fn -> wake() end}
-            ]
+          Map.merge(
+            tasks,
+            Gmail.NotificationWorker.Server.tasks(
+              source: source,
+              router: &Adapters.route/1,
+              wake: fn -> wake() end
+            )
+          )
 
         _ ->
-          children
+          tasks
       end
 
-    children = children ++ EmailJanitor.Mail.Receiver.children(feedback)
-    Supervisor.init(children, strategy: :one_for_one)
+    tasks =
+      tasks
+      |> Map.merge(SelfHost.Revocations.tasks(config))
+      |> Map.merge(SelfHost.Maintenance.tasks())
+      |> Map.merge(EmailJanitor.Mail.Receiver.tasks(feedback))
+
+    children =
+      [
+        {EmailJanitor.Jobs,
+         name: jobs,
+         repo: SelfHost.Repo,
+         prefix: SelfHost.scope().prefix,
+         tasks: tasks,
+         oban: [
+           queues: [
+             cleanup: 2,
+             discovery: 1,
+             notification: 1,
+             digest: 1,
+             revocations: 1,
+             intake: 1,
+             process: 1,
+             feedback: 1,
+             maintenance: 1,
+             spool: 1,
+             orphan: 1
+           ]
+         ]}
+      ] ++ facades
+
+    Supervisor.init(children, strategy: :rest_for_one)
   end
 
   defp active_inboxes do
@@ -116,28 +147,34 @@ end
 
 defmodule EmailJanitor.SelfHost.Maintenance do
   @moduledoc false
-  use GenServer
   alias EmailJanitor.{Preferences, SelfHost}
-  def start_link(config), do: GenServer.start_link(__MODULE__, config, name: __MODULE__)
-  @impl true
-  def init(config) do
-    send(self(), :tick)
-    {:ok, config}
-  end
 
-  @impl true
-  def handle_info(:tick, config) do
-    maintenance()
-    Process.send_after(self(), :tick, 60_000)
-    {:noreply, config}
+  def tasks do
+    %{
+      "host_maintenance" => %{
+        run: fn _ -> maintenance() end,
+        timeout_ms: 30_000,
+        queue: :maintenance
+      }
+    }
   end
 
   defp maintenance do
-    Preferences.purge_receipts(SelfHost.scope())
-    web = EmailJanitor.SelfHost.Web
-    if Code.ensure_loaded?(web) and function_exported?(web, :purge, 0), do: web.purge()
-    :ok
+    with {:ok, :ok} <- Preferences.purge_receipts(SelfHost.scope()) do
+      web = EmailJanitor.SelfHost.Web
+
+      result =
+        if Code.ensure_loaded?(web) and function_exported?(web, :purge, 0),
+          do: web.purge(),
+          else: :ok
+
+      if result == :ok, do: {:next, nil, 60_000}, else: :failed
+    else
+      _ -> :failed
+    end
   rescue
-    _ -> :ok
+    _ -> :failed
+  catch
+    _, _ -> :failed
   end
 end

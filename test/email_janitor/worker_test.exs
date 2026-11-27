@@ -1156,15 +1156,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted-inbox"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted-inbox"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    assert_receive {:reported_worker_status, :done}, 2_000
+    assert_receive {:reported_worker_status, :done}, 5_000
     assert read(ctx.state).mutations == [["z-new"]]
 
     assert [%Deferral{status: :unreadable, message_ids: ["a-old-1", "a-old-2"]}] =
@@ -1204,15 +1203,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted-inbox"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted-inbox"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    assert_receive {:reported_worker_status, :done}, 2_000
+    assert_receive {:reported_worker_status, :done}, 5_000
     assert read(ctx.state).mutations == [["z-new"]]
 
     assert [%Deferral{status: :unreadable, message_ids: ["a-old-1", "a-old-2"]}] =
@@ -1286,15 +1284,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted-inbox"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted-inbox"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    assert_receive {:reported_model_step, :done}, 2_000
+    assert_receive {:reported_model_step, :done}, 8_000
     assert read(ctx.state).mutations == [["z-new"]]
     assert {:ok, pending} = pending(ctx)
     assert Enum.sort(Enum.map(pending, & &1.message_id)) == ["bad-1", "bad-2", "bad-3"]
@@ -1323,12 +1320,11 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
     assert_receive {:global_outcome, :model_unavailable}, 1_000
@@ -1418,12 +1414,11 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
     assert_receive {:policy_outcome, :policy_unavailable}, 1_000
@@ -1458,12 +1453,11 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
     assert_receive {:candidate_policy, :policy_unavailable}, 1_000
@@ -1494,15 +1488,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    for _ <- 1..4, do: assert_receive({:rejection_report, :model_rejected}, 1_500)
+    for _ <- 1..4, do: assert_receive({:rejection_report, :model_rejected}, 3_000)
     refute_receive {:rejection_report, _}, 250
     assert length(read(ctx.state).model_inputs) == 4
     assert read(ctx.state).mutations == []

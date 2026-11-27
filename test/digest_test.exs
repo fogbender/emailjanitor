@@ -307,16 +307,33 @@ defmodule EmailJanitor.DigestTest do
       end
     ]
 
-    {:ok, worker} = Worker.start_link(opts)
-    assert_receive :sent, 5000
-    GenServer.stop(worker)
+    opts = Keyword.put(opts, :jobs, EmailJanitor.TestScheduler.jobs())
+    tasks = Worker.tasks(opts)
+    EmailJanitor.TestScheduler.start_tasks(tasks, queues: [discovery: 1, digest: 1])
+    assert_receive :sent, 5_000
+
+    EmailJanitor.TestScheduler.await(fn ->
+      TestRepo.one(from(o in Outgoing, select: o.state), prefix: ctx.other.prefix) == :sent
+    end)
+
+    EmailJanitor.TestScheduler.await(fn ->
+      rows = EmailJanitor.TestScheduler.rows("digest")
+      length(rows) == 2 and Enum.all?(rows, &(&1.state == "scheduled"))
+    end)
+
+    before = EmailJanitor.TestScheduler.rows("digest")
+    assert :ok = stop_supervised({EmailJanitor.Jobs, EmailJanitor.TestScheduler.jobs()})
 
     assert Outbox.get(ctx.scope, Digest.pending(ctx.scope, ctx.inbox.id).outbox_id).state ==
              :pending
 
-    {:ok, restarted} = Worker.start_link(opts)
-    assert {:ok, %{failed: 1, idle: 1}} = Worker.run(restarted)
-    GenServer.stop(restarted)
+    EmailJanitor.TestScheduler.start_tasks(tasks, queues: [discovery: 1, digest: 1])
+    after_restart = EmailJanitor.TestScheduler.rows("digest")
+
+    assert Enum.map(after_restart, &{&1.id, &1.args, &1.scheduled_at}) ==
+             Enum.map(before, &{&1.id, &1.args, &1.scheduled_at})
+
+    assert {:ok, %{failed: 1, idle: 1}} = Worker.run_once(opts)
     refute_received :sent
   end
 

@@ -444,8 +444,21 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     {:ok, feedback} = SelfHost.Email.config(ctx.config)
     assert %Feedback.Config{} = feedback
     {:ok, {_, children}} = SelfHost.Services.init({ctx.config, feedback})
-    spec = Enum.find(children, &(&1.id == Digest.Worker))
-    assert %{start: {Digest.Worker, :start_link, [opts]}} = spec
+    spec = Enum.find(children, &(&1.id == {EmailJanitor.Jobs, SelfHost.Oban}))
+    assert %{start: {EmailJanitor.Jobs, :start_link, [job_opts]}} = spec
+    assert job_opts[:prefix] == ctx.scope.prefix
+    assert job_opts[:oban][:queues][:cleanup] == 2
+    assert Map.has_key?(job_opts[:tasks], "digest")
+
+    opts = [
+      inboxes: fn -> [{ctx.scope, ctx.box.id}] end,
+      authorize: fn scope, id ->
+        if scope == ctx.scope and id == ctx.box.id,
+          do: {:ok, ctx.box},
+          else: {:error, :inbox_unavailable}
+      end
+    ]
+
     observer = self()
 
     mail =
@@ -461,9 +474,19 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
 
     clock = DateTime.new!(Date.utc_today(), ~T[21:00:00], "Etc/UTC")
     opts = opts |> Keyword.put(:mail, mail) |> Keyword.put(:clock, fn -> clock end)
-    worker = start_supervised!({Digest.Worker, opts})
+    opts = Keyword.put(opts, :jobs, EmailJanitor.TestScheduler.jobs())
+
+    EmailJanitor.TestScheduler.start_tasks(Digest.Worker.tasks(opts),
+      queues: [discovery: 1, digest: 1]
+    )
+
     assert_receive :digest_sent, 5_000
-    assert {:ok, %{idle: 1}} = Digest.Worker.run(worker)
+
+    EmailJanitor.TestScheduler.await(fn ->
+      match?([%Outgoing{state: :sent}], Repo.all(Outgoing, prefix: ctx.scope.prefix))
+    end)
+
+    assert {:ok, %{idle: 1}} = Digest.Worker.run_once(opts)
     refute_received :digest_sent
     assert [%Outgoing{state: :sent, kind: :digest}] = Repo.all(Outgoing, prefix: ctx.scope.prefix)
     assert Repo.aggregate(Digest.Snapshot, :count, prefix: ctx.scope.prefix) == 1

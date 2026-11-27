@@ -459,19 +459,24 @@ already active checkpoint from periodic history catch-up or local cleanup.
 Verified Janitor deliveries are removed before safeguards, correspondence lookup
 and classification; ordinary siblings retain all of those checks.
 
-`Worker.Server` supervises these steps with bounded concurrency (default two,
-maximum eight), one active task per trusted inbox reference, bounded task
-lifetimes and retry backoff. Supply `list: fn -> {:ok, refs} end` and
-`resolve: fn ref -> {:ok, config} end` as bounded host database operations;
-provider/model calls run in supervised tasks. Periodic catch-up remains necessary
-even when Pub/Sub notifications are absent. Supervise the authenticated
-`Gmail.NotificationWorker.Server` pull loop separately (trusted `source:`
-adapter/config, database-only `router:`, optional `wake:` callback), and call
-`Worker.Server.wake/1` after committing notifications when lower latency is needed.
-That generic wake preserves failure backoff. Only a trusted explicit auth/config
-repair or upgrade uses `wake/2` with a host-derived reference to reset that one
-inbox's backoff; new references must still appear in the trusted list callback.
-Host references are opaque binaries of 1–256 bytes, independent of Gmail IDs.
+`Worker.Server.tasks/1` supplies Oban discovery and per-inbox cleanup tasks.
+Supervise one `Jobs` instance in a host-owned schema (the single-user release uses
+`ej_selfhost`, migration 104), with `cleanup: 2`, `discovery: 1` and
+`notification: 1` queues. Pass its name as `jobs:`, plus bounded trusted
+`list: fn -> {:ok, refs} end` and `resolve: fn ref -> {:ok, config} end` callbacks.
+Only opaque references and fixed retry metadata enter Oban; credentials and
+provider/model callbacks remain in memory. Durable retries survive process and
+machine restarts, while domain effect ledgers still decide whether a mutation
+may be attempted. Periodic catch-up remains necessary without Pub/Sub signals.
+
+Merge `Gmail.NotificationWorker.Server.tasks/1` into the same runtime task map
+(trusted `source:` adapter/config, database-only `router:`, optional `wake:`).
+The optional timer-free `Worker.Server` facade takes the same cleanup options;
+`wake/1` hints healthy work without bypassing failure backoff. Only a trusted
+explicit auth/config repair or upgrade uses `wake/2` to reset one host-derived
+reference. New references must appear in the trusted list, and removed epochs
+are cancelled. Host references are opaque UTF-8 binaries of 1–256 bytes,
+independent of Gmail IDs. Immediate authenticated chat remains transient.
 
 A positively typed deleted-thread result retires the current pending recheck's
 exact core, host and worker metadata, without a quota refund. The worker captures

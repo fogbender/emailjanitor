@@ -58,6 +58,12 @@ defmodule EmailJanitor.SelfHost.Release do
         if SelfHost.Revocations.install(scope) not in [:ok, :already_up],
           do: raise("Email Janitor revocation migrations failed.")
 
+        if Ecto.Migrator.up(Repo, 104, EmailJanitor.Jobs.Migration,
+             prefix: scope.prefix,
+             log: false
+           ) not in [:ok, :already_up],
+           do: raise("Email Janitor background migrations failed.")
+
         if SelfHost.Transport.install(config) != :ok,
           do: raise("Email Janitor mail transport is not configured.")
 

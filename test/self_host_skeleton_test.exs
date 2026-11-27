@@ -127,15 +127,14 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert key != box.id
     observer = self()
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: &Store.worker_refs/0,
-       resolve: fn reference ->
-         send(observer, {:scheduler_resolved, reference})
-         {:error, :synthetic_stop}
-       end,
-       max_concurrency: 1,
-       interval_ms: 10}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: &Store.worker_refs/0,
+      resolve: fn reference ->
+        send(observer, {:scheduler_resolved, reference})
+        {:error, :synthetic_stop}
+      end,
+      max_concurrency: 1,
+      interval_ms: 10
     )
 
     assert_receive {:scheduler_resolved, ^key}, 5_000

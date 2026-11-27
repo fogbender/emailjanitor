@@ -159,15 +159,19 @@ already be reading it. Same-digest retries before dispatch can proceed, while
 other digests are deferred for that local day. An ambiguous dispatched digest
 is never resent. No activity is dropped or repeated to force calendar-day copy.
 
-`Digest.Worker` runs immediately when its supervisor starts, then once a minute.
+`Digest.Worker.tasks/1` adds durable Oban discovery and per-inbox digest jobs to
+the host's shared `Jobs` instance (`jobs:`). Set `discovery: 1` and `digest: 1`
+queue limits. Discovery starts at boot and repeats once a minute; each persisted
+opaque key resolves its current trusted scope and inbox before delivery.
 Host options are `:inboxes` (trusted `{Scope, inbox_id}` pairs), `:mail` (Mail.Config),
 `:authorize` (scope/inbox → currently connected Inbox), optional `:claim_extras`
 (scope plus the callback arguments above), `:footer` (scope/inbox → fixed text)
 and `:clock` (zero-argument UTC clock). It drains pending never-dispatched mail
 on retries even when that day's scheduling cutoff has already advanced. A failure
 is isolated to its inbox and only fixed status counts leave the worker. Add it
-to the embedding application's supervised release; NixOS then restarts that
-release on failure/reboot. The database ledger, not an in-memory timer, owns all
+to the embedding application's runtime task map; NixOS restarts that release
+on failure/reboot. The optional `run_once/1` API performs an explicit transient
+sweep. The database ledger owns all
 cutoffs, listing decisions, daily slots and replay protection.
 
 Lock ordering is shared with host settlement/disconnect: acquire the scoped

@@ -210,9 +210,25 @@ defmodule EmailJanitor.SelfHostWeb.AuthTest do
   test "supervised maintenance expires attempts without any subsequent sign-in", t do
     assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", DateTime.add(t.now, -601))
     {:ok, session} = Auth.issue("owner-subject", nil, t.now)
-    pid = start_supervised!(EmailJanitor.SelfHostWeb.Maintenance)
-    send(pid, :purge)
-    :sys.get_state(pid)
+
+    EmailJanitor.TestScheduler.start_tasks(
+      %{
+        "browser_maintenance" => %{
+          run: fn _ ->
+            EmailJanitor.SelfHostWeb.Maintenance.run()
+            {:next, nil, 60_000}
+          end,
+          timeout_ms: 30_000,
+          queue: :maintenance
+        }
+      },
+      queues: [maintenance: 1]
+    )
+
+    EmailJanitor.TestScheduler.await(fn ->
+      TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 0
+    end)
+
     assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 0
     assert {:ok, "owner-subject"} = Auth.fetch(Content.read(session), t.now)
   end

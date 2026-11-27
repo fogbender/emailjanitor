@@ -25,7 +25,7 @@ defmodule EmailJanitor.SelfHost.Web do
     )
 
     Supervisor.init(
-      [EmailJanitor.SelfHostWeb.ChatLimit, EmailJanitor.SelfHostWeb.Maintenance, Endpoint],
+      [EmailJanitor.SelfHostWeb.ChatLimit, Endpoint],
       strategy: :one_for_one
     )
   end

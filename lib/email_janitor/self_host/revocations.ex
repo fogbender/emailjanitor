@@ -179,20 +179,21 @@ defmodule EmailJanitor.SelfHost.Revocations do
     end
   end
 
-  def child_spec(config),
-    do:
-      Supervisor.child_spec(
-        {EmailJanitor.Mail.Job,
-         run: fn _ ->
-           case tick(config.google_oauth) do
-             {:ok, :idle} -> {:next, nil, 60_000}
-             {:ok, _} -> {:next, nil, 0}
-             _ -> {:next, nil, 60_000}
-           end
-         end,
-         timeout_ms: 70_000},
-        id: __MODULE__
-      )
+  def tasks(config) do
+    %{
+      "google_revocations" => %{
+        run: fn _ ->
+          case tick(config.google_oauth) do
+            {:ok, :idle} -> {:next, nil, 60_000}
+            {:ok, _} -> {:next, nil, 0}
+            _ -> :failed
+          end
+        end,
+        timeout_ms: 70_000,
+        queue: :revocations
+      }
+    }
+  end
 
   def tick(config, options \\ []) do
     Owner.run(
