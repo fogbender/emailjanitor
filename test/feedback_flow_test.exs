@@ -418,6 +418,55 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert :ignored = accept(ctx, incoming, auto)
   end
 
+  test "signup rechecks the trusted lifecycle guard after transport preparation before SES dispatch",
+       ctx do
+    stranger = "later-connected@other.com"
+    owner = self()
+    {:ok, allowed} = Agent.start_link(fn -> true end)
+    on_exit(fn -> if Process.alive?(allowed), do: Agent.stop(allowed) end)
+    original_credentials = ctx.config.mail.credentials
+
+    mail = %{
+      ctx.config.mail
+      | credentials: fn ->
+          Agent.update(allowed, fn _ -> false end)
+          original_credentials.()
+        end
+    }
+
+    config = %{
+      ctx.config
+      | mail: mail,
+        signup_guard: fn address ->
+          send(owner, {:signup_guard, address, Repo.in_transaction?()})
+          if Agent.get(allowed, & &1), do: :ok, else: {:error, :connection_changed}
+        end
+    }
+
+    {:ok, id} =
+      accept(%{ctx | config: config}, %{ctx.incoming | envelope_from: stranger}, raw(stranger))
+
+    assert {:ok, :rejected} = Feedback.process(config, id)
+    assert_receive {:signup_guard, ^stranger, true}
+    assert Agent.get(ctx.state, & &1.deliveries) == []
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 0
+    assert Ledger.get(ctx.scope, id).state == :rejected
+  end
+
+  test "transient signup lifecycle lookup failure retries without sending or releasing its once tombstone",
+       ctx do
+    stranger = "guard-unavailable@other.com"
+    {:ok, id} = accept(ctx, %{ctx.incoming | envelope_from: stranger}, raw(stranger))
+    config = %{ctx.config | signup_guard: fn _ -> {:error, :account_unavailable} end}
+    assert {:ok, :deferred} = Feedback.process(config, id)
+    assert Agent.get(ctx.state, & &1.deliveries) == []
+    assert Ledger.get(ctx.scope, id).state == :reply_pending
+    assert Repo.aggregate(Feedback.SignupTombstone, :count, prefix: ctx.scope.prefix) == 1
+    due(ctx, id)
+    assert {:ok, :completed} = Feedback.process(ctx.config, id)
+    assert length(Agent.get(ctx.state, & &1.deliveries)) == 1
+  end
+
   test "long verified Janitor reply quotes can be omitted without discarding the clean authored request",
        ctx do
     context = %{ctx.context | verified_reference: true}

@@ -80,3 +80,12 @@ Unsupported reply-shaped colon blocks with no recognized quote boundary clarify
 before any model call. This is a generic format ambiguity guard, with no sender
 names or spam heuristics. Known quote boundaries still permit normal authored
 lists, and plain quote-free replies remain accepted.
+
+`Config.signup_guard(address)` is an optional bounded, trusted DB-only lifecycle
+check. It runs in a short transaction before enqueue and again under the final
+Outbox mailbox fence after transport preparation. A permanent
+`{:error, :connection_changed}` ends the signup without sending; temporary lookup
+failures retry within the original receipt deadline. SaaS hosts use it to stop an
+already-claimed unknown-sender response after the address connects or is deleted.
+It never authorizes feedback commands and does not cancel an already dispatched
+SES request. Self-hosting can leave this callback unset because signup is disabled.

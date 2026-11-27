@@ -405,13 +405,24 @@ defmodule EmailJanitor.Mail.Feedback do
   end
 
   defp signup(config, row) do
-    if DateTime.compare(DateTime.utc_now(), row.expires_at) != :lt do
-      finish(config, row, :expired, :expired)
-    else
+    cond do
+      DateTime.compare(DateTime.utc_now(), row.expires_at) != :lt ->
+        finish(config, row, :expired, :expired)
+
+      true ->
+        do_signup(config, row)
+    end
+  end
+
+  defp do_signup(config, row) do
+    with :ok <- signup_guard(config, row.sender_address) do
       {:ok, inbox} = Inbox.new(row.sender_inbox_id, row.sender_address)
 
       authorize = fn id ->
-        if id == inbox.id, do: {:ok, inbox}, else: {:error, :wrong_recipient}
+        with true <- id == inbox.id,
+             :ok <- signup_guard(config, row.sender_address),
+             do: {:ok, inbox},
+             else: (_ -> {:error, :mail_unavailable})
       end
 
       render = fn _ ->
@@ -429,11 +440,42 @@ defmodule EmailJanitor.Mail.Feedback do
         case Outbox.deliver(config.transport_scope, outgoing.id, config.mail, authorize, render) do
           :ok -> finish(config, row, :completed, :processed)
           {:error, :unresolved_delivery} -> finish(config, row, :unresolved, :processed)
-          _ -> retry(config, row, :reply_pending)
+          _ -> signup_retry(config, row)
         end
       else
-        _ -> retry(config, row, :reply_pending)
+        _ -> signup_retry(config, row)
       end
+    else
+      _ -> signup_retry(config, row)
+    end
+  end
+
+  defp signup_retry(config, row) do
+    case signup_guard(config, row.sender_address) do
+      {:error, :connection_changed} -> finish(config, row, :rejected, :rejected)
+      _ -> retry(config, row, :reply_pending)
+    end
+  end
+
+  defp signup_guard(%Config{signup_guard: nil}, _), do: :ok
+
+  defp signup_guard(%Config{signup_guard: guard, transport_scope: scope}, address) do
+    result =
+      safe(fn ->
+        if scope.repo.in_transaction?() do
+          guard.(address)
+        else
+          case scope.repo.transaction(fn -> guard.(address) end) do
+            {:ok, status} -> status
+            _ -> {:error, :feedback_unavailable}
+          end
+        end
+      end)
+
+    case result do
+      :ok -> :ok
+      {:error, :connection_changed} = changed -> changed
+      _ -> {:error, :feedback_unavailable}
     end
   end
 

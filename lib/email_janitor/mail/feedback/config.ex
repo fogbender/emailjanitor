@@ -21,7 +21,7 @@ end
 defmodule EmailJanitor.Mail.Feedback.Config do
   @enforce_keys [:transport_scope, :transport_inbox, :mail, :parser_executable, :route, :resolve]
   @derive {Inspect, only: [:transport_inbox]}
-  defstruct @enforce_keys ++ [signup_url: nil, signup_secret: nil]
+  defstruct @enforce_keys ++ [signup_url: nil, signup_secret: nil, signup_guard: nil]
   alias EmailJanitor.{Inbox, Mail, Store.Scope}
 
   def new(opts) do
@@ -36,6 +36,7 @@ defmodule EmailJanitor.Mail.Feedback.Config do
          route when is_function(route, 1) <- opts[:route],
          resolve when is_function(resolve, 1) <- opts[:resolve],
          true <- signup?(opts[:signup_url]),
+         true <- is_nil(opts[:signup_guard]) or is_function(opts[:signup_guard], 1),
          true <- signup_secret?(opts[:signup_url], opts[:signup_secret]) do
       {:ok,
        %__MODULE__{
@@ -46,7 +47,8 @@ defmodule EmailJanitor.Mail.Feedback.Config do
          route: route,
          resolve: resolve,
          signup_url: opts[:signup_url],
-         signup_secret: opts[:signup_secret]
+         signup_secret: opts[:signup_secret],
+         signup_guard: opts[:signup_guard]
        }}
     else
       _ -> {:error, :invalid_feedback_configuration}
