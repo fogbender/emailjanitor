@@ -44,6 +44,17 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
   not developer profiles or model API keys. No direct OpenAI/Anthropic adapters.
 - Explicit repository/schema scopes, durable idempotent action intents, exact-ID
   Gmail mutation boundary and restoration protection, tested against PostgreSQL.
+- Dedicated short-lived execution owners, single-host Linux identity, bounded
+  dispatch and crash recovery. A dead
+  owner that never dispatched permits a fresh checked attempt. Dispatched orphan
+  actions and ordinary transport failures remain unresolved until fresh, complete Gmail history positively
+  accounts for every message; empty history never licenses replay. Live owners
+  remain protected, expired local owners are killed before recovery, and unknown
+  hosts/runtimes cannot be taken over. Hosts call `Executor.recover/3` and then
+  `Store.reconcile/4` with authenticated history started after recovery.
+  Do not wrap execution in a host transaction: it is rejected so the intent is
+  committed before Gmail is called. Low-level store ownership APIs are internal
+  executor primitives; a host should call `Executor.execute/4`.
 - Pure history-based ambiguous-action reconciliation decisions. Its live Gmail
   history consumer and automatic recovery worker are not implemented yet.
 
@@ -84,3 +95,14 @@ messages keeps the entire thread. Each header is capped at 4096 bytes and each
 readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
 MIME and encoded email context above 96000 bytes keep the conversation rather
 than submitting an incomplete or oversized review.
+
+## Self-host infrastructure foundation
+
+The [AWS/OpenTofu and NixOS foundation](infra/README.md) includes isolated mail
+transport, Gmail notification wiring, provider-mocked checks and a service module
+that consumes a supplied release. It has not been applied and is not yet a complete
+installer or deployable application. Run its local checks with:
+
+```sh
+nix develop --command bash scripts/check-infra
+```
