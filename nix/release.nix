@@ -4,13 +4,15 @@ let
   # out of both the dependency fetch and the final release's store closure.
   source = lib.fileset.toSource {
     root = src;
-    fileset = lib.fileset.unions [
+    fileset = lib.fileset.intersection
+      (if builtins.pathExists (src + /.git) then lib.fileset.gitTracked src else src)
+      (lib.fileset.unions [
       (src + /mix.exs)
       (src + /mix.lock)
       (src + /config)
       (src + /lib)
       (src + /priv)
-    ];
+      ]);
   };
 in (beam.mixRelease {
   pname = "emailjanitor";

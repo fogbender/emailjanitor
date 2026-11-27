@@ -107,7 +107,12 @@ or user-data: those would persist in state and instance metadata.
 
 ## NixOS runtime and secrets
 
-Import `nix/module.nix` into the NixOS image and supply the built Elixir release:
+Add a locked Email Janitor flake input and include its `nixosModules.default`
+in the image's module list. That export supplies the release built with Email
+Janitor's pinned nixpkgs, independently of the host's nixpkgs; see
+[release packaging](../docs/release-packaging.md).
+
+For a lower-level path import, explicitly supply that reviewed flake package:
 
 ```nix
 {

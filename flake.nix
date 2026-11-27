@@ -8,6 +8,11 @@
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in {
+      nixosModules.default = { lib, pkgs, ... }: {
+        imports = [ ./nix/module.nix ];
+        services.emailjanitor.package =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.emailjanitor;
+      };
       packages = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
         in rec {

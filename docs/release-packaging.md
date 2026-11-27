@@ -16,8 +16,12 @@ The unit keeps generated runtime configuration in private `/run/emailjanitor`,
 outside backups, and preserves `ProcSubset=all` with `ProtectProc=invisible` so
 owner recovery can read boot identity and its own UID's process-start records.
 
-The NixOS `services.emailjanitor.package` option defaults to this release. An
-operator can still supply a separately reviewed package. The release contains
+The flake exports `nixosModules.default`, which defaults to this exact pinned
+release even if the NixOS host uses another nixpkgs. Import that flake module into
+the image. The lower-level path module `nix/module.nix` still requires an explicit
+`services.emailjanitor.package`; supply the flake package when using it. An
+operator can supply another reviewed package. Direct source imports also filter
+Git working trees to tracked files, excluding ignored/untracked files. The release contains
 the reviewed engine and SDK transport; merely starting it does not configure an
 inbox or establish that supervised host workers are ready. Single-user host
 startup, Google connection/chat, exact scoped migrations, runtime secrets and

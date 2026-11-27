@@ -6,13 +6,7 @@ in {
     enable = lib.mkEnableOption "the single-user Email Janitor service";
     package = lib.mkOption {
       type = lib.types.package;
-      default = import ./release.nix {
-        inherit lib;
-        inherit (pkgs) coreutils;
-        beam = pkgs.beam.packages.erlang_28;
-        src = ../.;
-      };
-      description = "Locked Elixir release providing bin/email_janitor. Host worker startup remains an application integration gate.";
+      description = "Elixir release providing bin/email_janitor. The flake's NixOS module defaults to its pinned package.";
     };
     environmentFile = lib.mkOption {
       type = lib.types.str;

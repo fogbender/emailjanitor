@@ -322,7 +322,7 @@ separate work. No service account keys or email bodies are introduced here.
 
 The [AWS/OpenTofu and NixOS foundation](infra/README.md) includes isolated mail
 transport, Gmail notification wiring, provider-mocked checks and a service module
-that defaults to the locked release package. It has not been applied and is not yet a complete
+whose flake export defaults to the locked release package. It has not been applied and is not yet a complete
 installer or deployable application. Run its local checks with:
 
 ```sh

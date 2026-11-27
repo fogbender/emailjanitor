@@ -6,22 +6,25 @@ let
     sha256 = locked.narHash;
   };
   pkgs = import nixpkgs { system = "x86_64-linux"; };
+  outputs = (import ../flake.nix).outputs {
+    self = outputs;
+    nixpkgs = { outPath = nixpkgs; lib = pkgs.lib; };
+  };
   host = import (nixpkgs + "/nixos/lib/eval-config.nix") {
     system = "x86_64-linux";
     modules = [
-      ./module.nix
+      outputs.nixosModules.default
       ({ ... }: {
         system.stateVersion = "26.05";
         fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
         boot.loader.grub.devices = [ "/dev/vda" ];
         services.emailjanitor.enable = true;
-        # This is only an evaluation fixture, not a deployable application release.
-        services.emailjanitor.package = pkgs.writeShellScriptBin "email_janitor" "exit 0";
       })
     ];
   };
   service = host.config.systemd.services.emailjanitor;
 in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/environment";
+   assert host.config.services.emailjanitor.package.drvPath == outputs.packages.x86_64-linux.emailjanitor.drvPath;
    assert service.serviceConfig.User == "emailjanitor";
    assert service.environment.ERL_CRASH_DUMP == "/dev/null";
    assert service.serviceConfig.LimitCORE == 0;
