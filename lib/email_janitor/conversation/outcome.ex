@@ -21,6 +21,7 @@ defmodule EmailJanitor.Conversation.Outcome do
     unavailable = Enum.count(results, &(&1["status"] == "unavailable"))
     unchanged = Enum.count(results, &(&1["status"] == "unchanged"))
     not_found = Enum.count(results, &(&1["status"] == "missing"))
+    unsupported = Enum.count(results, &(&1["status"] == "unsupported"))
 
     [
       preferences,
@@ -44,6 +45,10 @@ defmodule EmailJanitor.Conversation.Outcome do
         do: "I could not finish processing #{count(unavailable)}. Please try again."
       ),
       if(not_found > 0, do: "#{count(not_found)} could no longer be found."),
+      if(unsupported > 0,
+        do:
+          "I could not restore #{count(unsupported)} because restoration is unavailable for this request."
+      ),
       if(unchanged > 0, do: "#{count(unchanged)} needed no inbox change.")
     ]
     |> Enum.reject(&(&1 in [nil, ""]))

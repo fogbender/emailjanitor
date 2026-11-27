@@ -238,7 +238,7 @@ defmodule EmailJanitor.Conversation.Ledger do
     end)
   end
 
-  @result_statuses ~w(done restored protected blocked unresolved unavailable unchanged missing)
+  @result_statuses ~w(done restored protected blocked unresolved unavailable unchanged missing unsupported)
   def record_result(scope, inbox_id, conversation_id, request_id, reference, status, effect_id)
       when status in @result_statuses do
     with true <- is_nil(effect_id) or match?({:ok, _}, Ecto.UUID.cast(effect_id)) do
@@ -265,7 +265,9 @@ defmodule EmailJanitor.Conversation.Ledger do
                 "protected",
                 "blocked",
                 "unresolved",
-                "unchanged"
+                "unchanged",
+                "missing",
+                "unsupported"
               ] ->
             receipt
 

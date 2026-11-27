@@ -4,6 +4,7 @@ defmodule EmailJanitor.Conversation do
 
   alias EmailJanitor.Conversation.{
     Context,
+    Evidence,
     ExplicitSelection,
     Instructions,
     Ledger,
@@ -34,6 +35,10 @@ defmodule EmailJanitor.Conversation do
          {:ok, _} <- Ecto.UUID.cast(ctx.conversation_id),
          true <- not ctx.scope.repo.in_transaction?(),
          true <- byte_size(Content.read(request)) in 1..16_000,
+         {:ok, _} <- Evidence.decode(ctx.request_evidence),
+         true <-
+           is_nil(ctx.previous_request_id) or
+             match?({:ok, _}, Ecto.UUID.cast(ctx.previous_request_id)),
          :ok <- ctx.guard.(),
          {:ok, snapshot} <- Preferences.snapshot(ctx.scope, ctx.inbox.id) do
       case Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id) do
@@ -56,7 +61,11 @@ defmodule EmailJanitor.Conversation do
   end
 
   defp plan(ctx, request_id, request, snapshot, pending) do
-    previous = Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+    previous =
+      if ctx.previous_request_id,
+        do: Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, ctx.previous_request_id),
+        else: Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+
     ctx = %{ctx | model: Keyword.put(ctx.model, :previous_effects, previous_effects(previous))}
 
     evidence =
@@ -86,7 +95,9 @@ defmodule EmailJanitor.Conversation do
              request,
              refs,
              messages,
-             Keyword.put(ctx.model, :search_truncated, truncated)
+             ctx.model
+             |> Keyword.put(:search_truncated, truncated)
+             |> Keyword.put(:request_evidence, ctx.request_evidence)
            ) do
       case proposal do
         %Plan{operation: :search} when remaining > 0 ->
@@ -363,6 +374,7 @@ defmodule EmailJanitor.Conversation do
                     opts
                   ])
                 else
+                  false -> {:error, :restore_unsupported}
                   _ -> {:error, :restore_unavailable}
                 end
               rescue
@@ -433,7 +445,10 @@ defmodule EmailJanitor.Conversation do
                 {"unchanged", nil}
 
               status == "done" ->
-                {"unavailable", nil}
+                {"protected", nil}
+
+              (status == "unresolved" and action) && action.state == :unresolved ->
+                {"protected", nil}
 
               status == "unresolved" ->
                 {"unavailable", nil}
@@ -458,6 +473,26 @@ defmodule EmailJanitor.Conversation do
 
   defp restore_result({:existing, state, id}) when state in [:intent, :unresolved],
     do: {"unresolved", id}
+
+  defp restore_result({:existing, :cancelled, _}), do: {"unsupported", nil}
+
+  defp restore_result({:error, reason})
+       when reason in [
+              :invalid_restore_selection,
+              :effect_conflict,
+              :unconfirmed_suppression,
+              :restore_unsupported,
+              :unconfirmed_restoration,
+              :wrong_inbox,
+              :connection_changed,
+              :instructions_changed,
+              :ownership_lost,
+              :dispatch_window_exhausted,
+              :authorization_required,
+              :forbidden,
+              :rate_limited
+            ],
+       do: {"unsupported", nil}
 
   defp restore_result(_), do: {"unavailable", nil}
 

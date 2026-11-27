@@ -310,7 +310,7 @@ defmodule EmailJanitor.ConversationTest do
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 
-  test "a missing restore adapter reports unavailable without claiming an uncertain Gmail attempt",
+  test "a missing restore adapter finishes with an honest unsupported result",
        t do
     ctx = context(t.ctx, target: :none)
 
@@ -322,12 +322,17 @@ defmodule EmailJanitor.ConversationTest do
 
     request_id = Ecto.UUID.generate()
 
-    assert {:error, :effects_pending} =
+    assert {:ok, reply} =
              Conversation.respond(ctx, request_id, Content.new("Undo that."))
 
+    assert Content.read(reply) =~ "could not restore"
+    refute Content.read(reply) =~ "uncertain"
+    refute Content.read(reply) =~ "try again"
+
     receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
-    refute receipt.completed
-    assert Enum.map(receipt.results, & &1["status"]) == ["unavailable"]
+    assert receipt.completed
+    assert Enum.map(receipt.results, & &1["status"]) == ["unsupported"]
+    assert {:ok, ^reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 
@@ -808,13 +813,85 @@ defmodule EmailJanitor.ConversationTest do
     ctx = %{context(t.ctx, target: :none) | conversation_id: Ecto.UUID.generate()}
     request_id = Ecto.UUID.generate()
 
-    assert {:error, :effects_pending} =
+    assert {:ok, reply} =
              Conversation.respond(ctx, request_id, Content.new("Done."))
 
     receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
-    refute receipt.completed
+    assert receipt.completed
     assert Enum.map(receipt.results, & &1["effect_id"]) == [nil]
-    assert Enum.map(receipt.results, & &1["status"]) == ["unavailable"]
+    assert Enum.map(receipt.results, & &1["status"]) == ["protected"]
+    assert Content.read(reply) =~ "mailbox safeguard"
+    refute Content.read(reply) =~ "uncertain"
+    assert {:ok, ^reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "a foreign settled action that never applied this message is a terminal safeguard", t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    TestRepo.update_all(Action, [set: [applied_message_ids: []]], prefix: ctx.scope.prefix)
+
+    Agent.update(t.state, fn state ->
+      %{state | messages: Enum.map(state.messages, &%{&1 | labels: ["INBOX", "UNREAD"]})}
+    end)
+
+    ctx = %{ctx | conversation_id: Ecto.UUID.generate()}
+    request_id = Ecto.UUID.generate()
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Done."))
+    assert Content.read(reply) =~ "mailbox safeguard"
+    receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+    assert receipt.completed
+    assert Enum.map(receipt.results, & &1["effect_id"]) == [nil]
+    assert Enum.map(receipt.results, & &1["status"]) == ["protected"]
+    assert {:ok, ^reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    assert TestRepo.aggregate(Action, :count, :id, prefix: ctx.scope.prefix) == 1
+  end
+
+  test "an email reply pins its original scoped request instead of the latest web action", t do
+    original_id = Ecto.UUID.generate()
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, original_id, Content.new("Done."))
+
+    newer = fn _, _, _ ->
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new("New unrelated answer"),
+         search_complete: true
+       }}
+    end
+
+    assert {:ok, _} =
+             Conversation.respond(
+               %{ctx | model: [script: newer]},
+               Ecto.UUID.generate(),
+               Content.new("An unrelated web question.")
+             )
+
+    for {previous_id, expected} <- [{original_id, "done"}, {Ecto.UUID.generate(), nil}] do
+      script = fn _, _, opts ->
+        if expected,
+          do: assert(opts[:previous_effects]["operation"] == expected),
+          else: assert(is_nil(opts[:previous_effects]))
+
+        assert newer.(nil, nil, nil)
+      end
+
+      pinned = %{ctx | previous_request_id: previous_id, model: [script: script]}
+
+      assert {:ok, _} =
+               Conversation.respond(
+                 pinned,
+                 Ecto.UUID.generate(),
+                 Content.new("What happened to that?")
+               )
+    end
+
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 end
