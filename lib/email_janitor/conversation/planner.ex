@@ -1,7 +1,7 @@
 defmodule EmailJanitor.Conversation.Planner do
   @moduledoc "Transient conversation planning through the shared bounded model SDK."
   alias EmailJanitor.{Content, Inbox, Message, Preferences}
-  alias EmailJanitor.Conversation.{Plan, Reference}
+  alias EmailJanitor.Conversation.{Instructions, Plan, Reference}
   alias EmailJanitor.Models.SDK
   @external_resource Path.expand("../../../priv/prompts/conversation.txt", __DIR__)
   @prompt File.read!(@external_resource)
@@ -14,7 +14,9 @@ defmodule EmailJanitor.Conversation.Planner do
         messages,
         opts
       ) do
-    with true <- byte_size(Content.read(request)) in 1..16_000,
+    with {:ok, truncated} <- Keyword.fetch(opts, :search_truncated),
+         true <- is_boolean(truncated),
+         true <- byte_size(Content.read(request)) in 1..16_000,
          true <- String.valid?(Content.read(request)),
          true <- snapshot.inbox_id == inbox.id,
          true <- is_list(references) and length(references) <= 10,
@@ -24,15 +26,20 @@ defmodule EmailJanitor.Conversation.Planner do
          true <- length(Enum.uniq(tokens)) == length(tokens),
          true <- is_list(messages) and length(messages) <= 5,
          true <- Enum.all?(messages, &known_message?(&1, references)),
+         {:ok, messages} <- readable_messages(messages),
+         instructions = %{
+           all: Instructions.entries(snapshot.global),
+           inbox: Instructions.entries(snapshot.local)
+         },
          payload = %{
            "SELECTED_INBOX" => inbox.address,
            "EXISTING_PREFERENCES" => %{
-             "all" => Content.read(snapshot.global),
-             "inbox" => Content.read(snapshot.local)
+             "all" => Enum.map(instructions.all, &instruction/1),
+             "inbox" => Enum.map(instructions.inbox, &instruction/1)
            },
            "USER_MESSAGE" => Content.read(request),
            "SEARCH_RESULTS" => Enum.map(references, &reference/1),
-           "SEARCH_TRUNCATED" => Keyword.get(opts, :search_truncated, false),
+           "SEARCH_TRUNCATED" => truncated,
            "UNTRUSTED_EMAILS" => Enum.map(messages, &message(&1, references))
          },
          {:ok, object} <-
@@ -44,11 +51,17 @@ defmodule EmailJanitor.Conversation.Planner do
            ) do
       bodies = messages |> Enum.map(& &1.body) |> Enum.filter(&match?(%Content{}, &1))
 
-      with {:ok, plan} <- Plan.parse(Content.read(object), tokens, bodies),
+      with {:ok, plan} <-
+             Plan.parse(
+               Content.read(object),
+               tokens,
+               bodies,
+               Map.new(instructions, fn {scope, rows} -> {scope, Enum.map(rows, & &1.id)} end)
+             ),
            true <-
-             not Keyword.get(opts, :search_truncated, false) or
+             not truncated or
                (plan.operation in [:search, :answer] and plan.preference_target == :none) do
-        {:ok, plan}
+        {:ok, %{plan | search_complete: not truncated}}
       else
         _ -> {:error, :conversation_unavailable}
       end
@@ -59,6 +72,17 @@ defmodule EmailJanitor.Conversation.Planner do
     _ -> {:error, :conversation_unavailable}
   catch
     _, _ -> {:error, :conversation_unavailable}
+  end
+
+  defp instruction(entry), do: %{"reference" => entry.id, "text" => Content.read(entry.text)}
+
+  defp readable_messages(messages) do
+    Enum.reduce_while(messages, {:ok, []}, fn message, {:ok, acc} ->
+      case SDK.readable_body(message, 8_000) do
+        {:ok, body} -> {:cont, {:ok, acc ++ [%{message | body: body}]}}
+        _ -> {:halt, {:error, :unreadable_content}}
+      end
+    end)
   end
 
   defp known_message?(%Message{} = message, references),
