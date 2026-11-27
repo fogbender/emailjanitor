@@ -653,6 +653,13 @@ defmodule EmailJanitor.RestoreTest do
     assert action == ctx.action_id
     assert [%Effect{state: :unresolved, applied_at: %DateTime{}}] = effects(ctx)
     assert {:ok, [^id]} = Restore.pending_settlements(ctx.scope, ctx.box)
+
+    assert {:error, :wrong_inbox} =
+             Restore.pending_settlements(ctx.scope, %{ctx.box | address: "stale@example.com"})
+
+    assert {:error, :invalid_restore_selection} =
+             Restore.pending_settlements(ctx.scope, ctx.box, 0)
+
     assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).state == :done
 
     assert {:existing, :done, ^id} =
