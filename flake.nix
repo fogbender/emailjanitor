@@ -12,6 +12,8 @@
         imports = [ ./nix/module.nix ];
         services.emailjanitor.package =
           lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.emailjanitor;
+        services.emailjanitor.replyParserPackage =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.reply-parser;
         services.emailjanitor-google-token.package =
           lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.google-auth-bridge;
       };

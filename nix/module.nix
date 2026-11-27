@@ -9,6 +9,10 @@ in {
       type = lib.types.package;
       description = "Elixir release providing bin/email_janitor. The flake's NixOS module defaults to its pinned package.";
     };
+    replyParserPackage = lib.mkOption {
+      type = lib.types.package;
+      description = "Pinned maintained reply parser providing bin/emailjanitor-reply-parser; the flake supplies its matching package.";
+    };
     environmentFile = lib.mkOption {
       type = lib.types.str;
       default = "/run/secrets/emailjanitor/environment";
@@ -61,6 +65,12 @@ in {
       virtualHosts.${cfg.publicHostname} = {
         forceSSL = true;
         enableACME = true;
+        extraConfig = ''
+          # OAuth callbacks contain one-use secrets in the request URI. Avoid
+          # access logs and upstream-error request dumps for this dedicated host.
+          access_log off;
+          error_log /dev/null;
+        '';
         locations."/".extraConfig = ''
           proxy_pass http://127.0.0.1:4000;
           proxy_http_version 1.1;
@@ -93,6 +103,7 @@ in {
         JANITOR_CREDENTIAL_KEY_FILE = "%d/credential-key";
         JANITOR_SECRET_KEY_BASE_FILE = "%d/web-secret";
         JANITOR_GOOGLE_CLIENT_JSON_FILE = "%d/google-client.json";
+        JANITOR_REPLY_PARSER_EXECUTABLE = "${cfg.replyParserPackage}/bin/emailjanitor-reply-parser";
         ERL_CRASH_DUMP = "/dev/null";
         RELEASE_TMP = "/run/emailjanitor/release";
         RELEASE_DISTRIBUTION = "none";

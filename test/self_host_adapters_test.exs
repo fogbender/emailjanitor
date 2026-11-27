@@ -49,6 +49,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       EmailJanitor.Gmail.Ingestion.install(scope)
       EmailJanitor.Worker.install(scope)
       Digest.install_staging(scope)
+      EmailJanitor.Mail.Feedback.install(scope)
       HostStore.install(scope)
       Ecto.Migrator.up(Repo, 102, SelfHost.AuthorityMigration, prefix: scope.prefix, log: false)
     end)
@@ -67,6 +68,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       public_url: "https://janitor.example.com",
       credential_key: Content.new(:crypto.strong_rand_bytes(32)),
       web_secret: Content.new(String.duplicate("s", 64)),
+      reply_parser_executable: System.find_executable("emailjanitor-reply-parser"),
       mail: %{
         "JANITOR_MAIL_SENDER" => "janitor@janitor.example.com",
         "JANITOR_MAIL_BUCKET" => "janitor-spool",
@@ -327,5 +329,164 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     assert Repo.get_by!(Candidate, [inbox_id: ctx.box.id, candidate_id: pending.id],
              prefix: ctx.scope.prefix
            ).message_ids == ["m2"]
+  end
+
+  defp envelope(address) do
+    now = DateTime.utc_now()
+
+    %EmailJanitor.Mail.Feedback.Envelope{
+      ses_id: "ses-route",
+      from: address,
+      rfc_message_id: "route@example.com",
+      received_at: now,
+      expires_at: DateTime.add(now, 3600),
+      signup_allowed: false
+    }
+  end
+
+  test "email context routes only verified connected metadata and fences sender epoch", ctx do
+    alias EmailJanitor.SelfHost.Email
+    {:ok, route} = Email.route(envelope(ctx.box.address))
+    {:ok, binding} = Email.resolve(ctx.config, route.key)
+    sent = message(id: "sent-1", headers: [{"From", ctx.box.address}], body: "PRIVATE_SENT_BODY")
+    assert {:ok, first} = binding.route_verified.(sent)
+    assert first.inbox == ctx.box
+    assert {:ok, again} = binding.route_verified.(%{sent | id: "sent-2"})
+    assert first.conversation_id == again.conversation_id
+    assert {:ok, restored} = binding.restore_context.(first.key)
+    assert restored.conversation_id == first.conversation_id
+    assert :ok = restored.guard.()
+    assert :binary.match(:erlang.term_to_binary(first), "PRIVATE_SENT_BODY") == :nomatch
+    assert :unknown = Email.route(envelope("unconnected@example.net"))
+    assert {:error, :feedback_connection_changed} = Email.resolve(ctx.config, "malformed")
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert {:error, _} = binding.restore_context.(first.key)
+    assert {:error, :feedback_connection_changed} = Email.resolve(ctx.config, route.key)
+  end
+
+  test "recorded digest references select the command inbox and retain rename proof", ctx do
+    alias EmailJanitor.SelfHost.Email
+    alias EmailJanitor.Mail.{Outbox, Outgoing}
+    other_result = %{ctx.result | subject: "other-subject", email: "other@example.com"}
+    {:ok, other} = SelfHost.connect(ctx.owner, other_result, "Etc/UTC")
+    binding = Repo.get!(Binding, other.id, prefix: ctx.scope.prefix)
+    :ok = HostStore.activate({other.id, binding.epoch})
+    snapshot_id = Ecto.UUID.generate()
+    {:ok, outgoing} = Outbox.enqueue(ctx.scope, other.id, :digest, [snapshot_id], snapshot_id)
+
+    Repo.insert!(
+      %Digest.Snapshot{
+        id: snapshot_id,
+        inbox_id: other.id,
+        timezone: "Etc/UTC",
+        local_date: Date.utc_today(),
+        cutoff: DateTime.utc_now(),
+        outbox_id: outgoing.id
+      },
+      prefix: ctx.scope.prefix
+    )
+
+    Repo.update!(
+      Ecto.Changeset.change(outgoing,
+        state: :sent,
+        provider_id: "digest-proof",
+        sender: "janitor@janitor.example.com",
+        recipient: other.address
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    {:ok, renamed} =
+      SelfHost.connect(ctx.owner, %{other_result | email: "renamed@example.com"}, "Etc/UTC")
+
+    {:ok, route} = Email.route(envelope(ctx.box.address))
+    {:ok, sender} = Email.resolve(ctx.config, route.key)
+
+    sent =
+      message(
+        headers: [{"In-Reply-To", "<digest-proof@email.amazonses.com>"}],
+        body: "PRIVATE_FORWARDED_BODY"
+      )
+
+    assert {:ok, context} = sender.route_verified.(sent)
+    assert context.inbox == renamed
+    assert context.conversation_id == snapshot_id
+    Repo.update_all(Outgoing, [set: [state: :unresolved]], prefix: ctx.scope.prefix)
+    assert {:clarify, fallback} = sender.route_verified.(sent)
+    assert fallback.inbox == ctx.box
+  end
+
+  test "intake acknowledges durable metadata then a restarted processor purges raw mail before Sent lookup",
+       ctx do
+    alias EmailJanitor.SelfHost.{Email, MailJobs, Transport}
+    alias EmailJanitor.Mail.{Incoming, Spool}
+    alias EmailJanitor.Mail.Feedback.Record
+    alias EmailJanitor.MailFixture, as: F
+    :ok = Transport.install(ctx.config)
+    {:ok, initial} = Email.config(ctx.config)
+    dummy = F.config(fn _ -> flunk("unused") end)
+    {_receipt, json} = F.receipt(dummy, "ses-intake")
+    notification = Jason.encode!(json)
+    test_pid = self()
+
+    raw =
+      "From: owner@example.com\r\nTo: janitor@janitor.example.com\r\nSubject: Cleanup\r\nMessage-ID: <intake@example.com>\r\n\r\nPRIVATE_SMTP_COMMAND_BODY"
+
+    mail =
+      F.config(fn conn ->
+        case conn.method do
+          "POST" ->
+            {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+            case URI.decode_query(body)["Action"] do
+              "ReceiveMessage" ->
+                Plug.Conn.send_resp(
+                  conn,
+                  200,
+                  "<ReceiveMessageResponse><ReceiveMessageResult><Message><MessageId>q1</MessageId><ReceiptHandle>handle1</ReceiptHandle><Body>#{notification}</Body><MD5OfBody>x</MD5OfBody></Message></ReceiveMessageResult></ReceiveMessageResponse>"
+                )
+
+              "DeleteMessage" ->
+                assert %Incoming{state: :pending} = Spool.get(ctx.scope, "ses-intake")
+                send(test_pid, :ack_after_durable_accept)
+
+                Plug.Conn.send_resp(
+                  conn,
+                  200,
+                  "<DeleteMessageResponse><ResponseMetadata><RequestId>r1</RequestId></ResponseMetadata></DeleteMessageResponse>"
+                )
+            end
+
+          "GET" ->
+            send(test_pid, :raw_read)
+            Plug.Conn.send_resp(conn, 200, raw)
+
+          "DELETE" ->
+            assert %Record{source_ses_id: "ses-intake"} =
+                     Repo.one(Record, prefix: ctx.scope.prefix)
+
+            send(test_pid, :raw_deleted_after_feedback_record)
+            Plug.Conn.send_resp(conn, 204, "")
+        end
+      end)
+
+    config = %{
+      initial
+      | mail: mail,
+        resolve: fn _ -> flunk("Sent lookup must wait for separate feedback job") end
+    }
+
+    assert {:next, nil, 1000} = MailJobs.receive_once(config)
+    assert_received :ack_after_durable_accept
+    refute_received :raw_read
+    assert %Incoming{state: :pending} = Spool.get(ctx.scope, "ses-intake")
+    assert {:next, nil, 0} = MailJobs.process_once(config)
+    assert_received :raw_read
+    assert_received :raw_deleted_after_feedback_record
+    assert %Incoming{state: :deleted} = Spool.get(ctx.scope, "ses-intake")
+    row = Repo.one!(Record, prefix: ctx.scope.prefix)
+    assert :binary.match(:erlang.term_to_binary(row), "PRIVATE_SMTP_COMMAND_BODY") == :nomatch
+    assert Repo.aggregate(EmailJanitor.Mail.Outgoing, :count, prefix: ctx.scope.prefix) == 0
+    assert {:next, nil, 1000} = MailJobs.process_once(config)
   end
 end

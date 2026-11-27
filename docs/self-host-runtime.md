@@ -66,3 +66,51 @@ persist here. Email bodies, raw replies, rendered digests and conversation
 transcripts do not belong in these tables. Tests exercise real SDK refresh wire
 fixtures, disconnect/reconsent races, owner/address reuse, ciphertext tampering,
 callback-origin checks and runtime secret bounds against fresh local PostgreSQL.
+
+The opt-in runtime builds SDK capabilities from each connection's own encrypted
+grant and immutable Google subject. A durable manual command records only its
+authenticated owner, inbox, conversation/request IDs, exact selected message IDs
+and connection epoch (host migration 102). Refresh preserves the authority;
+disconnect or an address rename invalidates it. The unlimited self-host policy
+stages sender/subject metadata before a Done intent and confirms only durable
+applied IDs. Exact retirement also narrows worker provenance so a corrected
+message cannot strand an unrelated sibling.
+
+Receipt intake acknowledges SQS only after durable metadata acceptance. A
+separate database-backed processor resumes raw inputs after a crash, even if the
+queue delivery was already acknowledged. Incoming SMTP content supplies routing
+hints; instructions are read from a fresh authenticated copy in the connected
+account's Sent folder. Digest/assistant context comes from confirmed, scoped SES
+delivery evidence. Neither SMTP References nor model fields select an inbox.
+Body parsing and authentication failures cannot extend the one-hour processing
+TTL. Independent cleanup jobs attempt deletion at least minutely and drain every
+continuation, including failed pages. Provider outages or an offline host can
+delay physical deletion; S3 lifecycle is a delayed fallback. No raw spool is
+versioned or backed up. Reply recovery renders metadata receipts, or gives an
+honest fixed clarification when no conversational answer was retained.
+
+The NixOS module passes three SOPS runtime files through `LoadCredential`:
+`/run/secrets/emailjanitor/credential-key`, `web-secret`, and `google-client.json`.
+The Google JSON must authorize the exact `JANITOR_PUBLIC_URL` origin plus
+`/auth/google/callback`. Never put those file contents in Nix or OpenTofu state.
+The module runs ascending migrations before startup, keeps PostgreSQL on its
+local Unix socket, disables core dumps/distribution, and preserves access to
+boot/process identity needed for durable owner recovery. The maintained reply
+parser is supplied from the same pinned flake.
+
+`nixosModules.google-token` is also usable by the private Azure host. Its
+`services.emailjanitor-google-token.configuration` contains only the official
+Google external-account **metadata**, not a private key or token. A root-owned
+SDK helper refreshes `/run/emailjanitor-google-token/token.json` every minute;
+the app group can read the atomic, short-lived file but cannot change it. The app
+reads a fresh file for each resolution rather than a boot-time credential copy.
+The AWS reference still uses only its instance role for Bedrock and SES/S3/SQS.
+
+Setting `services.emailjanitor.publicHostname` enables the reference Nginx/ACME
+HTTPS proxy; the app itself listens on loopback port 4000. This hostname must
+match `JANITOR_PUBLIC_URL`, DNS must already point to the host, and the reviewed
+cloud firewall must separately allow HTTP/HTTPS before certificate issuance.
+The proxy **overwrites** `X-Real-IP` with the socket remote address and removes
+forwarded chains. It disables dedicated-host access/error request logs so OAuth
+code/state, cookies and chat content do not enter proxy logs. Null leaves public
+web access closed for the SSH pilot; this module performs no DNS/cloud changes.

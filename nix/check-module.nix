@@ -66,6 +66,7 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert service.environment.JANITOR_CREDENTIAL_KEY_FILE == "%d/credential-key";
    assert service.environment.JANITOR_SECRET_KEY_BASE_FILE == "%d/web-secret";
    assert service.environment.JANITOR_GOOGLE_CLIENT_JSON_FILE == "%d/google-client.json";
+   assert service.environment.JANITOR_REPLY_PARSER_EXECUTABLE == "${outputs.packages.x86_64-linux.reply-parser}/bin/emailjanitor-reply-parser";
    assert builtins.length service.serviceConfig.LoadCredential == 3;
    assert pkgs.lib.hasInfix "SelfHost.Release.migrate()" service.serviceConfig.ExecStartPre;
    assert tokenHost.config.systemd.services.emailjanitor.environment.JANITOR_GOOGLE_TOKEN_FILE == "/run/emailjanitor-google-token/token.json";
@@ -76,6 +77,8 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert builtins.elem "-/run/credentials" tokenService.serviceConfig.InaccessiblePaths;
    assert tokenHost.config.systemd.timers.emailjanitor-google-token.timerConfig.OnUnitActiveSec == "60s";
    assert proxy.forceSSL && proxy.enableACME;
+   assert pkgs.lib.hasInfix "access_log off;" proxy.extraConfig;
+   assert pkgs.lib.hasInfix "error_log /dev/null;" proxy.extraConfig;
    assert pkgs.lib.hasInfix "proxy_set_header X-Real-IP $remote_addr;" proxy.locations."/".extraConfig;
    assert !(pkgs.lib.hasInfix "$http_x_real_ip" proxy.locations."/".extraConfig);
    assert builtins.elem 443 webHost.config.networking.firewall.allowedTCPPorts;

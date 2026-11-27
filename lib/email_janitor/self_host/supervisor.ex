@@ -4,21 +4,21 @@ defmodule EmailJanitor.SelfHost.Supervisor do
   alias EmailJanitor.SelfHost
   alias EmailJanitor.SelfHost.{Config, Repo, Runtime}
 
-  def start_link(%Config{} = config),
-    do: Supervisor.start_link(__MODULE__, config, name: __MODULE__)
+  def start_link(%Config{} = config) do
+    if Runtime.ready?(config) and
+         (not config.enable_web or Code.ensure_loaded?(EmailJanitor.SelfHost.Web)),
+       do: Supervisor.start_link(__MODULE__, config, name: __MODULE__),
+       else: {:error, :incomplete_self_host_release}
+  end
 
   @impl true
   def init(config) do
     web = EmailJanitor.SelfHost.Web
 
-    if Runtime.ready?(config) and (not config.enable_web or Code.ensure_loaded?(web)) do
-      Application.put_env(:email_janitor, :self_host_config, config)
-      children = [{Repo, config.database}, {SelfHost.Services, config}]
-      children = if config.enable_web, do: children ++ [{web, config}], else: children
-      Supervisor.init(children, strategy: :rest_for_one)
-    else
-      {:stop, :incomplete_self_host_release}
-    end
+    Application.put_env(:email_janitor, :self_host_config, config)
+    children = [{Repo, config.database}, {SelfHost.Services, config}]
+    children = if config.enable_web, do: children ++ [{web, config}], else: children
+    Supervisor.init(children, strategy: :rest_for_one)
   end
 end
 
@@ -27,9 +27,16 @@ defmodule EmailJanitor.SelfHost.Services do
   use Supervisor
   alias EmailJanitor.{Digest, Gmail, SelfHost}
   alias EmailJanitor.SelfHost.{Adapters, Store}
-  def start_link(config), do: Supervisor.start_link(__MODULE__, config, name: __MODULE__)
+
+  def start_link(config) do
+    case SelfHost.Email.config(config) do
+      {:ok, feedback} -> Supervisor.start_link(__MODULE__, {config, feedback}, name: __MODULE__)
+      _ -> {:error, :invalid_feedback_runtime}
+    end
+  end
+
   @impl true
-  def init(config) do
+  def init({config, feedback}) do
     children = [{SelfHost.Maintenance, config}]
 
     children =
@@ -75,6 +82,7 @@ defmodule EmailJanitor.SelfHost.Services do
           children
       end
 
+    children = children ++ SelfHost.MailJobs.children(feedback)
     Supervisor.init(children, strategy: :one_for_one)
   end
 
