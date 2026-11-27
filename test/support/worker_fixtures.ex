@@ -11,8 +11,12 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   defp watch_result(options, kind) do
     Agent.get_and_update(options[:state], fn state ->
       result =
-        {:ok,
-         %{history_id: state.watch_id, expires_at: DateTime.add(DateTime.utc_now(), 604_800)}}
+        if kind == :renew and options[:renew_error] do
+          {:error, options[:renew_error]}
+        else
+          {:ok,
+           %{history_id: state.watch_id, expires_at: DateTime.add(DateTime.utc_now(), 604_800)}}
+        end
 
       {result, %{state | calls: state.calls ++ [kind]}}
     end)
@@ -44,9 +48,10 @@ defmodule EmailJanitor.WorkerTest.Gmail do
 
   def thread_id(_, id, options) do
     Agent.get(options[:state], fn state ->
-      case Enum.find(state.messages, &(&1.id == id)) do
-        nil -> {:error, :not_found}
-        message -> {:ok, message.thread_id}
+      case {options[:thread_id_error], Enum.find(state.messages, &(&1.id == id))} do
+        {error, _} when not is_nil(error) -> {:error, error}
+        {_, nil} -> {:error, :message_not_found}
+        {_, message} -> {:ok, message.thread_id}
       end
     end)
   end
@@ -55,6 +60,9 @@ defmodule EmailJanitor.WorkerTest.Gmail do
     Agent.get_and_update(options[:state], fn state ->
       result =
         cond do
+          options[:snapshot_error] ->
+            {:error, options[:snapshot_error]}
+
           thread in Keyword.get(options, :snapshot_outages, []) ->
             {:error, :gmail_unavailable}
 
@@ -71,12 +79,25 @@ defmodule EmailJanitor.WorkerTest.Gmail do
 
   def thread(_, thread, options) do
     Agent.get_and_update(options[:state], fn state ->
-      result =
-        if thread in Keyword.get(options, :thread_failures, []),
-          do: {:error, Keyword.get(options, :thread_error, :invalid_thread)},
-          else: {:ok, Enum.filter(state.messages, &(&1.thread_id == thread))}
+      count = Map.get(state, :full_thread_count, 0) + 1
 
-      {result, %{state | calls: state.calls ++ [:full_thread]}}
+      injected =
+        if options[:full_thread_error_at] == count,
+          do: Keyword.get(options, :full_thread_late_error, :thread_not_found)
+
+      result =
+        if injected || options[:full_thread_error],
+          do: {:error, injected || options[:full_thread_error]},
+          else:
+            if(thread in Keyword.get(options, :thread_failures, []),
+              do: {:error, Keyword.get(options, :thread_error, :invalid_thread)},
+              else: {:ok, Enum.filter(state.messages, &(&1.thread_id == thread))}
+            )
+
+      {result,
+       state
+       |> Map.put(:calls, state.calls ++ [:full_thread])
+       |> Map.put(:full_thread_count, count)}
     end)
   end
 

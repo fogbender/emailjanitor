@@ -6,7 +6,6 @@ defmodule EmailJanitor.Worker.Server do
   Durable arrival/receipt/defer state makes scheduler restarts resume safely.
   """
   use GenServer
-  alias EmailJanitor.Gmail.Parser
   alias EmailJanitor.Worker
 
   @good [
@@ -75,7 +74,7 @@ defmodule EmailJanitor.Worker.Server do
 
   @impl true
   def handle_cast({:wake, ref}, state) do
-    if Parser.valid_id?(ref) do
+    if valid_ref?(ref) do
       now = System.monotonic_time(:millisecond)
 
       entries =
@@ -259,7 +258,7 @@ defmodule EmailJanitor.Worker.Server do
     try do
       case list.() do
         {:ok, refs} when is_list(refs) and length(refs) <= 10_000 ->
-          if Enum.all?(refs, &Parser.valid_id?/1), do: {:ok, Enum.uniq(refs)}, else: :error
+          if Enum.all?(refs, &valid_ref?/1), do: {:ok, Enum.uniq(refs)}, else: :error
 
         _ ->
           :error
@@ -270,4 +269,6 @@ defmodule EmailJanitor.Worker.Server do
       _, _ -> :error
     end
   end
+
+  defp valid_ref?(ref), do: is_binary(ref) and byte_size(ref) in 1..256
 end
