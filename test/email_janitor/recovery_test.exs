@@ -578,6 +578,8 @@ defmodule EmailJanitor.RecoveryTest do
 
     refute log =~ "PRIVATE_EMAIL_SENTINEL"
     assert_receive {:isolated, owner, action}
+    owner_monitor = Process.monitor(owner)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, _}, 5_000
     refute owner == caller
     assert Process.alive?(caller)
     assert Owner.proof(action) == :dead
