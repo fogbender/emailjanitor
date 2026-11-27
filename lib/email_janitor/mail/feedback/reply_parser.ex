@@ -7,7 +7,7 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
          subject when is_binary(subject) <- Message.header(message, "subject") || "",
          true <- byte_size(subject) <= 1024,
          raw = Content.read(body),
-         true <- is_binary(raw) and byte_size(raw) <= 1_000_000,
+         true <- is_binary(raw) and byte_size(raw) <= 128_000 and String.valid?(raw),
          frame =
            Jason.encode!(%{
              body: raw,
@@ -16,19 +16,30 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
                not is_nil(Message.header(message, "in-reply-to")) or
                  not is_nil(Message.header(message, "references"))
            }) <> "\n",
+         true <- byte_size(frame) <= 512_000,
          {:ok, value} <- command(executable, frame),
          {:ok, decoded} <- decode(value) do
       {:ok, decoded}
     else
-      _ -> {:error, :reply_parser_unavailable}
+      _ -> unsupported()
     end
   rescue
-    _ -> {:error, :reply_parser_unavailable}
+    _ -> unsupported()
   catch
-    _, _ -> {:error, :reply_parser_unavailable}
+    _, _ -> unsupported()
   end
 
   def parse(_, %Message{}), do: {:ok, %{status: :clarify, reason: :unsupported_format}}
+
+  defp unsupported, do: {:ok, %{status: :clarify, reason: :unsupported_format}}
+
+  defp drain(port) do
+    receive do
+      {^port, _} -> drain(port)
+    after
+      0 -> :ok
+    end
+  end
 
   defp command(executable, frame) do
     port =
@@ -36,6 +47,7 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
         :binary,
         :exit_status,
         :use_stdio,
+        :stderr_to_stdout,
         :hide
       ])
 
@@ -44,6 +56,7 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
       receive_output(port, <<>>, System.monotonic_time(:millisecond) + 5_000)
     after
       if Port.info(port), do: Port.close(port)
+      drain(port)
     end
   end
 
@@ -90,7 +103,12 @@ defmodule EmailJanitor.Mail.Feedback.ReplyParser do
           {:ok,
            %{
              status: :parsed,
-             kind: kind,
+             kind:
+               case kind do
+                 "reply" -> :reply
+                 "forward" -> :forward
+                 _ -> :direct
+               end,
              authored: Content.new(authored),
              evidence: evidence,
              evidence_omitted: omitted

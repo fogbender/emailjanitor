@@ -36,7 +36,7 @@
             postInstall = ''
               rm "$out/bin/emailjanitor-reply-parser"
               makeBinaryWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-reply-parser" \
-                --add-flags "-i ${pkgs.nodejs_22}/bin/node --max-old-space-size=64 $out/lib/node_modules/@emailjanitor/reply-parser/cli.mjs"
+                --add-flags "-i ${pkgs.coreutils}/bin/timeout --signal=KILL 3s ${pkgs.nodejs_22}/bin/node --max-old-space-size=64 $out/lib/node_modules/@emailjanitor/reply-parser/cli.mjs"
             '';
             doInstallCheck = true;
             installCheckPhase = ''

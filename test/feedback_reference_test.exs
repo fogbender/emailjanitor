@@ -159,4 +159,16 @@ defmodule EmailJanitor.FeedbackReferenceTest do
                fn _, _ -> true end
              )
   end
+
+  test "an exact current Janitor reference does not parse an unrelated oversized thread history",
+       ctx do
+    outgoing(ctx.scope, "ses-current")
+    long_history = Enum.map_join(1..30, " ", &"<old-#{&1}@example.com>")
+
+    assert {:ok, %{inbox_id: "inbox"}} =
+             Reference.delivery(ctx.scope, @sender, [
+               {"In-Reply-To", "<ses-current@amazonses.com>"},
+               {"References", long_history}
+             ])
+  end
 end

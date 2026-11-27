@@ -10,8 +10,7 @@ defmodule EmailJanitor.Mail.Feedback.Reference do
   def delivery(%Scope{} = scope, configured_sender, headers, historical_recipient?)
       when is_list(headers) and length(headers) <= 256 and is_function(historical_recipient?, 2) do
     with {:ok, sender} <- Address.normalize(configured_sender),
-         {:ok, current} <- ids(header(headers, "in-reply-to"), 1),
-         {:ok, history} <- ids(header(headers, "references"), 20) do
+         {:ok, current} <- ids(header(headers, "in-reply-to"), 1) do
       current_ids = ses_ids(current)
 
       cond do
@@ -19,9 +18,11 @@ defmodule EmailJanitor.Mail.Feedback.Reference do
           lookup(scope, sender, current_ids, historical_recipient?)
 
         true ->
-          case ses_ids(history) do
-            [] -> {:ok, :none}
-            ids -> lookup(scope, sender, ids, historical_recipient?)
+          with {:ok, history} <- ids(header(headers, "references"), 20) do
+            case ses_ids(history) do
+              [] -> {:ok, :none}
+              ids -> lookup(scope, sender, ids, historical_recipient?)
+            end
           end
       end
     else

@@ -50,7 +50,7 @@ defmodule EmailJanitor.Mail.Feedback do
          {:ok, id} <- RFCMessageID.request_id(route.inbox_id, envelope.rfc_message_id),
          now = DateTime.utc_now(),
          {:ok, _} <-
-           Ledger.insert(config.transport_scope, %Record{
+           Ledger.admit(config.transport_scope, %Record{
              id: id,
              kind: :feedback,
              source_ses_id: envelope.ses_id,
@@ -66,6 +66,7 @@ defmodule EmailJanitor.Mail.Feedback do
       {:ok, id}
     else
       {:error, :feedback_reference_conflict} -> :rejected
+      {:error, :feedback_rate_limited} -> :ignored
       false -> :rejected
       _ -> {:error, :feedback_unavailable}
     end
@@ -113,7 +114,16 @@ defmodule EmailJanitor.Mail.Feedback do
 
              if count >= 100, do: scope.repo.rollback(:signup_rate_limited)
              {:ok, inbox} = Inbox.new(recipient_id, envelope.from)
-             {:ok, _} = Store.add_inbox(scope, inbox)
+
+             case scope.repo.one(
+                    from(m in Store.Mailbox, where: m.id == ^inbox.id, lock: "FOR UPDATE"),
+                    prefix: scope.prefix
+                  ) do
+               nil -> {:ok, _} = Store.add_inbox(scope, inbox)
+               %{address: address} when address == envelope.from -> :ok
+               _ -> scope.repo.rollback(:signup_recipient_changed)
+             end
+
              now = DateTime.utc_now()
 
              {:ok, row} =
@@ -141,9 +151,10 @@ defmodule EmailJanitor.Mail.Feedback do
   @doc "One bounded due receipt. Host supervision bounds concurrent callers; no raw SMTP body is needed."
   def tick(%Config{} = config) do
     safe(fn ->
-      case Ledger.due(config.transport_scope, DateTime.utc_now()) do
-        nil -> {:ok, :idle}
-        row -> process(config, row.id)
+      case Ledger.claim_next(config.transport_scope, DateTime.utc_now()) do
+        :idle -> {:ok, :idle}
+        {:ok, row, _} -> claimed(config, row)
+        error -> error
       end
     end)
   end
@@ -153,14 +164,24 @@ defmodule EmailJanitor.Mail.Feedback do
       with false <- config.transport_scope.repo.in_transaction?(),
            {:ok, _} <- Ecto.UUID.cast(id),
            {:ok, row, _previous} <- Ledger.claim(config.transport_scope, id, DateTime.utc_now()) do
-        case row.kind do
-          :signup -> signup(config, row)
-          :feedback -> feedback(config, row)
-        end
+        claimed(config, row)
       else
         _ -> {:error, :feedback_busy}
       end
     end)
+  end
+
+  defp claimed(config, row) do
+    cond do
+      reply_expired?(row) ->
+        finish(config, row, :expired, row.outcome || :expired)
+
+      row.kind == :signup ->
+        signup(config, row)
+
+      true ->
+        feedback(config, row)
+    end
   end
 
   defp feedback(config, row) do
@@ -181,9 +202,9 @@ defmodule EmailJanitor.Mail.Feedback do
     else
       {:error, reason}
       when reason in [:connection_unavailable, :feedback_unavailable, :database_unavailable] ->
-        if DateTime.compare(DateTime.utc_now(), row.expires_at) == :lt,
+        if not reply_expired?(row),
           do: retry(config, row, :waiting_sent),
-          else: finish(config, row, :expired, :expired)
+          else: finish(config, row, :expired, row.outcome || :expired)
 
       _ ->
         finish(config, row, :rejected, :rejected)
@@ -224,7 +245,12 @@ defmodule EmailJanitor.Mail.Feedback do
               prepare_reply(config, row, binding, context, :clarify_unsupported, clarification())
 
             {_, :clarify} ->
-              prepare_reply(config, row, binding, context, :clarify_ambiguous, clarification())
+              outcome =
+                if parsed.reason == :unsupported_format,
+                  do: :clarify_unsupported,
+                  else: :clarify_ambiguous
+
+              prepare_reply(config, row, binding, context, outcome, clarification())
 
             {_, :parsed} ->
               run_workflow(config, row, binding, context, parsed)
@@ -259,7 +285,7 @@ defmodule EmailJanitor.Mail.Feedback do
   end
 
   defp run_workflow(config, row, binding, context, parsed) do
-    if parsed.evidence_omitted do
+    if parsed.evidence_omitted and not (parsed.kind == :reply and context.verified_reference) do
       prepare_reply(config, row, binding, context, :clarify_ambiguous, clarification())
     else
       with :ok <- context.guard.(),
@@ -388,9 +414,17 @@ defmodule EmailJanitor.Mail.Feedback do
          true <-
            is_function(context.guard, 0) and is_function(context.respond, 3) and
              is_function(context.render, 1),
+         true <- is_boolean(context.verified_reference),
          :ok <- context.guard.(),
          do: :ok,
          else: (_ -> {:error, :invalid_feedback_context})
+  end
+
+  defp reply_expired?(row) do
+    deadline =
+      if row.authenticated_at, do: DateTime.add(row.authenticated_at, 3600), else: row.expires_at
+
+    DateTime.compare(DateTime.utc_now(), deadline) != :lt
   end
 
   defp safe_subject(sent) do

@@ -28,6 +28,8 @@ defmodule EmailJanitor.Mail.Feedback.Migration do
     end
 
     create(index(:mail_feedback, [:next_attempt_at, :id]))
+    create(index(:mail_feedback, [:state, :next_attempt_at, :authenticated_at, :inserted_at]))
+    create(index(:mail_feedback, [:sender_inbox_id, :state]))
     create(index(:mail_feedback, [:kind, :received_at]))
     create(constraint(:mail_feedback, :feedback_kind, check: "kind IN ('feedback','signup')"))
 

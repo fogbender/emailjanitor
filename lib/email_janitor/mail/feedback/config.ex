@@ -7,7 +7,7 @@ defmodule EmailJanitor.Mail.Feedback.Context do
   @moduledoc "Host-built command context. Keys contain only opaque identifiers; callbacks are never derived from email content."
   @enforce_keys [:key, :scope, :inbox, :conversation_id, :guard, :respond, :render]
   @derive {Inspect, only: [:inbox, :conversation_id]}
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [verified_reference: false]
 end
 
 defmodule EmailJanitor.Mail.Feedback.Binding do

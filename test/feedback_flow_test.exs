@@ -382,4 +382,172 @@ defmodule EmailJanitor.FeedbackFlowTest do
     auto = String.replace(raw(stranger), "\r\n\r\n", "\r\nAuto-Submitted: auto-replied\r\n\r\n")
     assert :ignored = accept(ctx, incoming, auto)
   end
+
+  test "long verified Janitor reply quotes can be omitted without discarding the clean authored request",
+       ctx do
+    context = %{ctx.context | verified_reference: true}
+    binding = %{ctx.binding | route_verified: fn _ -> {:ok, context} end}
+    config = %{ctx.config | resolve: fn _ -> {:ok, binding} end}
+
+    body =
+      "Keep Bob in my inbox.\n\nOn Thu, Nov 26, Janitor <janitor@janitor.example.com> wrote:\n" <>
+        String.duplicate("> A long daily email entry.\n", 600)
+
+    Agent.update(ctx.state, &%{&1 | sent: %{&1.sent | body: Content.new(body)}})
+    {:ok, id} = accept(%{ctx | config: config})
+    assert {:ok, :completed} = Feedback.process(config, id)
+    assert Ledger.get(ctx.scope, id).outcome == :processed
+    assert [{_, "Keep Bob in my inbox.", nil}] = Agent.get(ctx.state, & &1.commands)
+  end
+
+  test "oversize or unreadable parser input clarifies once instead of repeatedly fetching the body",
+       ctx do
+    Agent.update(
+      ctx.state,
+      &%{&1 | sent: %{&1.sent | body: Content.new(String.duplicate("x", 128_001))}}
+    )
+
+    {:ok, id} = accept(ctx)
+    assert {:ok, :completed} = Feedback.process(ctx.config, id)
+    assert Ledger.get(ctx.scope, id).outcome == :clarify_unsupported
+    assert Agent.get(ctx.state, & &1.commands) == []
+    assert {:ok, :idle} = Feedback.tick(ctx.config)
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 1
+  end
+
+  test "spoofed failed-DMARC hints are ignored and concurrent known-sender admission is bounded",
+       ctx do
+    failed = %{ctx.incoming | verdicts: Map.put(ctx.incoming.verdicts, "dmarcVerdict", "FAIL")}
+    assert :ignored = accept(ctx, failed)
+    assert Repo.all(Record, prefix: ctx.scope.prefix) == []
+
+    results =
+      1..25
+      |> Task.async_stream(
+        fn n ->
+          accept(
+            ctx,
+            %{ctx.incoming | id: "ses-cap-#{n}"},
+            raw(ctx.sender.address, "cap-#{n}@example.com")
+          )
+        end,
+        max_concurrency: 8,
+        timeout: 10_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &match?({:ok, _}, &1)) == 20
+    assert Enum.count(results, &(&1 == :ignored)) == 5
+
+    claims =
+      1..20
+      |> Task.async_stream(fn _ -> Ledger.claim_next(ctx.scope, DateTime.utc_now()) end,
+        max_concurrency: 8,
+        timeout: 10_000
+      )
+      |> Enum.map(fn {:ok, {:ok, row, _}} -> row.id end)
+
+    assert length(Enum.uniq(claims)) == 20
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 0
+  end
+
+  test "pending reply expiry preserves the actual processed outcome and does not resend late",
+       ctx do
+    Agent.update(ctx.state, &%{&1 | credentials: :unavailable})
+    {:ok, id} = accept(ctx)
+    assert {:ok, :deferred} = Feedback.process(ctx.config, id)
+
+    Repo.update_all(
+      from(r in Record, where: r.id == ^id),
+      [set: [authenticated_at: DateTime.add(DateTime.utc_now(), -7200)]],
+      prefix: ctx.scope.prefix
+    )
+
+    due(ctx, id)
+    assert {:ok, :expired} = Feedback.process(ctx.config, id)
+    row = Ledger.get(ctx.scope, id)
+    assert row.state == :expired and row.outcome == :processed
+    assert Agent.get(ctx.state, & &1.gmail_calls) == 1
+    assert length(Agent.get(ctx.state, & &1.commands)) == 1
+  end
+
+  test "signup can send again on a later UTC day without recreating its transport recipient",
+       ctx do
+    stranger = "repeat-visitor@example.net"
+    incoming = %{ctx.incoming | envelope_from: stranger}
+    {:ok, today_id} = accept(ctx, incoming, raw(stranger))
+    first = Ledger.get(ctx.scope, today_id)
+    yesterday = DateTime.add(first.received_at, -86400)
+
+    {:ok, yesterday_id} =
+      EmailJanitor.Mail.RFCMessageID.request_id(
+        first.sender_inbox_id,
+        "signup-" <> Date.to_iso8601(DateTime.to_date(yesterday)) <> "@emailjanitor.invalid"
+      )
+
+    Repo.update_all(
+      from(r in Record, where: r.id == ^today_id),
+      [
+        set: [
+          id: yesterday_id,
+          received_at: yesterday,
+          expires_at: DateTime.add(first.expires_at, -86400)
+        ]
+      ],
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:ok, ^today_id} =
+             accept(ctx, %{incoming | id: "ses-next-day"}, raw(stranger, "next-day@example.net"))
+
+    assert {:ok, :completed} = Feedback.process(ctx.config, today_id)
+    assert length(Agent.get(ctx.state, & &1.deliveries)) == 1
+
+    assert Repo.aggregate(from(m in Store.Mailbox, where: m.id == ^first.sender_inbox_id), :count,
+             prefix: ctx.scope.prefix
+           ) == 1
+  end
+
+  test "metadata purge removes stale claims and old signup recipients but preserves a live claim",
+       ctx do
+    stranger = "purge-visitor@example.net"
+    {:ok, signup_id} = accept(ctx, %{ctx.incoming | envelope_from: stranger}, raw(stranger))
+    assert {:ok, :completed} = Feedback.process(ctx.config, signup_id)
+    signup = Ledger.get(ctx.scope, signup_id)
+    {:ok, stale_id} = accept(ctx)
+
+    {:ok, live_id} =
+      accept(ctx, %{ctx.incoming | id: "ses-live"}, raw(ctx.sender.address, "live@example.com"))
+
+    old = DateTime.add(DateTime.utc_now(), -8 * 86400)
+
+    Repo.update_all(
+      from(r in Record, where: r.id in ^[signup_id, stale_id, live_id]),
+      [set: [inserted_at: old]],
+      prefix: ctx.scope.prefix
+    )
+
+    Repo.update_all(
+      from(r in Record, where: r.id == ^stale_id),
+      [set: [state: :processing, lease_until: DateTime.add(DateTime.utc_now(), -1)]],
+      prefix: ctx.scope.prefix
+    )
+
+    Repo.update_all(
+      from(r in Record, where: r.id == ^live_id),
+      [set: [state: :processing, lease_until: DateTime.add(DateTime.utc_now(), 1000)]],
+      prefix: ctx.scope.prefix
+    )
+
+    Repo.update_all(EmailJanitor.Mail.Outgoing, [set: [inserted_at: old]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok = Ledger.purge(ctx.scope, DateTime.utc_now())
+    assert Ledger.get(ctx.scope, signup_id) == nil
+    assert Ledger.get(ctx.scope, stale_id) == nil
+    assert Ledger.get(ctx.scope, live_id)
+    assert Repo.get(Store.Mailbox, signup.sender_inbox_id, prefix: ctx.scope.prefix) == nil
+    assert Repo.all(EmailJanitor.Mail.Outgoing, prefix: ctx.scope.prefix) == []
+  end
 end
