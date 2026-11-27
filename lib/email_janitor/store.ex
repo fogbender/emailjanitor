@@ -101,31 +101,49 @@ defmodule EmailJanitor.Store do
           prefix: scope.prefix
         )
 
-      if existing do
-        {:existing, existing}
-      else
-        review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
-        evaluated_ids = Proposal.evaluated_ids(proposal)
+      review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
+      evaluated_ids = Proposal.evaluated_ids(proposal)
 
-        # A later review may have blocked a larger batch while this executor was
-        # fetching Gmail history. Never let its older subset bypass that decision.
-        newer_candidate? =
-          scope.repo.exists?(
-            from(c in Candidate,
-              where:
-                c.inbox_id == ^inbox_id and c.updated_at > ^review_started_at and
-                  fragment(
-                    "COALESCE(?, ?) && ?::text[]",
-                    c.evaluated_message_ids,
-                    c.message_ids,
-                    ^evaluated_ids
-                  )
-            ),
-            prefix: scope.prefix
+      # Every accepted evaluation is authoritative, including Keep targets when
+      # its Done subset already belongs to a durable action. Older retries may
+      # still settle that action, but must not overwrite newer review evidence.
+      newer_candidate? =
+        scope.repo.exists?(
+          from(c in Candidate,
+            where:
+              c.inbox_id == ^inbox_id and c.updated_at > ^review_started_at and
+                fragment(
+                  "COALESCE(?, ?) && ?::text[]",
+                  c.evaluated_message_ids,
+                  c.message_ids,
+                  ^evaluated_ids
+                )
+          ),
+          prefix: scope.prefix
+        )
+
+      stale? =
+        newer_candidate? or newer_review?(scope, inbox_id, evaluated_ids, review_started_at)
+
+      if existing do
+        unless stale? do
+          policy = Keyword.get(opts, :policy, Policy.unlimited())
+
+          retire_overlapping_candidates(
+            scope,
+            inbox_id,
+            existing,
+            policy,
+            review_started_at,
+            proposal
           )
 
-        if newer_candidate? or newer_review?(scope, inbox_id, evaluated_ids, review_started_at),
-          do: scope.repo.rollback(:proposal_changed)
+          record_review(scope, inbox_id, review_ids(evaluated_ids, opts))
+        end
+
+        {:existing, existing}
+      else
+        if stale?, do: scope.repo.rollback(:proposal_changed)
 
         ids = Enum.sort(proposal.message_ids)
         message_key = :crypto.hash(:sha256, :erlang.term_to_binary(ids))

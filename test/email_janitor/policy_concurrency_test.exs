@@ -370,6 +370,118 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     end
   end
 
+  for phase <- [:in_flight, :cached_review] do
+    test "an existing unresolved action preserves a newer Keep fence (#{phase})", ctx do
+      messages = [message(), message(id: "message-2")]
+      Agent.update(ctx.state, &%{&1 | messages: messages})
+      parent = self()
+
+      review = fn targets, keep ->
+        database(fn ->
+          Executor.review(
+            ctx.scope,
+            ctx.inbox,
+            "thread-1",
+            {TestGmail, [state: ctx.state]},
+            {EmailJanitor.TargetClassifier, [keep_ids: keep]},
+            "",
+            1,
+            cleanup_target_ids: targets
+          )
+        end)
+      end
+
+      assert {:ok, action_proposal} = review.(["message-1"], [])
+
+      assert {:unresolved, action_id} =
+               database(fn ->
+                 Executor.execute(
+                   ctx.scope,
+                   ctx.inbox,
+                   action_proposal,
+                   {TestGmail, [state: ctx.state, mode: :error_without_apply]}
+                 )
+               end)
+
+      assert {:ok, old} = review.(["message-2"], [])
+
+      running =
+        if unquote(phase) == :in_flight do
+          {pid, monitor} =
+            spawn_monitor(fn ->
+              result =
+                database(fn ->
+                  Executor.execute(
+                    ctx.scope,
+                    ctx.inbox,
+                    old,
+                    {TestGmail,
+                     [
+                       state: ctx.state,
+                       history_hook: fn ->
+                         send(parent, {:existing_pause, self()})
+
+                         receive do
+                           :continue_existing -> :ok
+                         after
+                           5_000 -> raise "Synthetic existing-action barrier timed out"
+                         end
+                       end
+                     ]}
+                  )
+                end)
+
+              send(parent, {:existing_old_result, result})
+            end)
+
+          on_exit(fn -> Process.exit(pid, :kill) end)
+          assert_receive {:existing_pause, owner}, 5_000
+          on_exit(fn -> Process.exit(owner, :kill) end)
+          {pid, monitor, owner}
+        end
+
+      assert {:ok, newer} = review.(["message-1", "message-2"], ["message-2"])
+
+      assert {:existing, ^action_id, :unresolved} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+               end)
+
+      if running do
+        {pid, monitor, owner} = running
+        send(owner, :continue_existing)
+        assert_receive {:existing_old_result, {:error, :proposal_changed}}, 5_000
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+      else
+        assert {:error, :proposal_changed} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, old, {TestGmail, [state: ctx.state]})
+                 end)
+      end
+
+      fence = fn ->
+        database(fn ->
+          TestRepo.get_by!(
+            Store.ReviewFence,
+            [inbox_id: ctx.inbox.id, message_id: "message-2"],
+            prefix: ctx.scope.prefix
+          )
+        end).reviewed_at
+      end
+
+      accepted_at = fence.()
+      # A cached retry can settle its original action without refreshing the
+      # accepted timestamp for any newer evaluation.
+      assert {:existing, ^action_id, :unresolved} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+               end)
+
+      assert accepted_at == fence.()
+      assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+    end
+  end
+
   for entry <- [:settle_action, :execute] do
     test "#{entry} cannot overwrite terminal reconciliation with stale unresolved settlement",
          ctx do
