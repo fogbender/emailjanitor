@@ -454,7 +454,7 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
 
       if unquote(keep_b),
         do: assert(newer_result == {:existing, action_id, :unresolved}),
-        else: assert(newer_result == {:blocked, :already_reserved})
+        else: assert(newer_result == {:deferred, action_id, {:existing, action_id, :unresolved}})
 
       if running do
         {pid, monitor, owner} = running
@@ -496,7 +496,7 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
       end
 
       unless unquote(keep_b) do
-        assert {:blocked, :already_reserved} =
+        assert {:deferred, ^action_id, {:existing, ^action_id, :unresolved}} =
                  database(fn ->
                    Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
                  end)
@@ -627,7 +627,7 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
 
     assert {:ok, fresh} = review.(["message-1", "message-2", "message-3"], ["message-3"])
 
-    assert {:blocked, :already_reserved} =
+    assert {:deferred, ^action_id, {:existing, ^action_id, :unresolved}} =
              database(fn ->
                Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]},
                  policy: policy
@@ -669,72 +669,95 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
   end
 
-  test "retaining uncovered work also recovers and settles its abandoned overlapping intent",
-       ctx do
-    messages = [message(), message(id: "message-2")]
-    Agent.update(ctx.state, &%{&1 | messages: messages})
-    policy = %Policy{adapter: EmailJanitor.TargetPolicy, context: ctx.policy.context}
+  for fail_settlement <- [false, true] do
+    test "retaining uncovered work preserves recovery results (failed settlement=#{fail_settlement})",
+         ctx do
+      messages = [message(), message(id: "message-2")]
+      Agent.update(ctx.state, &%{&1 | messages: messages})
 
-    review = fn targets ->
-      database(fn ->
-        Executor.review(
-          ctx.scope,
-          ctx.inbox,
-          "thread-1",
-          {TestGmail, [state: ctx.state]},
-          {EmailJanitor.TargetClassifier, []},
-          "",
-          1,
-          cleanup_target_ids: targets
+      control =
+        start_supervised!({Agent, fn -> %{fail: unquote(fail_settlement)} end},
+          id: :orphan_settle
         )
-      end)
-    end
 
-    {:ok, first} = review.(["message-1"])
-    parent = self()
+      policy = %Policy{
+        adapter: EmailJanitor.TargetPolicy,
+        context: Map.put(ctx.policy.context, :control, control)
+      }
 
-    assert {:error, :executor_unavailable} =
-             EmailJanitor.Owner.run(fn ->
-               database(fn ->
-                 {:ok, {:created, action}} =
-                   Store.intent(ctx.scope, ctx.inbox.id, first, "100", policy: policy)
+      review = fn targets ->
+        database(fn ->
+          Executor.review(
+            ctx.scope,
+            ctx.inbox,
+            "thread-1",
+            {TestGmail, [state: ctx.state]},
+            {EmailJanitor.TargetClassifier, []},
+            "",
+            1,
+            cleanup_target_ids: targets
+          )
+        end)
+      end
 
-                 send(parent, {:orphan_for_overlap, action.id, self()})
-                 raise "Synthetic abandoned prewire action"
+      {:ok, first} = review.(["message-1"])
+      parent = self()
+
+      assert {:error, :executor_unavailable} =
+               EmailJanitor.Owner.run(fn ->
+                 database(fn ->
+                   {:ok, {:created, action}} =
+                     Store.intent(ctx.scope, ctx.inbox.id, first, "100", policy: policy)
+
+                   send(parent, {:orphan_for_overlap, action.id, self()})
+                   raise "Synthetic abandoned prewire action"
+                 end)
                end)
-             end)
 
-    assert_receive {:orphan_for_overlap, action_id, owner}
-    monitor = Process.monitor(owner)
-    assert_receive {:DOWN, ^monitor, :process, ^owner, _}, 5_000
-    {:ok, combined} = review.(["message-1", "message-2"])
+      assert_receive {:orphan_for_overlap, action_id, owner}
+      monitor = Process.monitor(owner)
+      assert_receive {:DOWN, ^monitor, :process, ^owner, _}, 5_000
+      {:ok, combined} = review.(["message-1", "message-2"])
 
-    assert {:blocked, :already_reserved} =
-             database(fn ->
-               Executor.execute(ctx.scope, ctx.inbox, combined, {TestGmail, [state: ctx.state]},
-                 policy: policy
-               )
-             end)
+      result =
+        database(fn ->
+          Executor.execute(ctx.scope, ctx.inbox, combined, {TestGmail, [state: ctx.state]},
+            policy: policy
+          )
+        end)
 
-    database(fn ->
-      assert Store.get(ctx.scope, ctx.inbox.id, action_id).state == :cancelled
+      if unquote(fail_settlement) do
+        assert {:deferred, ^action_id, {:settlement_pending, ^action_id, :cancelled}} = result
+        Agent.update(control, &%{&1 | fail: false})
 
-      assert [[[], ["message-1"]]] ==
-               Ecto.Adapters.SQL.query!(
-                 TestRepo,
-                 "SELECT message_ids,not_applied_ids FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 AND kind='settle'",
-                 [action_id],
-                 log: false
-               ).rows
+        assert {:existing, ^action_id, :cancelled} =
+                 database(fn ->
+                   Executor.settle_action(ctx.scope, ctx.inbox, action_id, policy: policy)
+                 end)
+      else
+        assert {:deferred, ^action_id, {:existing, ^action_id, :cancelled}} = result
+      end
 
-      assert [%{message_ids: ["message-2"]}] =
-               TestRepo.all(
-                 Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
-                 prefix: ctx.scope.prefix
-               )
-    end)
+      database(fn ->
+        assert Store.get(ctx.scope, ctx.inbox.id, action_id).state == :cancelled
 
-    assert Agent.get(ctx.state, & &1.calls) == []
+        assert [[[], ["message-1"]]] ==
+                 Ecto.Adapters.SQL.query!(
+                   TestRepo,
+                   "SELECT message_ids,not_applied_ids FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 AND kind='settle'",
+                   [action_id],
+                   log: false
+                 ).rows
+
+        assert [%{message_ids: ["message-2"]}] =
+                 TestRepo.all(
+                   Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                   prefix: ctx.scope.prefix
+                 )
+      end)
+
+      assert Agent.get(ctx.state, & &1.calls) == []
+    end
   end
 
   for entry <- [:settle_action, :execute] do
