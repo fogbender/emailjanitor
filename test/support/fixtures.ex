@@ -50,7 +50,11 @@ end
 
 defmodule EmailJanitor.TestGmail do
   @behaviour EmailJanitor.Gmail
-  def history_id(_inbox, _opts), do: {:ok, "100"}
+  def history_id(_inbox, opts) do
+    if hook = opts[:history_hook], do: hook.()
+    {:ok, "100"}
+  end
+
   def thread(_inbox, _thread, opts), do: Agent.get(opts[:state], &{:ok, &1.messages})
 
   def contacted(_inbox, keys, opts) do
