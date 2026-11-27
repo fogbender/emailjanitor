@@ -35,6 +35,7 @@ end
 defmodule EmailJanitor.SelfHost.Authority do
   @moduledoc "Host-authenticated, metadata-only manual retry grants; never inferred from a core candidate."
   alias EmailJanitor.{SelfHost, Conversation.Reference, Gmail.Parser}
+  alias EmailJanitor.Store, as: CoreStore
   alias EmailJanitor.SelfHost.{Grant, Owner, Store}
 
   def record(_ref, _owner, _conversation, _request, operation, _refs) when operation != :done,
@@ -60,10 +61,17 @@ defmodule EmailJanitor.SelfHost.Authority do
                  message_ids: ids
                }
 
-               scope.repo.insert!(struct!(Grant, values),
-                 prefix: scope.prefix,
-                 on_conflict: :nothing
-               )
+               now = DateTime.utc_now()
+
+               {inserted, _} =
+                 scope.repo.insert_all(
+                   Grant,
+                   [Map.merge(values, %{inserted_at: now, updated_at: now})],
+                   prefix: scope.prefix,
+                   on_conflict: :nothing,
+                   conflict_target: [:inbox_id, :request_id],
+                   log: false
+                 )
 
                saved =
                  scope.repo.get_by!(Grant, [inbox_id: id, request_id: request],
@@ -75,6 +83,9 @@ defmodule EmailJanitor.SelfHost.Authority do
                     saved.connection_epoch != binding.epoch or
                     ids -- saved.message_ids != [],
                   do: scope.repo.rollback(:manual_authorization_changed)
+
+               if inserted == 1 and CoreStore.fence_recheck(scope, id, ids) != :ok,
+                 do: scope.repo.rollback(:manual_authorization_changed)
 
                :ok
              else

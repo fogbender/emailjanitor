@@ -232,6 +232,42 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     assert {:ignore, :disconnected} = Adapters.route(ctx.box.address)
   end
 
+  test "a genuinely new manual grant fences prior retirement before a worker source exists; replay does not refresh it",
+       ctx do
+    alias EmailJanitor.Store.ReviewFence
+    request = Ecto.UUID.generate()
+    conversation = Ecto.UUID.generate()
+    refs = [reference(ctx, "m1")]
+    assert Repo.aggregate(EmailJanitor.Worker.Candidate, :count, prefix: ctx.scope.prefix) == 0
+    assert :ok = Authority.record(ctx.ref, ctx.owner, conversation, request, :done, refs)
+    assert Repo.aggregate(EmailJanitor.Worker.Candidate, :count, prefix: ctx.scope.prefix) == 0
+
+    first =
+      Repo.get_by!(ReviewFence, [inbox_id: ctx.box.id, message_id: "m1"],
+        prefix: ctx.scope.prefix
+      )
+
+    assert :ok = Authority.allow(ctx.ref, request, ["m1"])
+    assert :ok = Authority.record(ctx.ref, ctx.owner, conversation, request, :done, refs)
+
+    replay =
+      Repo.get_by!(ReviewFence, [inbox_id: ctx.box.id, message_id: "m1"],
+        prefix: ctx.scope.prefix
+      )
+
+    assert replay.reviewed_at == first.reviewed_at
+
+    assert :ok =
+             Authority.record(ctx.ref, ctx.owner, conversation, Ecto.UUID.generate(), :done, refs)
+
+    fresh =
+      Repo.get_by!(ReviewFence, [inbox_id: ctx.box.id, message_id: "m1"],
+        prefix: ctx.scope.prefix
+      )
+
+    assert DateTime.compare(fresh.reviewed_at, first.reviewed_at) == :gt
+  end
+
   test "mail spool anchor cannot appear as a connected Google cleanup inbox", ctx do
     assert :ok = SelfHost.Transport.install(ctx.config)
     assert :ok = SelfHost.Transport.install(ctx.config)
