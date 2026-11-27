@@ -22,7 +22,14 @@ defmodule EmailJanitor.Store do
   end
 
   def add_inbox(%Scope{} = scope, %Inbox{} = inbox) do
-    scope.repo.insert(%Mailbox{id: inbox.id, address: inbox.address}, prefix: scope.prefix)
+    scope.repo.transaction(fn ->
+      EmailJanitor.Preferences.Lock.acquire(scope, :shared)
+
+      case scope.repo.insert(%Mailbox{id: inbox.id, address: inbox.address}, prefix: scope.prefix) do
+        {:ok, mailbox} -> mailbox
+        {:error, reason} -> scope.repo.rollback(reason)
+      end
+    end)
   end
 
   def instruction_version(%Scope{} = scope, inbox_id) do
@@ -414,6 +421,11 @@ defmodule EmailJanitor.Store do
 
   defp do_begin_dispatch(scope, inbox_id, id, token) do
     case scope.repo.transaction(fn ->
+           mailbox =
+             scope.repo.one(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+               prefix: scope.prefix
+             )
+
            action =
              scope.repo.one(
                from(a in Action,
@@ -424,6 +436,9 @@ defmodule EmailJanitor.Store do
              )
 
            with %Action{} <- action, true <- Owner.owns?(action) do
+             if is_nil(mailbox) or mailbox.instruction_version != action.instruction_version,
+               do: scope.repo.rollback(:proposal_changed)
+
              {count, _} =
                scope.repo.update_all(
                  from(a in Action,
