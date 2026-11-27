@@ -180,7 +180,8 @@ defmodule EmailJanitor.Restore do
              {:ok, on_restored} <- settlement_option(options),
              %Policy{} = policy <- Keyword.get(options, :policy, Policy.unlimited()),
              {:ok, id} <- Ecto.UUID.cast(id),
-             :ok <- authorized(authorize) do
+             :ok <- authorized(authorize),
+             :ok <- readable_inbox(scope, inbox) do
           settle_effect(scope, inbox, id, authorize, on_restored, policy)
         else
           {:error, reason} when reason in @errors -> {:error, reason}
@@ -449,7 +450,7 @@ defmodule EmailJanitor.Restore do
 
     case result do
       {:ok, :done} -> {:done, id}
-      {:error, :unconfirmed_restoration} = error -> error
+      {:error, reason} = error when reason in [:unconfirmed_restoration, :wrong_inbox] -> error
       _ -> {:unresolved, id}
     end
   end

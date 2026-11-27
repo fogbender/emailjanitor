@@ -671,6 +671,14 @@ defmodule EmailJanitor.RestoreTest do
     assert {:error, :wrong_inbox} =
              Restore.pending_settlements(ctx.scope, %{ctx.box | address: "stale@example.com"})
 
+    assert {:error, :wrong_inbox} =
+             Restore.settle(
+               ctx.scope,
+               %{ctx.box | address: "stale@example.com"},
+               id,
+               trusted_options()
+             )
+
     assert {:error, :invalid_restore_selection} =
              Restore.pending_settlements(ctx.scope, ctx.box, 0)
 
@@ -973,7 +981,8 @@ defmodule EmailJanitor.RestoreTest do
         {:same, true},
         {:new, false},
         {:same, false},
-        {:changed, false}
+        {:changed, false},
+        {:changed, true}
       ] do
     test "manual queue #{selection} refresh=#{refresh} distinguishes new authority from ordinary discovery",
          ctx do

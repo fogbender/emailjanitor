@@ -512,7 +512,7 @@ defaults to failure. It must verify every ID against active original grants,
 current account identity and authorization, both before message fetch and at
 admission. Original authority survives fresh actions and deliberate reconnect;
 partial withdrawal must reject a source containing any withdrawn ID. Repeated
-discovery preserves retry deadlines and caps. A missing exact partial-retirement
+discovery must pass `refresh_authority: false`; it preserves retry deadlines and caps. A missing exact partial-retirement
 capability pauses the affected candidate until explicit repair/recheck, without
 repeated classifier calls or fallback to a whole-candidate withdrawal.
 
@@ -641,7 +641,7 @@ and newer accepted requests, and never constructs an invented review snapshot.
 Hosts that persist worker candidates must also retire the same exact IDs from
 `Worker.Ledger` in their policy callback in that transaction, preserving unrelated
 arrival provenance. Repeated exact retirement is idempotent.
-Explicit rechecks and changed manual selections atomically fence older reviews;
+Explicit rechecks and explicit changed manual selections atomically fence older reviews;
 ordinary scheduler discovery does not refresh that authority.
 Every accepted explicit `queue_manual` call fences its exact IDs and advances
 the request version, including new rows and unchanged selections. Trusted host
