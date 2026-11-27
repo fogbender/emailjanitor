@@ -126,3 +126,50 @@ Google's generated connection currently omits the decompression bound required
 by Tesla 1.23. A small connection middleware supplies an 8 MiB cap to that SDK
 middleware and also limits uncompressed responses before JSON decoding. This
 preserves the SDK protocol implementation without downgrading HTTP security fixes.
+
+## Metadata-only notification ingestion
+
+`EmailJanitor.Google.PubSub` uses Google's generated client for bounded,
+authenticated pull and exact acknowledgement. Supply a trusted subscription and
+an explicit short-lived service-token resolver. It reads no ambient credentials;
+the service token is separate from each Gmail user's OAuth token. SDK transport
+fixtures cover the actual generated requests. Pub/Sub IDs and acknowledgement
+tokens are never treated as Gmail message IDs. Malformed delivery batches fail
+closed without acknowledgement.
+
+`Gmail.Ingestion.install(scope)` installs scoped migration 10. After the host calls
+`Gmail.SDK.watch/3`, `Ingestion.baseline/3` saves that watch cursor without scanning
+or cleaning existing mail. Restarting reads the existing checkpoint. Only an
+explicit `reconnect/4`, fenced by the previous connection generation, establishes
+a new baseline and discards old-generation discovery work. Watch renewal changes
+only expiration; its registration cursor never advances the processing cursor.
+OAuth refresh or reconsent after revoked credentials resumes the existing
+generation and cursor. It must never be interpreted as deliberate disconnection
+or used to call `reconnect/4` automatically.
+
+`NotificationWorker.poll_once/2` resolves each notification through the host's
+trusted email-to-scope/Inbox router, commits a coalesced history hint, and only then
+acknowledges it. Failed routes or commits remain unacknowledged. A crash after
+commit can safely redeliver the same hint. Hosts must supervise this bounded step
+and periodically call `Ingestion.catch_up/3` even with no notifications: Gmail can
+delay or drop them. Catch-up atomically queues discovered message IDs and advances
+the cursor only for complete, non-regressing history, with generation/cursor CAS.
+Independent-connection tests cover commits, rollback and competing snapshots.
+
+Pending work contains IDs, cursors and timestamps only. `eligible_thread/5` reads
+thread content transiently and preserves the whole conversation if any current
+INBOX message lacks same-generation post-baseline eligibility. It returns only a
+metadata eligibility proof. `authorize_proposal/4` rejects proposals outside that
+proof and rejects proofs from a previous connection generation. Hosts must also
+honor connection-generation fencing at final execution, retain the engine's
+instruction/manual-restoration guards, and use the Executor's fresh fingerprint
+and exact-ID checks. This slice does not dispatch classification or mutations,
+and it does not implement a partial-message mask for mixed old/new conversations.
+
+Expired history enters `:gap` and pauses discovery/eligibility. This deliberately
+does **not** recover arrivals missed after Gmail's history retention expires.
+An explicit reconnect leaves that missed backlog in the inbox; it is not outage
+catch-up. A reviewed metadata-only recovery strategy or a surfaced reconnect
+consequence is required before launch. Host scheduling, reconnect/forget lifecycle,
+the private workload-auth token-file bridge and autonomous cleanup wiring remain
+separate work. No service account keys or email bodies are introduced here.
