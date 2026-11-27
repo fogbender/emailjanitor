@@ -192,7 +192,7 @@ defmodule EmailJanitor.ConversationLedgerTest do
     receipt = %{receipt | results: [%{"status" => "unresolved"}], preference_status: :failed}
     reply = Outcome.render(receipt, snapshot) |> Content.read()
     assert reply =~ "uncertain"
-    assert reply =~ "could not update"
+    assert reply =~ "could not confirm"
     refute reply =~ "returned"
     refute reply =~ "PRIVATE_REPLY"
     later = %{receipt | results: [], preference_status: :updated, preference_revision: 1}
@@ -303,12 +303,12 @@ defmodule EmailJanitor.ConversationLedgerTest do
              Ledger.record_preference(ctx.scope, ctx.box.id, ctx.conversation, id, :updated, 1)
   end
 
-  test "unrecorded effects stay uncertain and a foreign snapshot cannot make completion claims",
+  test "unrecorded effects await confirmation and a foreign snapshot cannot make completion claims",
        ctx do
     {:ok, receipt} = reserve(ctx)
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.box.id)
     text = Outcome.render(receipt, snapshot) |> Content.read()
-    assert text =~ "uncertain"
+    assert text =~ "haven't confirmed"
     assert text =~ "still being verified"
     refute text =~ "No email or instruction changes"
 
@@ -346,5 +346,75 @@ defmodule EmailJanitor.ConversationLedgerTest do
     assert {:ok, fresh} = reserve(ctx)
     assert DateTime.compare(fresh.inserted_at, original.inserted_at) != :lt
     assert fresh.inserted_at != past
+  end
+
+  test "a live request owner excludes duplicate effects and actual owner death permits recovery",
+       ctx do
+    parent = self()
+
+    child =
+      Task.async(fn ->
+        receive do
+          :start ->
+            send(parent, {:reserved, reserve(ctx)})
+            receive do: (:finish -> :ok)
+        end
+      end)
+
+    Ecto.Adapters.SQL.Sandbox.allow(TestRepo, self(), child.pid)
+    send(child.pid, :start)
+    assert_receive {:reserved, {:ok, original}}, 2_000
+    assert {:error, :request_in_flight} = reserve(ctx)
+
+    assert {:error, :request_in_flight} =
+             Ledger.record_preference(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               :updated,
+               1
+             )
+
+    send(child.pid, :finish)
+    assert :ok = Task.await(child)
+    assert {:ok, recovered} = reserve(ctx)
+    assert recovered.owner_token != original.owner_token
+
+    assert {:ok, _} =
+             Ledger.record_preference(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               :updated,
+               1
+             )
+
+    effect_id = Ecto.UUID.generate()
+
+    assert {:ok, _} =
+             Ledger.record_result(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               ctx.ref.token,
+               "unresolved",
+               effect_id
+             )
+
+    assert {:ok, %{completed: true}} =
+             Ledger.complete(ctx.scope, ctx.box.id, ctx.conversation, ctx.request)
+
+    assert {:error, :request_complete} =
+             Ledger.record_preference(
+               ctx.scope,
+               ctx.box.id,
+               ctx.conversation,
+               ctx.request,
+               :failed,
+               nil
+             )
   end
 end

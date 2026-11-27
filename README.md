@@ -61,14 +61,33 @@ split prompt injection.
 These checks supplement the prompt; execution still
 requires the immutable executor safeguards and the host's policy.
 
-`Conversation.Ledger.install/1` installs migration 8 for seven-day metadata-only
+`Conversation.respond/3` uses a trusted `Conversation.Context` supplied by the
+host. It resolves references inside the selected inbox, applies small preference
+edits, and routes explicit Done requests through the same executor safeguards
+and policy as automatic cleanup. Completion replies come from exact durable
+message outcomes. Hosts must provide the policy and current connection guard;
+model output cannot select a storage scope or a Gmail credential.
+Read-only questions normally receive a transient model answer. If the preceding
+request has uncertain effects, that turn reports its durable status instead of
+letting generated prose claim success. An interrupted instruction update is
+recovered from its saved preference-change receipt; without that proof the user
+is asked to send the instruction again. Pinned message selections are never
+replanned during recovery.
+
+Email hosts can supply `Conversation.Evidence.new/3` as `request_evidence` to keep
+the authenticated author's text separate from untrusted forwarded content.
+`previous_request_id` pins a verified reply to its exact scoped predecessor;
+an expired explicit predecessor never falls back to a newer unrelated request.
+
+`Conversation.Ledger.install/1` installs migrations 8 and 9 for seven-day metadata-only
 request/effect receipts and previous reference IDs. It stores no user request,
 model response, search query, sender, subject or body. Hosts call `purge/2` during
 maintenance. `Conversation.Outcome` derives completion claims from recorded
 effects, preserves ambiguous results, and detects instructions changed since an
-earlier request. The authenticated runner, Gmail lookup/restoration and website
-and email entry-point wiring remain separate integration work; this foundation
-does not enable cleanup.
+earlier request. A live request owner excludes duplicate effects; takeover requires
+actual owner death, and completed receipts cannot be changed. The runner's Gmail
+search/restoration capabilities and authenticated website/email entry points are
+still being integrated; no live cleanup or production service is enabled here.
 
 Versioned distilled preferences are available through `Preferences.install/1`
 (migration 3), `snapshot/2`, `text/1` and `replace/5`. The host selects either all
@@ -82,7 +101,8 @@ version, then bump affected inbox versions atomically. UUID effect receipts
 deduplicate retries for seven days without retaining conversation text or text
 hashes. Reusing a request UUID returns its original effect, even after a later
 correction; callers compare that receipt's revision with current state before
-describing what is active. Clearing a scope removes its older receipts. Writes
+describing what is active. Clearing a scope removes its instruction text while
+keeping recovery metadata for the same seven-day retry window. Writes
 prune expired receipts; hosts also call `Preferences.purge_receipts/2` during
 maintenance. The [migration registry](docs/migrations.md) reserves optional module
 versions alongside the core sequence. Registration serializes
@@ -623,3 +643,73 @@ and a global 100/day abuse backstop, with no Gmail inbox provisioned for Janitor
 This is library plumbing tested with isolated PostgreSQL and synthetic HTTP.
 It is not activated, and real Google/SES delivery and threaded replies still
 need the final host/release integration gates.
+## Exact-message restoration and search
+
+`Gmail.SDK.search(inbox_id, query, options)` returns at most ten message/thread
+references and an explicit `truncated` flag. It uses only generated SDK metadata
+fields and never logs or persists the query. Callers must refine ambiguous or
+truncated searches before selecting effects; message bodies require an explicit
+subsequent scoped fetch.
+
+`Restore.apply(scope, inbox, effect_uuid, action_uuid, exact_ids, gmail, options)`
+restores only confirmed applied IDs from that exact scoped Janitor action.
+Migration 7 is installed with the core. Requested IDs are protected durably
+before the single generated-SDK add-INBOX operation; read/unread and all other
+labels are preserved. The source action is not blanket-marked restored. Receipt
+UUIDs bind the action and exact selection; duplicate or ambiguous effects never
+auto-dispatch again. Proven dead owners with no dispatch marker may be cancelled,
+allowing a fresh explicit request UUID. Overlapping unresolved effects stay blocked.
+
+`Restore.outcome/3` reads an effect without network access: positive wire proof
+is `{:done, id}`, a live owner is `{:prepared, id}`, proven dead pre-dispatch
+owners are `{:cancelled, id}`, and dispatched or unknown-owner ambiguity remains
+`{:unresolved, id}`. `Restore.overlap_outcome/4` distinguishes live overlapping
+requests from permanent ambiguity; a completed wire awaiting only reporting does
+not block a new explicit request. These reads do not dispatch or settle effects.
+
+Hosts must pass `authorize: fn -> :ok | {:error, atom} end` and the current
+`expected_instruction_version:`. Authorization is bounded DB-only work and runs
+again under the final mailbox fence; disconnect must atomically increment that
+mailbox version. An Inbox UUID must retain one immutable Google subject: address
+changes for that subject are allowed, a different subject needs a new Inbox UUID.
+The host guard enforces that invariant for the referenced action. Credentials
+are frozen and verified before durable admission. Callers must not persist the
+prepared closure. Forget/delete workflows remove manual_restore_protections
+and restore_effects before actions/inboxes. No bodies, search text or tokens
+enter either restoration table.
+
+The source action records the full fresh observed thread IDs. Admission and
+the final dispatch fence both check restoration protections under the mailbox
+lock; a sibling cannot slip through a concurrent restore. Pre-migration prepared
+intents without observed context must cancel and obtain a fresh review.
+
+Only authoritative 401/403/429 responses from the generated SDK's single
+batch-modify call produce an unapplied rejection proof. Those receipts cancel
+and permit a fresh explicit request UUID after repair. Transport failures remain
+ambiguous and never automatically repeat the Gmail mutation.
+An observer-privacy refusal detected locally before HTTP is also a no-wire proof;
+it cancels that effect instead of leaving a permanent ambiguous reservation.
+
+A successful restore durably records `Effect.applied_at` and the exact original
+action's `restored_message_ids` before reporting settlement. The bounded DB-only
+`on_restored(action_id, exact_ids)` callback can withdraw pending digest activity;
+hosts with digests must wire it. Callback failure preserves positive wire proof.
+`Restore.pending_settlements/3`, `Restore.settle/4` and duplicate-UUID calls retry
+only DB settlement, without Gmail. Requested protections are not positive wire
+evidence; historical action IDs keep an old restore from withdrawing newer work.
+Restoration settlement uses the trusted `policy:` option for exact retirement of
+older pending/cancelled metadata, without charging or refunding quota. It uses
+the positive effect timestamp and per-ID review fences, preserves unrelated IDs
+and newer accepted requests, and never constructs an invented review snapshot.
+Hosts that persist worker candidates must also retire the same exact IDs from
+`Worker.Ledger` in their policy callback in that transaction, preserving unrelated
+arrival provenance. Repeated exact retirement is idempotent.
+Explicit rechecks and changed manual selections atomically fence older reviews;
+ordinary scheduler discovery does not refresh that authority.
+Every accepted explicit `queue_manual` call fences its exact IDs and advances
+the request version, including new rows and unchanged selections. Trusted host
+discovery or replay must pass `refresh_authority: false`; structural selection
+repair then preserves the original authority age. Explicit repair still uses
+`queue_recheck` to reset paused or capped work.
+The 30s mutation watchdog ends after the provider call; positive proof and
+reporting use the remaining overall 60s owner budget, including database waits.

@@ -126,6 +126,28 @@ defmodule EmailJanitor.TransportPrivacyTest do
     refute_received {:observed, _}
   end
 
+  test "a prepared restore returns a positive no-wire proof for a local observer refusal" do
+    owner = self()
+
+    {:ok, config} =
+      Config.new(Fixtures.inbox(), fn -> {:ok, "TOKEN_SENTINEL"} end, adapter: Tesla.Mock)
+
+    Tesla.Mock.mock(fn env ->
+      if String.ends_with?(env.url, "/profile") do
+        Tesla.Mock.json(%{"emailAddress" => "owner@acme.com", "historyId" => "100"})
+      else
+        send(owner, :restore_http)
+        Tesla.Mock.json(%{})
+      end
+    end)
+
+    assert {:ok, dispatch} = SDK.prepare_add_inbox("inbox-1", ["message-1"], config: config)
+    attach_request_observer()
+    assert {:rejected, :unsafe_http_observers} = dispatch.()
+    refute_received :restore_http
+    refute_received {:observed, _}
+  end
+
   defp attach_request_observer do
     id = {__MODULE__, make_ref()}
 
