@@ -65,13 +65,15 @@ defmodule EmailJanitor.Gmail.Parser do
     with {:ok, own} <- text(part),
          children = part.parts || [],
          true <- is_list(children) and length(children) <= 100,
+         {visible, omitted} = optional_visual_parts(part.mimeType, children),
          {:ok, rest} <-
-           Enum.reduce_while(children, {:ok, []}, fn child, {:ok, acc} ->
+           Enum.reduce_while(visible, {:ok, []}, fn child, {:ok, acc} ->
              case parts(child, depth + 1) do
                {:ok, text} -> {:cont, {:ok, acc ++ text}}
                error -> {:halt, error}
              end
-           end) do
+           end),
+         true <- omitted == [] or Enum.any?(own ++ rest, &(String.trim(&1) != "")) do
       {:ok, own ++ rest}
     else
       _ -> {:error, :invalid_mime}
@@ -79,6 +81,29 @@ defmodule EmailJanitor.Gmail.Parser do
   end
 
   defp parts(_, _), do: {:error, :invalid_mime}
+
+  # AMP is an alternative representation, and related inline images are visual
+  # resources. Omit them only when supported readable text is also available.
+  # Other unsupported text (calendar/enriched) must still fail conservatively.
+  defp optional_visual_parts("multipart/alternative", children) do
+    if Enum.any?(
+         children,
+         &(&1.mimeType in ["text/plain", "text/html"] and &1.filename in [nil, ""])
+       ) do
+      Enum.split_with(children, &(&1.mimeType != "text/x-amp-html"))
+    else
+      {children, []}
+    end
+  end
+
+  defp optional_visual_parts("multipart/related", children) do
+    Enum.split_with(children, fn child ->
+      not (is_binary(child.mimeType) and String.starts_with?(child.mimeType, "image/") and
+             child.parts in [nil, []])
+    end)
+  end
+
+  defp optional_visual_parts(_, children), do: {children, []}
 
   defp text(%Google.MessagePart{
          mimeType: type,

@@ -227,6 +227,71 @@ defmodule EmailJanitor.GmailSDKTest do
     assert current.labels == ["INBOX", "UNREAD", "IMPORTANT"]
   end
 
+  test "attachment-only messages do not become empty classifier input" do
+    attachment = %{
+      "mimeType" => "application/pdf",
+      "filename" => "a.pdf",
+      "body" => %{"attachmentId" => "attachment-reference"}
+    }
+
+    for payload <- [attachment, %{"mimeType" => "multipart/mixed", "parts" => [attachment]}] do
+      mock(fn _ ->
+        Tesla.Mock.json(%{"id" => "thread-1", "messages" => [gmail_message(payload)]})
+      end)
+
+      assert {:error, :invalid_message} = SDK.thread("inbox-1", "thread-1", options())
+    end
+  end
+
+  test "AMP alternatives and related unnamed images do not block readable sales mail" do
+    alternative = %{
+      "mimeType" => "multipart/alternative",
+      "parts" => [
+        part("text/plain", "Development services pitch"),
+        part("text/html", "<p>Development services pitch</p>"),
+        part("text/x-amp-html", "AMP_SENTINEL")
+      ]
+    }
+
+    related = %{
+      "mimeType" => "multipart/related",
+      "parts" => [
+        alternative,
+        part("image/png", "IMAGE_SENTINEL", %{
+          "headers" => [%{"name" => "Content-ID", "value" => "logo"}]
+        })
+      ]
+    }
+
+    for payload <- [alternative, related] do
+      mock(fn _ ->
+        Tesla.Mock.json(%{"id" => "thread-1", "messages" => [gmail_message(payload)]})
+      end)
+
+      assert {:ok, [message]} = SDK.thread("inbox-1", "thread-1", options())
+      assert Content.read(message.body) =~ "Development services pitch"
+      refute Content.read(message.body) =~ "AMP_SENTINEL"
+      refute Content.read(message.body) =~ "IMAGE_SENTINEL"
+    end
+  end
+
+  test "AMP-only and image-only mail are preserved without meaningful readable text" do
+    for payload <- [
+          part("text/x-amp-html", "Unsupported body"),
+          %{
+            "mimeType" => "multipart/alternative",
+            "parts" => [part("text/plain", ""), part("text/x-amp-html", "Unsupported body")]
+          },
+          %{"mimeType" => "multipart/related", "parts" => [part("image/png", "Image body")]}
+        ] do
+      mock(fn _ ->
+        Tesla.Mock.json(%{"id" => "thread-1", "messages" => [gmail_message(payload)]})
+      end)
+
+      assert {:error, :invalid_message} = SDK.thread("inbox-1", "thread-1", options())
+    end
+  end
+
   test "exact addresses at company domains match exactly, not via domain keys" do
     mock(fn env ->
       if String.ends_with?(env.url, "/messages"),

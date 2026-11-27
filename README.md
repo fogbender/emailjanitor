@@ -80,6 +80,9 @@ and body content is wrapped in `Content`. Attachment bodies are not fetched.
 Unsupported/malformed MIME and oversized text fail conservatively; this slice
 supports UTF-8 text. The HTTP tests use synthetic responses and a per-connection
 Tesla mock; no account tokens or actual mailbox bodies are test fixtures.
+AMP alternatives and related inline images are omitted only when meaningful
+supported text is available; AMP-only, image-only and attachment-only mail stays
+untouched rather than becoming empty classifier input.
 
 Google's generated connection currently omits the decompression bound required
 by Tesla 1.23. A small connection middleware supplies an 8 MiB cap to that SDK
