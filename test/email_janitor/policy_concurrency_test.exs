@@ -556,6 +556,53 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
         )
       end)
 
+    prior_fence =
+      database(fn ->
+        TestRepo.get_by!(
+          Store.ReviewFence,
+          [inbox_id: ctx.inbox.id, message_id: "message-2"],
+          prefix: ctx.scope.prefix
+        ).reviewed_at
+      end)
+
+    parent = self()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          database(fn ->
+            Executor.review(
+              ctx.scope,
+              ctx.inbox,
+              "thread-1",
+              {TestGmail, [state: ctx.state]},
+              {EmailJanitor.TargetClassifier,
+               [
+                 keep_ids: ["message-2"],
+                 hook: fn ->
+                   send(parent, {:pending_keep_paused, self()})
+
+                   receive do
+                     :continue_pending_keep -> :ok
+                   after
+                     5_000 -> raise "Synthetic pending Keep barrier timed out"
+                   end
+                 end
+               ]},
+              "",
+              1,
+              cleanup_target_ids: ["message-2"],
+              policy: policy
+            )
+          end)
+
+        send(parent, {:pending_keep_result, result})
+      end)
+
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    assert_receive {:pending_keep_paused, owner}, 5_000
+    on_exit(fn -> Process.exit(owner, :kill) end)
+
     assert {:ok, fresh} = review.(["message-1", "message-2", "message-3"], ["message-3"])
 
     assert {:existing, ^action_id, :unresolved} =
@@ -565,7 +612,20 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
                )
              end)
 
+    send(owner, :continue_pending_keep)
+    assert_receive {:pending_keep_result, {:error, :proposal_changed}}, 5_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+
     database(fn ->
+      fresh_fence =
+        TestRepo.get_by(
+          Store.ReviewFence,
+          [inbox_id: ctx.inbox.id, message_id: "message-2"],
+          prefix: ctx.scope.prefix
+        )
+
+      assert DateTime.compare(fresh_fence.reviewed_at, prior_fence) == :gt
+
       assert [%{message_ids: ["message-2"]}] =
                TestRepo.all(
                  Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
