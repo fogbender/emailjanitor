@@ -118,7 +118,9 @@ an `EmailJanitor.Gmail.Config` with the connected `Inbox` and a zero-argument
 token resolver returning `{:ok, access_token}` (or a redacted `Content` wrapper).
 Token refresh and OAuth consent belong to the host; the adapter reads no global
 credential stores. The resolver must identify that inbox, not whichever Google
-account is currently active on the machine.
+account is currently active on the machine. Refresh early: a resolved token must
+remain valid for at least the full 60-second execution budget, since preparation
+freezes its verified token before admission.
 
 Every operation verifies Google's profile email against that inbox before
 accessing messages. Mutations accept 1–1000 distinct message IDs and remove only
@@ -133,6 +135,20 @@ plus 5-second connect budget under the 30-second owner watchdog. Legacy
 `remove_inbox/3` composes preparation and invocation. Hosts must never persist
 closures, credentials, or captured environments; custom test transports must
 honor the same bounded mutation contract.
+
+Adapters that resolve credentials or verify the Google account must implement the
+optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
+and returns an opaque zero-argument mutation closure. Only invoke that closure
+inside the executor's durable dispatch fence; never persist it or its captured
+credentials in a job. Preparation failure or termination creates no intent and
+reserves no quota. Legacy lightweight adapters remain supported through
+`remove_inbox/3`.
+
+The executor also reserves a complete dispatch watchdog window inside its overall
+execution deadline. If slow preparation exhausts that window, it fails before
+admission; if database contention exhausts it after intent, the never-dispatched
+intent is cancelled and its policy settlement is retried safely.
+
 
 `history/3` fetches all pages and exposes ordered INBOX label changes plus arrival
 and deletion IDs. Expired history, failed pages, pagination loops and limits
@@ -171,16 +187,3 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
-
-Adapters that resolve credentials or verify the Google account must implement the
-optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
-and returns an opaque zero-argument mutation closure. Only invoke that closure
-inside the executor's durable dispatch fence; never persist it or its captured
-credentials in a job. Preparation failure or termination creates no intent and
-reserves no quota. Legacy lightweight adapters remain supported through
-`remove_inbox/3`.
-
-The executor also reserves a complete dispatch watchdog window inside its overall
-execution deadline. If slow preparation exhausts that window, it fails before
-admission; if database contention exhausts it after intent, the never-dispatched
-intent is cancelled and its policy settlement is retried safely.

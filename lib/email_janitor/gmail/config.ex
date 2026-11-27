@@ -3,6 +3,10 @@ defmodule EmailJanitor.Gmail.Config do
   Host-owned Gmail connection. The host resolves rotating OAuth access tokens;
   this adapter never reads global Google, Codex, or Claude credentials.
 
+  The resolver must refresh early and return an access token valid for at least
+  the full 60-second execution budget. Preparation freezes that verified token;
+  dispatch must not resolve or refresh credentials after an intent is admitted.
+
   `adapter` is a trusted Tesla transport override, useful for isolated tests.
   The default transport verifies TLS peers and does not redirect credentials.
   Custom transports must honor the mutation's 15-second total budget as well.

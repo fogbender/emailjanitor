@@ -137,6 +137,8 @@ defmodule EmailJanitor.Gmail.SDK do
   Verify/freeze credentials, mailbox and exact IDs before the durable dispatch marker.
   The returned transient closure sends only batchModify with a 15-second default
   transport budget. Never persist the closure or inspect its captured environment.
+  The host resolver must return a token valid for at least 60 seconds, refreshing
+  early so admission and dispatch cannot consume the token's remaining lifetime.
   """
   @impl true
   def prepare_remove_inbox(inbox_id, ids, opts) do
