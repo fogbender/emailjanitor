@@ -574,3 +574,47 @@ Policy adapters must explicitly implement `retire_candidate_messages/4` to suppo
 partial metadata withdrawal. Legacy `retire_candidate/4` is used only when all
 remaining work is withdrawn; unsupported partial retirement rolls back before
 changing either host metadata or the core candidate.
+
+### Incoming email feedback (host integration)
+
+`Mail.Feedback` adds a metadata-only M13 workflow, with no SMTP body, Gmail body,
+reply prose, or auth tokens stored. A trusted host constructs `Feedback.Config`
+with its transport-only Scope/Inbox, Mail config, absolute parser executable,
+`route(envelope)` and `resolve(route_key)` callbacks. Initial routing identifies
+only the sender's currently connected Google inbox. Neither SMTP headers nor SES
+verdicts authorize a command. Known requests are durably accepted before the
+spool purges the raw S3 object, including while Gmail Sent indexing is delayed.
+
+The worker freshly verifies the Gmail account and searches an exact, unique
+Sent RFC Message-ID. It requires the current sender, Janitor recipient, SENT
+label, and an internal timestamp within one hour of the SES receipt. It parses
+only that authenticated Sent body. Maintained Crisp reply/forward parsers run in
+a bounded one-shot Nix executable (`.#reply-parser`, `emailjanitor-reply-parser`),
+with separate authored instructions and untrusted forwarded evidence. Unsupported
+MIME, ambiguous forwards, and interleaved quotes receive a clarification.
+
+`Feedback.Binding.route_verified(fresh_sent)` constructs the command Context
+only after authentication, using scoped confirmed Janitor outgoing references.
+`Feedback.Reference.delivery/3` is strict about the current recipient; `/4`
+accepts a trusted, exact subject-bound historical-recipient callback for renamed
+Google accounts. The host may return `{:clarify, sender_context}` for an expired
+or ambiguous reference, without executing a guessed conversation. A referenced
+digest may address another inbox only within the same trusted Scope; the reply
+still goes to the authenticated sender inbox. SMTP References are never passed
+to the routing callback. Hosts must derive the original conversation ID and,
+where present, exact prior request ID from their durable outgoing reference.
+
+`Feedback.accept(config, incoming, raw_content)` is the `Spool.process` handler;
+`Feedback.tick(config)` performs one due metadata receipt. Hosts bound worker
+concurrency and call `Feedback.Ledger.purge(scope, now)` during maintenance. They
+supply current DB-only guards and `respond(request_uuid, authored, evidence)` /
+`render(request_uuid)` functions. Request UUIDs depend only on the scoped inbox
+and canonical RFC ID. A reply interrupted after execution can be rebuilt from
+durable effect metadata; an unretained read-only answer gets an honest fixed
+fallback. Ambiguous SES dispatch is terminal, with no automatic resend. Unknown
+human senders can receive a configured signup link, limited to one sender/day
+and a global 100/day abuse backstop, with no Gmail inbox provisioned for Janitor.
+
+This is library plumbing tested with isolated PostgreSQL and synthetic HTTP.
+It is not activated, and real Google/SES delivery and threaded replies still
+need the final host/release integration gates.

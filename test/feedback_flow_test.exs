@@ -317,6 +317,45 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert delivery["Message.Body.Text.Data"] =~ "separate your note"
   end
 
+  test "authenticated missing context clarifies without running a guessed conversation", ctx do
+    binding = %{ctx.binding | route_verified: fn _ -> {:clarify, ctx.context} end}
+    config = %{ctx.config | resolve: fn _ -> {:ok, binding} end}
+    {:ok, id} = accept(%{ctx | config: config})
+    assert {:ok, :completed} = Feedback.process(config, id)
+    assert Agent.get(ctx.state, & &1.commands) == []
+    assert Ledger.get(ctx.scope, id).outcome == :clarify_unsupported
+  end
+
+  test "a temporary routing failure retains the spool for bounded retry instead of dropping the request",
+       ctx do
+    config = %{ctx.config | route: fn _ -> {:error, :database_temporarily_unavailable} end}
+    assert {:error, :feedback_unavailable} = accept(%{ctx | config: config})
+    assert Repo.all(Record, prefix: ctx.scope.prefix) == []
+  end
+
+  test "a temporary connection lookup retries, but a revoked binding never invokes the workflow",
+       ctx do
+    {:ok, id} = accept(ctx)
+    temporary = %{ctx.config | resolve: fn _ -> {:error, :connection_unavailable} end}
+    assert {:ok, :deferred} = Feedback.process(temporary, id)
+    assert Ledger.get(ctx.scope, id).state == :waiting_sent
+    due(ctx, id)
+    revoked_binding = %{ctx.binding | guard: fn -> {:error, :connection_changed} end}
+    revoked = %{ctx.config | resolve: fn _ -> {:ok, revoked_binding} end}
+    assert {:ok, :rejected} = Feedback.process(revoked, id)
+    assert Agent.get(ctx.state, & &1.commands) == []
+  end
+
+  test "a command context in another scope is rejected after authentication", ctx do
+    foreign = %{ctx.context | scope: ctx.scope}
+    binding = %{ctx.binding | route_verified: fn _ -> {:ok, foreign} end}
+    config = %{ctx.config | resolve: fn _ -> {:ok, binding} end}
+    {:ok, id} = accept(%{ctx | config: config})
+    assert {:ok, :rejected} = Feedback.process(config, id)
+    assert Agent.get(ctx.state, & &1.commands) == []
+    assert Agent.get(ctx.state, & &1.deliveries) == []
+  end
+
   test "unknown human signup is bounded per sender/day, loop protected and needs no Gmail account",
        ctx do
     stranger = "visitor@other.com"

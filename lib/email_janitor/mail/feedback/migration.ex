@@ -41,7 +41,7 @@ defmodule EmailJanitor.Mail.Feedback.Migration do
     create(
       constraint(:mail_feedback, :feedback_bounded_metadata,
         check:
-          "char_length(sender_address)<=254 AND char_length(sender_inbox_id)<=256 AND char_length(rfc_message_id)<=600 AND char_length(source_ses_id)<=256 AND (route_key IS NULL OR char_length(route_key)<=1024) AND (context_key IS NULL OR char_length(context_key)<=1024)"
+          "char_length(sender_address)<=254 AND char_length(sender_inbox_id)<=256 AND char_length(rfc_message_id)<=600 AND char_length(source_ses_id)<=256 AND (route_key IS NULL OR char_length(route_key)<=1024) AND (context_key IS NULL OR char_length(context_key)<=1024) AND (original_subject IS NULL OR octet_length(original_subject)<=1024)"
       )
     )
   end

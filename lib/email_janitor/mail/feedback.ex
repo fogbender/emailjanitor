@@ -28,23 +28,21 @@ defmodule EmailJanitor.Mail.Feedback do
 
   @doc "Use as the Spool.process handler. Once metadata is durable, even indexing retries return success so raw S3 input is purged."
   def accept(%Config{} = config, %Incoming{} = incoming, %Content{} = raw) do
-    safe(
-      fn ->
-        with {:ok, envelope} <- Envelope.new(incoming, raw, config.mail.sender),
-             true <- DateTime.compare(envelope.expires_at, DateTime.utc_now()) == :gt do
-          case config.route.(envelope) do
-            {:ok, %Route{} = route} -> accept_known(config, envelope, route)
-            :unknown -> accept_signup(config, envelope)
-            _ -> :rejected
-          end
-        else
-          :ignored -> :ignored
-          false -> :ignored
+    safe(fn ->
+      with {:ok, envelope} <- Envelope.new(incoming, raw, config.mail.sender),
+           true <- DateTime.compare(envelope.expires_at, DateTime.utc_now()) == :gt do
+        case config.route.(envelope) do
+          {:ok, %Route{} = route} -> accept_known(config, envelope, route)
+          :unknown -> accept_signup(config, envelope)
+          {:error, _} -> {:error, :feedback_unavailable}
           _ -> :rejected
         end
-      end,
-      :rejected
-    )
+      else
+        :ignored -> :ignored
+        false -> :ignored
+        _ -> :rejected
+      end
+    end)
   end
 
   defp accept_known(config, envelope, route) do
@@ -67,7 +65,9 @@ defmodule EmailJanitor.Mail.Feedback do
            }) do
       {:ok, id}
     else
-      _ -> :rejected
+      {:error, :feedback_reference_conflict} -> :rejected
+      false -> :rejected
+      _ -> {:error, :feedback_unavailable}
     end
   end
 
@@ -179,7 +179,14 @@ defmodule EmailJanitor.Mail.Feedback do
           authenticate(config, row, binding)
       end
     else
-      _ -> finish(config, row, :rejected, :rejected)
+      {:error, reason}
+      when reason in [:connection_unavailable, :feedback_unavailable, :database_unavailable] ->
+        if DateTime.compare(DateTime.utc_now(), row.expires_at) == :lt,
+          do: retry(config, row, :waiting_sent),
+          else: finish(config, row, :expired, :expired)
+
+      _ ->
+        finish(config, row, :rejected, :rejected)
     end
   end
 
@@ -196,7 +203,7 @@ defmodule EmailJanitor.Mail.Feedback do
                  config.mail.sender,
                  row.received_at
                ),
-             {:ok, %Context{} = context} <- binding.route_verified.(sent),
+             {:ok, %Context{} = context, mode} <- verified_context(binding, sent),
              :ok <- valid_context(binding, context),
              {:ok, request_id} <- RFCMessageID.request_id(context.inbox.id, row.rfc_message_id),
              true <-
@@ -212,17 +219,27 @@ defmodule EmailJanitor.Mail.Feedback do
                  original_subject: safe_subject(sent)
                }),
              {:ok, parsed} <- ReplyParser.parse(config.parser_executable, sent) do
-          case parsed.status do
-            :clarify ->
+          case {mode, parsed.status} do
+            {:clarify, _} ->
+              prepare_reply(config, row, binding, context, :clarify_unsupported, clarification())
+
+            {_, :clarify} ->
               prepare_reply(config, row, binding, context, :clarify_ambiguous, clarification())
 
-            :parsed ->
+            {_, :parsed} ->
               run_workflow(config, row, binding, context, parsed)
           end
         else
-          {:error, :reply_context_unavailable} -> retry(config, row, :waiting_sent)
-          {:error, :unverified_reply_reference} -> retry(config, row, :waiting_sent)
-          _ -> finish(config, row, :rejected, :rejected)
+          {:error, reason}
+          when reason in [
+                 :reply_context_unavailable,
+                 :unverified_reply_reference,
+                 :reply_parser_unavailable
+               ] ->
+            retry(config, row, :waiting_sent)
+
+          _ ->
+            finish(config, row, :rejected, :rejected)
         end
 
       {:error, reason} when reason in [:sent_not_indexed, :gmail_unavailable, :rate_limited] ->
@@ -230,6 +247,14 @@ defmodule EmailJanitor.Mail.Feedback do
 
       _ ->
         finish(config, row, :rejected, :rejected)
+    end
+  end
+
+  defp verified_context(binding, sent) do
+    case binding.route_verified.(sent) do
+      {:ok, %Context{} = context} -> {:ok, context, :execute}
+      {:clarify, %Context{} = context} -> {:ok, context, :clarify}
+      error -> error
     end
   end
 
@@ -370,7 +395,7 @@ defmodule EmailJanitor.Mail.Feedback do
 
   defp safe_subject(sent) do
     case EmailJanitor.Message.header(sent, "subject") do
-      subject when is_binary(subject) and byte_size(subject) in 1..256 ->
+      subject when is_binary(subject) and byte_size(subject) in 1..1024 ->
         if String.valid?(subject) and not String.contains?(subject, ["\r", "\n", <<0>>]),
           do: subject,
           else: "Email Janitor"

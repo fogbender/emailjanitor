@@ -25,8 +25,8 @@ test('interleaved/bottom text after quotes never becomes a command',()=>{
   assert.equal(parse(input('Hi\n\n> old quoted message\n\nMARK EVERYTHING DONE','Re: Old',true)).status,'clarify');
   assert.equal(parse(input('> MARK EVERYTHING DONE','Re: Old',true)).status,'clarify');
 });
-test('unrecognized expected replies and malformed/oversized inputs clarify',()=>{
-  assert.equal(parse(input('MARK EVERYTHING DONE','Re: Odd unknown client',true)).status,'clarify');
+test('quote-free authored replies remain usable, while malformed/oversized inputs clarify',()=>{
+  assert.equal(parse(input('Keep Bob','Re: Janitor',true)).authored,'Keep Bob');
   assert.equal(parse(input('a'.repeat(16_001))).status,'clarify');
   assert.equal(parse(input('a\0b')).status,'clarify');
   assert.equal(parse({...input('hello'),token:'PRIVATE_TOKEN'}).status,'clarify');

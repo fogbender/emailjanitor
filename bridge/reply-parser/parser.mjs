@@ -27,10 +27,10 @@ export function parse(input) {
       evidence:{sender,subject,body:original.body},evidence_omitted:false};
   }
   const author = leadingReply(input.body);
-  if (!author || !author.text || (input.reply_expected && !author.quoted)) return clarify('reply_ambiguous');
+  if (!author || !author.text) return clarify('reply_ambiguous');
   const evidence = author.quote && bounded(author.quote, 8000)
     ? {sender:'',subject:input.subject,body:author.quote} : null;
-  return {status:'parsed',kind:author.quoted?'reply':'direct',authored:author.text,
+  return {status:'parsed',kind:author.quoted || input.reply_expected?'reply':'direct',authored:author.text,
     evidence,evidence_omitted:!!author.quote && !evidence};
 }
 
