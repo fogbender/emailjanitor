@@ -587,6 +587,11 @@ defmodule EmailJanitor.IngestionTest do
     assert {:ok, _} =
              Ingestion.catch_up(scope, box, gmail(fn _ -> {:ok, history(["message-1"])} end))
 
+    for reason <- [:invalid_history, :incomplete_history] do
+      assert {:error, ^reason} =
+               Ingestion.catch_up(scope, box, gmail(fn _ -> {:error, reason} end))
+    end
+
     for reason <- [:authorization_required, :forbidden, :rate_limited, :wrong_inbox] do
       assert {:error, ^reason} =
                Ingestion.catch_up(scope, box, gmail(fn _ -> {:error, reason} end))

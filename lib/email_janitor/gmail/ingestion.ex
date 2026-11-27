@@ -150,7 +150,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
           {:ok, %HistoryBatch{} = history} -> persist_history(scope, inbox, previous, history)
           {:error, :history_expired} -> mark_gap(scope, inbox, previous)
           {:error, reason} = error when reason in @provider_errors -> error
-          {:error, :incomplete_history} = error -> error
+          {:error, reason} = error when reason in [:incomplete_history, :invalid_history] -> error
           _ -> {:error, :gmail_unavailable}
         end
       else
