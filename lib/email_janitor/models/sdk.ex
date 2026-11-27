@@ -103,6 +103,22 @@ defmodule EmailJanitor.Models.SDK do
   # provider protocol/authentication is implemented here. Pinned SDK tests attach
   # a real exporter and assert these events cannot leak on any failure path.
   defp generate(provider, model, context, options) do
+    # The pinned Converse decoder can log untrusted model text at warning level.
+    # Silence only this caller while the SDK prepares, dispatches and decodes;
+    # restore its exact prior setting even when the provider raises or throws.
+    previous = Logger.get_process_level(self())
+    Logger.put_process_level(self(), :none)
+
+    try do
+      generate_quietly(provider, model, context, options)
+    after
+      if is_nil(previous),
+        do: Logger.delete_process_level(self()),
+        else: Logger.put_process_level(self(), previous)
+    end
+  end
+
+  defp generate_quietly(provider, model, context, options) do
     deadline = ReqLLM.TimeoutBudget.deadline(options)
     {:ok, resolved} = ReqLLM.model(model)
 
@@ -129,7 +145,9 @@ defmodule EmailJanitor.Models.SDK do
       request = %{
         request
         | private: Map.delete(request.private, key),
-          request_steps: Keyword.delete(request.request_steps, :llm_telemetry_start),
+          request_steps:
+            [janitor_quiet_sdk: &quiet_request/1] ++
+              Keyword.delete(request.request_steps, :llm_telemetry_start),
           response_steps: Keyword.delete(request.response_steps, :llm_telemetry_stop),
           error_steps: Keyword.delete(request.error_steps, :llm_telemetry_exception)
       }
@@ -143,6 +161,13 @@ defmodule EmailJanitor.Models.SDK do
           {:error, :model_unavailable}
       end)
     end
+  end
+
+  # TimeoutBudget runs Req in its own short-lived Task, which does not inherit
+  # Logger's caller-local setting. Suppress it before any SDK request/decode step.
+  defp quiet_request(request) do
+    Logger.put_process_level(self(), :none)
+    request
   end
 
   defp payload(message) do
