@@ -85,9 +85,9 @@ retry; configure provider request deadlines within that budget.
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
 - Validated classifier boundary; transient content redaction and HTML extraction.
-  Thin ReqLLM adapters target AWS Bedrock for the one supported self-host setup
-  and Azure AI for the SaaS. Bedrock uses ExAws's rotating EC2 role credentials,
-  not developer profiles or model API keys. No direct OpenAI/Anthropic adapters.
+  Thin ReqLLM adapters target AWS Bedrock for self-hosting and Azure AI for the SaaS.
+  Bedrock uses ExAws rotating EC2 role credentials, without developer profiles.
+  No direct OpenAI/Anthropic adapters.
 - Explicit repository/schema scopes, durable idempotent action intents, exact-ID
   Gmail mutation boundary and restoration protection, tested against PostgreSQL.
 - Dedicated short-lived execution owners, single-host Linux identity, bounded
@@ -108,18 +108,51 @@ retry; configure provider request deadlines within that budget.
   history consumer and automatic recovery worker are not implemented yet.
 
 The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
-has separate HTTP-transport tests; no live Gmail account is connected yet. There
+has separate HTTP-transport tests; model tests exercise both real SDK pipelines
+against synthetic responses. No live Gmail account or model credentials are connected yet. There
 is no running cleanup service, email transport, chat UI, billing, or cloud
 deployment yet.
-
-The Gmail adapter in the tests is a fake. Model HTTP tests exercise the real SDK
-against synthetic responses, not live models or credentials. There is no OAuth connection, running
-cleanup service, email transport, chat UI, billing, or cloud deployment yet.
 
 The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
 scopes from model output or HTTP parameters. Query-prefix separation is covered
 here; full SaaS authorization is a later integration gate.
+
+## Model privacy boundary
+
+Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
+duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
+that never reach a model). The adapter removes the pinned SDK's
+request lifecycle telemetry before dispatch, including the upstream exception
+event that can otherwise contain raw text despite `payloads: :none`. Provider
+preparation, signing and decoding still use the SDK. Tests attach an upstream
+exporter and exercise failures for both providers. Raw payload tracing and dotenv
+loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
+are disabled (`max_retries: 0`); the durable job owner controls
+retry/backoff. Never put full SDK responses/errors into job arguments or reports.
+
+Finch, the underlying HTTP client, publishes raw bodies and credential headers in
+its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
+enable runtime HTTP tracing. The model adapter checks for Finch handlers before
+each call and fails closed if any are present; hosts must keep observer settings
+fixed during calls. Only the metadata-only Janitor event above is supported.
+Provider preparation also runs with logging disabled for that caller only,
+restoring its prior logger setting afterward. A first request step disables
+logging inside the SDK's separate short-lived dispatch/decoding task. This prevents the
+pinned Bedrock Converse decoder's malformed-tool warning from persisting raw
+model text; ordinary application logging in other processes stays available.
+Oversized or structurally excessive raw HTML passed directly to the model adapter
+is kept as `:unreadable_content` rather
+than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
+normal callers should use `Reviewer.review` to include safeguards and context.
+
+Every actionable INBOX message is included in model context, with recent
+already-done messages filling remaining context slots. More than five actionable
+messages keeps the entire thread. Each header is capped at 4096 bytes and each
+readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
+MIME, preferences above 32000 bytes, and complete encoded system/user context
+above 96000 bytes keep the conversation rather
+than submitting an incomplete or oversized review.
 
 ## Gmail SDK boundary
 
@@ -223,40 +256,62 @@ by Tesla 1.23. A small connection middleware supplies an 8 MiB cap to that SDK
 middleware and also limits uncompressed responses before JSON decoding. This
 preserves the SDK protocol implementation without downgrading HTTP security fixes.
 
-## Model privacy boundary
+## Metadata-only notification ingestion
 
-Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
-duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
-that never reach a model). The adapter removes the pinned SDK's
-request lifecycle telemetry before dispatch, including the upstream exception
-event that can otherwise contain raw text despite `payloads: :none`. Provider
-preparation, signing and decoding still use the SDK. Tests attach an upstream
-exporter and exercise failures for both providers. Raw payload tracing and dotenv
-loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
-are disabled (`max_retries: 0`); the durable job owner controls
-retry/backoff. Never put full SDK responses/errors into job arguments or reports.
+`EmailJanitor.Google.PubSub` uses Google's generated client for bounded,
+authenticated pull and exact acknowledgement. Supply a trusted subscription and
+an explicit short-lived service-token resolver. It reads no ambient credentials;
+the service token is separate from each Gmail user's OAuth token. SDK transport
+fixtures cover the actual generated requests. Pub/Sub IDs and acknowledgement
+tokens are never treated as Gmail message IDs. Malformed deliveries remain
+unacknowledged without blocking valid neighbors. Numeric history IDs normalize
+to strings and unknown payload fields are ignored without retaining their values.
 
-Finch, the underlying HTTP client, publishes raw bodies and credential headers in
-its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
-enable runtime HTTP tracing. The model adapter checks for Finch handlers before
-each call and fails closed if any are present; hosts must keep observer settings
-fixed during calls. Only the metadata-only Janitor event above is supported.
-Provider preparation also runs with logging disabled for that caller only,
-restoring its prior logger setting afterward. A first request step disables
-logging inside the SDK's separate short-lived dispatch/decoding task. This prevents the
-pinned Bedrock Converse decoder's malformed-tool warning from persisting raw
-model text; ordinary application logging in other processes stays available.
-Oversized or structurally excessive HTML is kept as `:unreadable_content` rather
-than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
-normal callers should use `Reviewer.review` to include safeguards and context.
+`Gmail.Ingestion.install(scope)` installs scoped migration 10. After the host calls
+`Gmail.SDK.watch/3`, `Ingestion.baseline/3` saves that watch cursor without scanning
+or cleaning existing mail. Restarting reads the existing checkpoint. Only an
+explicit `reconnect/4`, fenced by the previous connection generation, establishes
+a new baseline and discards old-generation discovery work. Watch renewal changes
+only expiration; its registration cursor never advances the processing cursor.
+OAuth refresh or reconsent after revoked credentials resumes the existing
+generation and cursor. It must never be interpreted as deliberate disconnection
+or used to call `reconnect/4` automatically.
 
-Every actionable INBOX message is included in model context, with recent
-already-done messages filling remaining context slots. More than five actionable
-messages keeps the entire thread. Each header is capped at 4096 bytes and each
-readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
-MIME, preferences above 32000 bytes, and complete encoded system/user context
-above 96000 bytes keep the conversation rather
-than submitting an incomplete or oversized review.
+`NotificationWorker.poll_once/2` resolves each notification through the host's
+trusted email-to-scope/Inbox router, commits a coalesced history hint, and only then
+acknowledges it. Failed routes or commits remain unacknowledged. A crash after
+commit can safely redeliver the same hint. Hosts must supervise this bounded step
+outside host transactions: ingestion writes reject outer transactions so an ack
+cannot outrun its commit. Hosts must periodically call `Ingestion.catch_up/3`
+even with no notifications: Gmail can delay or drop them. Catch-up atomically
+queues discovered message IDs and advances only through closed, non-regressing
+history records, with generation/cursor CAS. `Gmail.SDK.ingestion_batch/3` reads
+one bounded API page; `more?: true` tells the host to schedule the next batch
+immediately after its committed cursor. This avoids all-history page/count stalls.
+The distinct `HistoryBatch` type has no `complete?` field and cannot authorize
+ambiguous-action reconciliation; recovery still requires complete `history/3`.
+Independent-connection tests cover commits, rollback and competing snapshots.
+
+Pending work contains IDs, cursors and timestamps only. `eligible_thread/5` reads
+thread content transiently and preserves the whole conversation if any current
+INBOX message lacks same-generation post-baseline eligibility. It returns only a
+metadata eligibility proof. `authorize_proposal/4` rejects proposals outside that
+proof and rejects proofs from a previous connection generation. Hosts must also
+honor connection-generation fencing at final execution, retain the engine's
+instruction/manual-restoration guards, and use the Executor's fresh fingerprint
+and exact-ID checks. This slice does not dispatch classification or mutations,
+and it does not implement a partial-message mask for mixed old/new conversations.
+
+Expired history enters `:gap` and pauses discovery/eligibility. This deliberately
+does **not** recover arrivals missed after Gmail's history retention expires.
+Known gap-state inboxes still durably coalesce and acknowledge notification hints
+without advancing their cursor, avoiding repeated subscription backlog. Fixed
+authorization errors reach the host for reconsent without resetting the baseline.
+An explicit reconnect leaves that missed backlog in the inbox; it is not outage
+catch-up. A reviewed metadata-only recovery strategy or a surfaced reconnect
+consequence is required before launch. Host scheduling, reconnect/forget lifecycle,
+the private workload-auth token-file bridge and autonomous cleanup wiring remain
+separate work. No service account keys or email bodies are introduced here.
 
 ## Self-host infrastructure foundation
 
@@ -268,3 +323,49 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
+
+## Google workload token helper
+
+The isolated `google-auth-bridge` Nix package uses Google’s official Node SDK
+for AWS IMDSv2 or an explicitly selected Azure managed identity. It signs and
+exchanges workload credentials and impersonates the provisioned Google service
+account for the Pub/Sub scope. The pinned SDK’s AWS client adds its target header
+after signing; a small SDK subclass supplies the fixed configured audience to
+the official signer before delegation and rejects unexpected signed headers.
+Revalidate that upstream assumption on every SDK upgrade. It never receives Gmail credentials, email content,
+or model input. There is no handwritten SigV4 or STS implementation.
+
+A root-owned scheduled service runs:
+
+```sh
+emailjanitor-google-token --config /etc/emailjanitor/google-external-account.json --output /run/emailjanitor-google/token.json
+```
+
+Provision the SDK `external_account` JSON from the operator’s trusted infrastructure
+outputs. Only the expected Google STS/IAM endpoints and exact AWS metadata source
+or Azure metadata URL with an explicit `client_id` are accepted. Executables,
+ambient AWS keys, custom credential endpoints, proxies, redirects and retries
+are disabled. The helper caps requests at 10 seconds and its process at 45 seconds.
+The Nix launcher starts Node with an empty environment, excluding startup proxy,
+TLS, module injection and debug settings. Hosts must run this isolated launcher
+without ambient instrumentation or observers.
+
+The config must be owned by the helper user and not group/world writable. Use a
+canonical path, including the direct store path for Nix-generated configuration;
+the helper refuses configuration symlinks. Use a
+canonical absolute output directory owned by root, with the application’s group
+and mode `0750`. Tokens replace atomically with mode `0640`; failed refreshes keep
+the previous file. Give the application read-only access to this directory and
+no metadata-server/workload-credential access. Renew well before expiry, for
+example every 15 minutes with a one-hour token; restart the helper after reboot.
+The runtime file contains only `access_token` and epoch-second `expires_at`.
+Supply `fn -> EmailJanitor.Google.ServiceToken.read(path) end` as the Pub/Sub
+resolver. Missing, unsafe, malformed or expiring tokens fail closed without
+ambient-account fallback or credential logging.
+
+`nix build .#google-auth-bridge` builds and fixture-tests the pinned helper.
+`nix develop --command bash scripts/check-google-auth` runs real SDK federation,
+redirection/retry, configuration, redaction and atomic-file tests plus dependency
+audit. Only synthetic workload identities and mocked HTTP are used. Service
+unit wiring and deployment remain host integration work; no cloud resources
+have been changed by this helper slice.

@@ -34,6 +34,7 @@ defmodule EmailJanitor.MixProject do
       {:postgrex, "~> 0.23.0"},
       {:req, "~> 0.7.0"},
       {:google_api_gmail, "~> 0.17.0"},
+      {:google_api_pub_sub, "~> 0.42.0"},
       {:assent, "~> 0.4.0"},
       {:plug, "~> 1.20", only: :test},
       {:stream_data, "~> 1.4", only: :test},
