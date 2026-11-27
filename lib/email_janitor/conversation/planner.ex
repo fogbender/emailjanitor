@@ -1,7 +1,7 @@
 defmodule EmailJanitor.Conversation.Planner do
   @moduledoc "Transient conversation planning through the shared bounded model SDK."
   alias EmailJanitor.{Content, Inbox, Message, Preferences}
-  alias EmailJanitor.Conversation.{Instructions, Plan, Reference}
+  alias EmailJanitor.Conversation.{Evidence, Instructions, Plan, Reference}
   alias EmailJanitor.Models.SDK
   @external_resource Path.expand("../../../priv/prompts/conversation.txt", __DIR__)
   @prompt File.read!(@external_resource)
@@ -18,6 +18,7 @@ defmodule EmailJanitor.Conversation.Planner do
          true <- is_boolean(truncated),
          true <- byte_size(Content.read(request)) in 1..16_000,
          true <- String.valid?(Content.read(request)),
+         {:ok, forwarded} <- Evidence.decode(Keyword.get(opts, :request_evidence)),
          true <- snapshot.inbox_id == inbox.id,
          true <- is_list(references) and length(references) <= 10,
          true <- Enum.all?(references, &match?(%Reference{}, &1)),
@@ -38,6 +39,8 @@ defmodule EmailJanitor.Conversation.Planner do
              "inbox" => Enum.map(instructions.inbox, &instruction/1)
            },
            "USER_MESSAGE" => Content.read(request),
+           "UNTRUSTED_FORWARDED_EVIDENCE" => forwarded,
+           "PREVIOUS_EFFECTS" => Keyword.get(opts, :previous_effects),
            "SEARCH_RESULTS" => Enum.map(references, &reference/1),
            "SEARCH_TRUNCATED" => truncated,
            "UNTRUSTED_EMAILS" => Enum.map(messages, &message(&1, references))
@@ -64,7 +67,7 @@ defmodule EmailJanitor.Conversation.Planner do
              Plan.parse(
                Content.read(object),
                tokens,
-               bodies ++ headers,
+               bodies ++ headers ++ Evidence.sources(forwarded),
                Map.new(instructions, fn {scope, rows} ->
                  {scope, rows |> Enum.filter(& &1.editable) |> Enum.map(& &1.id)}
                end)

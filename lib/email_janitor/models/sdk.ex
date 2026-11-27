@@ -20,7 +20,6 @@ defmodule EmailJanitor.Models.SDK do
   end
 
   defp perform(messages, instructions, opts) do
-    %Config{} = config = Keyword.fetch!(opts, :config)
     %Inbox{} = inbox = Keyword.fetch!(opts, :inbox)
 
     # SDK debug logging is process-global; fail closed if a host enables it.
@@ -46,49 +45,33 @@ defmodule EmailJanitor.Models.SDK do
       @prompt <>
         "\nSELECTED_INBOX_JSON:\n" <>
         Jason.encode!(%{address: inbox.address, relay_addresses: inbox.relay_addresses}) <>
-        "\nUSER_PREFERENCES:\n" <>
-        instructions <>
-        "\nOUTPUT_SCHEMA_JSON:\n" <> Jason.encode!(schema)
+        "\nUSER_PREFERENCES:\n" <> instructions
 
     user_text = "UNTRUSTED_EMAIL_JSON:\n" <> payload
 
-    # Bound the entire encoded context, including accumulated preferences and
-    # trusted mailbox identity, before the SDK allocates/prepares any request.
-    encoded_context =
-      Jason.encode!([
-        %{role: "system", content: system_text},
-        %{role: "user", content: user_text}
-      ])
+    with {:ok, object} <-
+           request_object(
+             Content.new(system_text),
+             Content.new(user_text),
+             schema,
+             opts,
+             true
+           ),
+         {:ok, value} <- Jason.decode(Content.read(object)),
+         {:ok, _} <- parse(value, target_ids) do
+      {:ok, value}
+    else
+      {:error, :invalid_model_content} ->
+        {:keep, :unreadable_content}
 
-    if byte_size(encoded_context) > 96_000, do: throw(:invalid_content)
-    context = [ReqLLM.Context.system(system_text), ReqLLM.Context.user(user_text)]
+      {:error, :model_rejected} ->
+        {:error, :model_rejected}
 
-    options =
-      [
-        max_tokens: 4096,
-        max_retries: 0,
-        receive_timeout: 30_000,
-        total_timeout: 35_000,
-        telemetry: [payloads: :none],
-        req_http_options: Keyword.get(opts, :http_options, [])
-      ]
-      |> optional(:base_url, config.base_url)
-      |> optional(:deployment, config.deployment)
+      {:error, reason} when reason in [:invalid_model_output, :invalid_decision] ->
+        {:invalid, :decision}
 
-    {:ok, credentials} = credentials(config, opts)
-    options = Keyword.merge(options, credentials)
-    provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
-
-    model = %{provider: provider, id: config.model}
-    # ReqLLM does not force structured tools for Nova Micro. Classification has
-    # no executable tools, so use its normal text API and validate JSON locally.
-    generated = generate(config.provider, model, context, options, schema)
-
-    case generated do
-      {:ok, response} -> decision_object(response, config.provider, target_ids)
-      {:invalid, :decision} -> {:invalid, :decision}
-      {:error, :model_rejected} -> {:error, :model_rejected}
-      _ -> {:error, :model_unavailable}
+      _ ->
+        {:error, :model_unavailable}
     end
   rescue
     _ -> {:error, :model_unavailable}
@@ -100,23 +83,8 @@ defmodule EmailJanitor.Models.SDK do
       {:error, :model_unavailable}
   end
 
-  # Only parsing an already successful provider response produces this fixed
-  # invalid result; transport/auth/timeouts retain the retryable outage result.
-  defp decision_object(response, provider, target_ids) do
-    object =
-      if provider == :bedrock,
-        do: ReqLLM.Response.text(response),
-        else: ReqLLM.Response.object(response)
-
-    case parse(object, target_ids) do
-      {:ok, _} -> if is_binary(object), do: Jason.decode(object), else: {:ok, object}
-      _ -> {:invalid, :decision}
-    end
-  rescue
-    _ -> {:invalid, :decision}
-  catch
-    _, _ -> {:invalid, :decision}
-  end
+  defp parse(object, nil), do: Decision.parse(object)
+  defp parse(object, ids), do: TargetDecisions.parse(object, ids)
 
   @doc """
   Generate a bounded structured object with the same private SDK transport used
@@ -172,19 +140,31 @@ defmodule EmailJanitor.Models.SDK do
     provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
     model = %{provider: provider, id: config.model}
 
-    with {:ok, response} <- generate(config.provider, model, context, options, schema),
-         {:ok, value} <- response_object(response, config.provider),
-         {:ok, validated} <- ReqLLM.Schema.validate(value, schema),
-         encoded = Jason.encode!(validated),
-         true <- byte_size(encoded) <= 32_000 do
-      {:ok, Content.new(encoded)}
-    else
+    case generate(config.provider, model, context, options, schema) do
+      {:ok, response} -> validated_object(response, config.provider, schema)
+      {:invalid, :decision} -> {:error, :invalid_model_output}
+      {:error, :model_rejected} -> {:error, :model_rejected}
       _ -> {:error, :model_unavailable}
     end
   rescue
     _ -> {:error, :model_unavailable}
   catch
     _, _ -> {:error, :model_unavailable}
+  end
+
+  defp validated_object(response, provider, schema) do
+    with {:ok, value} <- response_object(response, provider),
+         {:ok, validated} <- ReqLLM.Schema.validate(value, schema),
+         encoded = Jason.encode!(validated),
+         true <- byte_size(encoded) <= 32_000 do
+      {:ok, Content.new(encoded)}
+    else
+      _ -> {:error, :invalid_model_output}
+    end
+  rescue
+    _ -> {:error, :invalid_model_output}
+  catch
+    _, _ -> {:error, :invalid_model_output}
   end
 
   defp response_object(response, :bedrock) do
@@ -206,9 +186,6 @@ defmodule EmailJanitor.Models.SDK do
   # telemetry before any request can run. No global handlers are detached and no
   # provider protocol/authentication is implemented here. Pinned SDK tests attach
   # a real exporter and assert these events cannot leak on any failure path.
-  defp parse(object, nil), do: Decision.parse(object)
-  defp parse(object, target_ids), do: TargetDecisions.parse(object, target_ids)
-
   defp generate(provider, model, context, options, schema) do
     # The pinned Converse decoder can log untrusted model text at warning level.
     # Silence only this caller while the SDK prepares, dispatches and decodes;

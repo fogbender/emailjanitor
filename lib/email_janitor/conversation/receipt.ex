@@ -19,6 +19,13 @@ defmodule EmailJanitor.Conversation.Receipt do
     field(:preference_revision, :integer)
     field(:results, {:array, :map}, default: [])
     field(:completed, :boolean, default: false)
+    field(:owner_token, Ecto.UUID)
+    field(:owner_runtime, :string)
+    field(:owner_host, :string)
+    field(:owner_boot, :string)
+    field(:owner_os_pid, :string)
+    field(:owner_os_start, :string)
+    field(:owner_beam_pid, :binary)
     timestamps(type: :utc_datetime_usec)
   end
 end

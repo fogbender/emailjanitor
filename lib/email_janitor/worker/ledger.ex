@@ -296,30 +296,38 @@ defmodule EmailJanitor.Worker.Ledger do
   end
 
   def retire_candidate(scope, inbox, id, ids) do
-    case scope.repo.get_by(Candidate, [inbox_id: inbox.id, candidate_id: id],
-           prefix: scope.prefix,
-           log: false
-         ) do
-      nil ->
-        :ok
+    case scope.repo.transaction(fn ->
+           candidate =
+             scope.repo.one(
+               from(c in Candidate,
+                 where: c.inbox_id == ^inbox.id and c.candidate_id == ^id,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix,
+               log: false
+             )
 
-      candidate ->
-        remaining = candidate.message_ids -- ids
+           if candidate do
+             remaining = candidate.message_ids -- ids
 
-        if remaining != candidate.message_ids do
-          scope.repo.update!(
-            Ecto.Changeset.change(candidate,
-              message_ids: remaining,
-              status: if(remaining == [], do: :retired, else: :pending),
-              requested: remaining != [] and candidate.requested,
-              request_version: candidate.request_version + 1
-            ),
-            prefix: scope.prefix,
-            log: false
-          )
-        end
+             if remaining != candidate.message_ids do
+               scope.repo.update!(
+                 Ecto.Changeset.change(candidate,
+                   message_ids: remaining,
+                   status: if(remaining == [], do: :retired, else: :pending),
+                   requested: remaining != [] and candidate.requested,
+                   request_version: candidate.request_version + 1
+                 ),
+                 prefix: scope.prefix,
+                 log: false
+               )
+             end
+           end
 
-        :ok
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      _ -> {:error, :policy_unavailable}
     end
   end
 
@@ -383,16 +391,18 @@ defmodule EmailJanitor.Worker.Ledger do
 
   def queue_manual(scope, inbox, id, thread, ids, options) do
     authority = Keyword.get(options, :authority_id, id)
+    refresh_authority = Keyword.get(options, :refresh_authority, true)
 
     with {:ok, id} <- Ecto.UUID.cast(id),
          {:ok, authority} <- Ecto.UUID.cast(authority),
+         true <- is_boolean(refresh_authority),
          true <- EmailJanitor.Gmail.Parser.valid_id?(thread) and valid_selection?(ids) do
       case scope.repo.transaction(fn ->
              mailbox =
                scope.repo.one(
                  from(m in Mailbox,
                    where: m.id == ^inbox.id,
-                   lock: "FOR NO KEY UPDATE"
+                   lock: "FOR UPDATE"
                  ),
                  prefix: scope.prefix,
                  log: false
@@ -449,8 +459,6 @@ defmodule EmailJanitor.Worker.Ledger do
                    do: scope.repo.rollback(:ineligible_recheck)
 
                  if Enum.sort(existing.message_ids) != Enum.sort(ids) do
-                   :ok = EmailJanitor.Store.fence_recheck(scope, inbox.id, ids)
-
                    scope.repo.update!(
                      Ecto.Changeset.change(existing,
                        message_ids: Enum.sort(ids),
@@ -483,6 +491,20 @@ defmodule EmailJanitor.Worker.Ledger do
                  )
              end
 
+             if refresh_authority do
+               :ok = EmailJanitor.Store.fence_recheck(scope, inbox.id, ids)
+
+               scope.repo.update_all(
+                 from(p in Candidate,
+                   where:
+                     p.inbox_id == ^inbox.id and p.candidate_id == ^id and p.status == :pending
+                 ),
+                 [inc: [request_version: 1]],
+                 prefix: scope.prefix,
+                 log: false
+               )
+             end
+
              # Preserve requested backoff and every cap on repeated host discovery.
              scope.repo.update_all(
                from(p in Candidate,
@@ -491,7 +513,8 @@ defmodule EmailJanitor.Worker.Ledger do
                      p.candidate_id == ^id and p.status == :pending and not p.requested and
                      not p.contract_blocked and p.invalid_attempts < 8 and p.rejected_attempts < 4
                ),
-               [set: [requested: true, next_attempt_at: nil], inc: [request_version: 1]],
+               [set: [requested: true, next_attempt_at: nil]] ++
+                 if(refresh_authority, do: [], else: [inc: [request_version: 1]]),
                prefix: scope.prefix,
                log: false
              )

@@ -91,6 +91,8 @@ defmodule EmailJanitor.PreferencesExecutionTest do
     correction =
       Task.async(fn ->
         unboxed(fn ->
+          send(observer, {:correction_backend, backend_pid()})
+
           Preferences.replace(
             ctx.scope,
             :all,
@@ -103,7 +105,8 @@ defmodule EmailJanitor.PreferencesExecutionTest do
 
     # Establish a real DB waiter before releasing the intent transaction. The
     # correction therefore owns the mailbox before the subsequent dispatch fence.
-    wait_for_database_lock(200)
+    assert_receive {:correction_backend, correction_backend}, 1000
+    wait_for_database_lock(correction_backend, 200)
     send(owner, :continue)
     assert {:ok, _} = Task.await(correction)
     assert {:error, :proposal_changed} = Task.await(execution)
@@ -115,16 +118,23 @@ defmodule EmailJanitor.PreferencesExecutionTest do
     assert [%{labels: ["INBOX", "UNREAD", "IMPORTANT"]}] = Agent.get(state, & &1.messages)
   end
 
-  defp wait_for_database_lock(0), do: flunk("Correction never waited on the mailbox lock")
+  defp backend_pid do
+    %{rows: [[pid]]} =
+      Ecto.Adapters.SQL.query!(TestRepo, "SELECT pg_backend_pid()", [], log: false)
 
-  defp wait_for_database_lock(attempts) do
+    pid
+  end
+
+  defp wait_for_database_lock(_, 0), do: flunk("Correction never waited on the mailbox lock")
+
+  defp wait_for_database_lock(backend, attempts) do
     waiting =
       unboxed(fn ->
         %{rows: [[count]]} =
           Ecto.Adapters.SQL.query!(
             TestRepo,
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
-            [],
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock' AND query ILIKE '%inboxes%' AND cardinality(pg_blocking_pids(pid)) > 0",
+            [backend],
             log: false
           )
 
@@ -133,7 +143,7 @@ defmodule EmailJanitor.PreferencesExecutionTest do
 
     if !waiting do
       Process.sleep(5)
-      wait_for_database_lock(attempts - 1)
+      wait_for_database_lock(backend, attempts - 1)
     end
   end
 
@@ -196,6 +206,8 @@ defmodule EmailJanitor.PreferencesExecutionTest do
     global =
       Task.async(fn ->
         unboxed(fn ->
+          send(observer, {:global_backend, backend_pid()})
+
           Preferences.replace(
             ctx.scope,
             :all,
@@ -206,7 +218,8 @@ defmodule EmailJanitor.PreferencesExecutionTest do
         end)
       end)
 
-    wait_for_database_lock(200)
+    assert_receive {:global_backend, global_backend}, 1000
+    wait_for_database_lock(global_backend, 200)
     assert is_nil(Task.yield(global, 10))
     send(holder.pid, :release)
     assert {:ok, :ok} = Task.await(holder)

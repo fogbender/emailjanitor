@@ -1500,7 +1500,8 @@ defmodule EmailJanitor.WorkerTest do
 
     assert :ok =
              Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"],
-               authority_id: authority
+               authority_id: authority,
+               refresh_authority: false
              )
 
     assert [^before] = Repo.all(Candidate, prefix: ctx.scope.prefix)

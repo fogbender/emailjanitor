@@ -3,5 +3,11 @@ defmodule EmailJanitor.Conversation.Context do
   @derive {Inspect, only: [:inbox, :conversation_id]}
   @enforce_keys [:scope, :inbox, :conversation_id, :gmail, :model, :guard, :policy]
   defstruct @enforce_keys ++
-              [execution_options: [], planner: EmailJanitor.Conversation.Planner]
+              [
+                request_evidence: nil,
+                previous_request_id: nil,
+                prior_receipt: nil,
+                execution_options: [],
+                planner: EmailJanitor.Conversation.Planner
+              ]
 end

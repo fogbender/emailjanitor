@@ -15,7 +15,7 @@ inside an optional module.
 | 6 | Target categories, remaining candidate/cancelled metadata and review fences | `Store.install/1` |
 | 7 | Exact restoration effects and durable per-message protections | `Store.install/1` / `Restore.install/1` |
 | 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
-| 9 | Conversation execution ownership | Conversation installer (in development) |
+| 9 | Conversation execution ownership and exact action bindings | `Conversation.Ledger.install/1` |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement/deferred provenance ledger | `Worker.install/1` |
 | 12 | Staged digest action headers | `Digest.install_staging/1` |
