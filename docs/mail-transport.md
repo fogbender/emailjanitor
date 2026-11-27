@@ -5,8 +5,9 @@ durable outbox/spool. It does not yet schedule digests, parse human conversation
 send signup instructions, run feedback workflows, or prove SES account readiness.
 No live mail or cloud resources were used during its tests.
 
-The host first installs `Store.install(scope)`, then `Mail.Store.install(scope)`
-(public migration 4). `Mail.Config.new/1` takes the trusted AWS region, exact sender,
+The host first installs `Store.install(scope)`, then `Preferences.install(scope)`
+(scoped migration 3) if used, then `Mail.Store.install(scope)` (scoped migration 4;
+see the [migration registry](migrations.md)). `Mail.Config.new/1` takes the trusted AWS region, exact sender,
 spool bucket, SQS URL, SES receipt topic ARN and a zero-argument credentials resolver.
 The resolver returns temporary `access_key_id`, `secret_access_key`, `security_token`
 keywords. `Mail.Credentials.instance_role/1` uses the maintained ExAws EC2 role
