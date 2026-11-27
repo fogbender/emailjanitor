@@ -36,6 +36,23 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
 
 ## Implemented foundation
 
+The conversation foundation uses the same Azure/Bedrock SDK transport as
+classification through `Models.SDK.object/4`. `Conversation.Planner.plan/6`
+returns a transient typed proposal with inbox-bound reference tokens; email
+content cannot supply a storage scope, credential or arbitrary tool. Incomplete
+search results cannot authorize effects. Copied email passages are rejected from
+distilled instructions. These checks supplement the prompt; execution still
+requires the immutable executor safeguards and the host's policy.
+
+`Conversation.Ledger.install/1` installs migration 8 for seven-day metadata-only
+request/effect receipts and previous reference IDs. It stores no user request,
+model response, search query, sender, subject or body. Hosts call `purge/2` during
+maintenance. `Conversation.Outcome` derives completion claims from recorded
+effects, preserves ambiguous results, and detects instructions changed since an
+earlier request. The authenticated runner, Gmail lookup/restoration and website
+and email entry-point wiring remain separate integration work; this foundation
+does not enable cleanup.
+
 Versioned distilled preferences are available through `Preferences.install/1`
 (migration 3), `snapshot/2`, `text/1` and `replace/5`. The host selects either all
 inboxes or the snapshot's inbox after authenticating the conversation. Only the

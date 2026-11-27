@@ -33,14 +33,7 @@ defmodule EmailJanitor.Models.SDK do
   end
 
   defp perform(messages, instructions, opts) do
-    %Config{} = config = Keyword.fetch!(opts, :config)
     %Inbox{} = inbox = Keyword.fetch!(opts, :inbox)
-
-    # SDK debug logging is process-global; fail closed if a host enables it.
-    false = ReqLLM.Debug.enabled?()
-    # Finch events include raw request bodies/headers. Observer configuration is
-    # a host trust boundary: fail closed if ANY Finch handlers are installed.
-    [] = :telemetry.list_handlers([:finch])
 
     if not is_binary(instructions) or byte_size(instructions) > 32_000,
       do: throw(:invalid_content)
@@ -56,15 +49,55 @@ defmodule EmailJanitor.Models.SDK do
 
     user_text = "UNTRUSTED_EMAIL_JSON:\n" <> payload
 
-    # Bound the entire encoded context, including accumulated preferences and
-    # trusted mailbox identity, before the SDK allocates/prepares any request.
-    encoded_context =
+    with {:ok, object} <- object(Content.new(system_text), Content.new(user_text), @schema, opts),
+         {:ok, value} <- Jason.decode(Content.read(object)),
+         {:ok, _} <- Decision.parse(value) do
+      {:ok, value}
+    else
+      {:error, :invalid_model_content} -> {:keep, :unreadable_content}
+      _ -> {:error, :model_unavailable}
+    end
+  rescue
+    _ -> {:error, :model_unavailable}
+  catch
+    :throw, reason when reason in [:invalid_html, :invalid_content] ->
+      {:keep, :unreadable_content}
+
+    _, _ ->
+      {:error, :model_unavailable}
+  end
+
+  @doc """
+  Generate a bounded structured object with the same private SDK transport used
+  by classification. The schema and system prompt are trusted application code.
+  Returned JSON remains transient Content; callers validate their typed contract
+  before applying any effect. There are no model-executable provider tools.
+  """
+  def object(%Content{} = system, %Content{} = user, schema, opts) when is_map(schema) do
+    system_text = Content.read(system) <> "\nOUTPUT_SCHEMA_JSON:\n" <> Jason.encode!(schema)
+    user_text = Content.read(user)
+
+    encoded =
       Jason.encode!([
         %{role: "system", content: system_text},
         %{role: "user", content: user_text}
       ])
 
-    if byte_size(encoded_context) > 96_000, do: throw(:invalid_content)
+    if byte_size(encoded) <= 96_000 and String.valid?(system_text) and String.valid?(user_text) do
+      do_object(system_text, user_text, schema, opts)
+    else
+      {:error, :invalid_model_content}
+    end
+  rescue
+    _ -> {:error, :model_unavailable}
+  catch
+    _, _ -> {:error, :model_unavailable}
+  end
+
+  defp do_object(system_text, user_text, schema, opts) do
+    %Config{} = config = Keyword.fetch!(opts, :config)
+    false = ReqLLM.Debug.enabled?()
+    [] = :telemetry.list_handlers([:finch])
     context = [ReqLLM.Context.system(system_text), ReqLLM.Context.user(user_text)]
 
     options =
@@ -82,31 +115,35 @@ defmodule EmailJanitor.Models.SDK do
     {:ok, credentials} = credentials(config, opts)
     options = Keyword.merge(options, credentials)
     provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
-
     model = %{provider: provider, id: config.model}
-    # ReqLLM does not force structured tools for Nova Micro. Classification has
-    # no executable tools, so use its normal text API and validate JSON locally.
-    generated = generate(config.provider, model, context, options)
 
-    with {:ok, response} <- generated,
-         object =
-           if(config.provider == :bedrock,
-             do: ReqLLM.Response.text(response),
-             else: ReqLLM.Response.object(response)
-           ),
-         {:ok, _} <- Decision.parse(object) do
-      if is_binary(object), do: Jason.decode(object), else: {:ok, object}
+    with {:ok, response} <- generate(config.provider, model, context, options, schema),
+         {:ok, value} <- response_object(response, config.provider),
+         {:ok, validated} <- ReqLLM.Schema.validate(value, schema),
+         encoded = Jason.encode!(validated),
+         true <- byte_size(encoded) <= 32_000 do
+      {:ok, Content.new(encoded)}
     else
       _ -> {:error, :model_unavailable}
     end
   rescue
     _ -> {:error, :model_unavailable}
   catch
-    :throw, reason when reason in [:invalid_html, :invalid_content] ->
-      {:keep, :unreadable_content}
+    _, _ -> {:error, :model_unavailable}
+  end
 
-    _, _ ->
-      {:error, :model_unavailable}
+  defp response_object(response, :bedrock) do
+    case ReqLLM.Response.text(response) do
+      text when is_binary(text) and byte_size(text) <= 32_000 -> Jason.decode(text)
+      _ -> {:error, :invalid_object}
+    end
+  end
+
+  defp response_object(response, :azure) do
+    case ReqLLM.Response.object(response) do
+      value when is_map(value) -> {:ok, value}
+      _ -> {:error, :invalid_object}
+    end
   end
 
   # ReqLLM 1.31 emits raw request-bearing exceptions even with payloads:none.
@@ -114,7 +151,7 @@ defmodule EmailJanitor.Models.SDK do
   # telemetry before any request can run. No global handlers are detached and no
   # provider protocol/authentication is implemented here. Pinned SDK tests attach
   # a real exporter and assert these events cannot leak on any failure path.
-  defp generate(provider, model, context, options) do
+  defp generate(provider, model, context, options, schema) do
     # The pinned Converse decoder can log untrusted model text at warning level.
     # Silence only this caller while the SDK prepares, dispatches and decodes;
     # restore its exact prior setting even when the provider raises or throws.
@@ -122,7 +159,7 @@ defmodule EmailJanitor.Models.SDK do
     Logger.put_process_level(self(), :none)
 
     try do
-      generate_quietly(provider, model, context, options)
+      generate_quietly(provider, model, context, options, schema)
     after
       if is_nil(previous),
         do: Logger.delete_process_level(self()),
@@ -130,7 +167,7 @@ defmodule EmailJanitor.Models.SDK do
     end
   end
 
-  defp generate_quietly(provider, model, context, options) do
+  defp generate_quietly(provider, model, context, options, schema) do
     deadline = ReqLLM.TimeoutBudget.deadline(options)
     {:ok, resolved} = ReqLLM.model(model)
 
@@ -140,8 +177,10 @@ defmodule EmailJanitor.Models.SDK do
           {ReqLLM.Providers.AmazonBedrock, :chat, Keyword.delete(options, :output_validation)}
 
         :azure ->
-          {:ok, schema} = ReqLLM.Schema.compile(@schema)
-          {ReqLLM.Providers.Azure, :object, Keyword.put(options, :compiled_schema, schema)}
+          {:ok, compiled_schema} = ReqLLM.Schema.compile(schema)
+
+          {ReqLLM.Providers.Azure, :object,
+           Keyword.put(options, :compiled_schema, compiled_schema)}
       end
 
     with {:ok, options} <-
