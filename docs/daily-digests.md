@@ -70,6 +70,21 @@ returns `:digest_stage_conflict`. Unknown actions never authorize promotion.
 Staging and confirmation take the scoped mailbox first, so the same-inbox digest
 claim/settlement paths preserve the shared lock order.
 
+After a positively confirmed restoration, a trusted host may call
+`Digest.withdraw_pending(scope, inbox_id, exact_message_ids)` in its database-only
+restoration callback. It retires unlisted Done entries only where their exact
+source action's durable `restored_message_ids` contains that Gmail ID. Requested
+restoration protections alone are not proof. Historical activity/action rows stay
+intact, and this operation makes no Gmail call or quota refund.
+
+Digest claims also exclude that positive per-action proof before selecting a
+snapshot, so a crash between restoring mail and running the metadata callback
+cannot report it as pending suppression. Late staged settlement preserves the
+historical Done event but retires its restored entries. A retried older callback
+cannot retire a newer genuine Done action on the same message. Already frozen
+snapshots remain immutable, including an outbox intent still awaiting delivery;
+the restoration affects future snapshots only.
+
 `Digest.tick(scope, inbox_id, now, claim_extras)` locks the schedule and chooses
 the latest passed local 21:00 cutoff. It includes only unlisted activity at or
 before that cutoff; a late tick cannot consume later-evening arrivals. Empty
