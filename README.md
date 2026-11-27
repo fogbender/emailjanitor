@@ -45,14 +45,22 @@ distilled instructions. Small edits preserve unrelated instruction paragraphs
 without generating a full 15,000-byte scope replacement. These checks supplement the prompt; execution still
 requires the immutable executor safeguards and the host's policy.
 
-`Conversation.Ledger.install/1` installs migration 8 for seven-day metadata-only
+`Conversation.respond/3` uses a trusted `Conversation.Context` supplied by the
+host. It resolves references inside the selected inbox, applies small preference
+edits, and routes explicit Done requests through the same executor safeguards
+and policy as automatic cleanup. Completion replies come from exact durable
+message outcomes. Hosts must provide the policy and current connection guard;
+model output cannot select a storage scope or a Gmail credential.
+
+`Conversation.Ledger.install/1` installs migrations 8 and 9 for seven-day metadata-only
 request/effect receipts and previous reference IDs. It stores no user request,
 model response, search query, sender, subject or body. Hosts call `purge/2` during
 maintenance. `Conversation.Outcome` derives completion claims from recorded
 effects, preserves ambiguous results, and detects instructions changed since an
-earlier request. The authenticated runner, Gmail lookup/restoration and website
-and email entry-point wiring remain separate integration work; this foundation
-does not enable cleanup.
+earlier request. A live request owner excludes duplicate effects; takeover requires
+actual owner death, and completed receipts cannot be changed. The runner's Gmail
+search/restoration capabilities and authenticated website/email entry points are
+still being integrated; no live cleanup or production service is enabled here.
 
 Versioned distilled preferences are available through `Preferences.install/1`
 (migration 3), `snapshot/2`, `text/1` and `replace/5`. The host selects either all
@@ -167,7 +175,7 @@ here; full SaaS authorization is a later integration gate.
 ## Model privacy boundary
 
 Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
-duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
+duration and a fixed status (`:ok`, `:error`, `:invalid` or `:keep`, including preflight keeps
 that never reach a model). The adapter removes the pinned SDK's
 request lifecycle telemetry before dispatch, including the upstream exception
 event that can otherwise contain raw text despite `payloads: :none`. Provider

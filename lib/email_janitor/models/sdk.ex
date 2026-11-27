@@ -55,8 +55,14 @@ defmodule EmailJanitor.Models.SDK do
          {:ok, _} <- parse(value, target_ids) do
       {:ok, value}
     else
-      {:error, :invalid_model_content} -> {:keep, :unreadable_content}
-      _ -> {:error, :model_unavailable}
+      {:error, :invalid_model_content} ->
+        {:keep, :unreadable_content}
+
+      {:error, reason} when reason in [:invalid_model_output, :invalid_decision] ->
+        {:invalid, :decision}
+
+      _ ->
+        {:error, :model_unavailable}
     end
   rescue
     _ -> {:error, :model_unavailable}
@@ -125,19 +131,30 @@ defmodule EmailJanitor.Models.SDK do
     provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
     model = %{provider: provider, id: config.model}
 
-    with {:ok, response} <- generate(config.provider, model, context, options, schema),
-         {:ok, value} <- response_object(response, config.provider),
-         {:ok, validated} <- ReqLLM.Schema.validate(value, schema),
-         encoded = Jason.encode!(validated),
-         true <- byte_size(encoded) <= 32_000 do
-      {:ok, Content.new(encoded)}
-    else
+    case generate(config.provider, model, context, options, schema) do
+      {:ok, response} -> validated_object(response, config.provider, schema)
+      {:invalid, :decision} -> {:error, :invalid_model_output}
       _ -> {:error, :model_unavailable}
     end
   rescue
     _ -> {:error, :model_unavailable}
   catch
     _, _ -> {:error, :model_unavailable}
+  end
+
+  defp validated_object(response, provider, schema) do
+    with {:ok, value} <- response_object(response, provider),
+         {:ok, validated} <- ReqLLM.Schema.validate(value, schema),
+         encoded = Jason.encode!(validated),
+         true <- byte_size(encoded) <= 32_000 do
+      {:ok, Content.new(encoded)}
+    else
+      _ -> {:error, :invalid_model_output}
+    end
+  rescue
+    _ -> {:error, :invalid_model_output}
+  catch
+    _, _ -> {:error, :invalid_model_output}
   end
 
   defp response_object(response, :bedrock) do
@@ -211,14 +228,26 @@ defmodule EmailJanitor.Models.SDK do
           error_steps: Keyword.delete(request.error_steps, :llm_telemetry_exception)
       }
 
-      ReqLLM.Runtime.execute_prepared(request, deadline, fn
-        %Req.Response{status: status, body: %ReqLLM.Response{} = response}
-        when status in 200..299 ->
-          {:ok, response}
+      result =
+        ReqLLM.Runtime.execute_prepared(request, deadline, fn
+          %Req.Response{status: status, body: %ReqLLM.Response{} = response}
+          when status in 200..299 ->
+            {:ok, response}
 
-        _ ->
-          {:error, :model_unavailable}
-      end)
+          %Req.Response{status: status} when status in 200..299 ->
+            {:invalid, :decision}
+
+          _ ->
+            {:error, :model_unavailable}
+        end)
+
+      case result do
+        {:error, %ReqLLM.Error.API.Response{status: status}} when status in 200..299 ->
+          {:invalid, :decision}
+
+        other ->
+          other
+      end
     end
   end
 

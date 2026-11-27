@@ -15,9 +15,10 @@ inside an optional module.
 | 6 | Target categories, remaining candidates and review fences | `Store.install/1` |
 | 7 | Exact-message restoration protection/receipts | Restore installer (in development) |
 | 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
+| 9 | Conversation execution ownership | `Conversation.Ledger.install/1` |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
 
-Version 9 is unallocated. Changes to an already released schema require a new
+Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's
 global `public` schema has its own independent registry and migration table.

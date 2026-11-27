@@ -3,7 +3,10 @@ defmodule EmailJanitor.Classifier do
   alias EmailJanitor.{Decision, Inbox, Message, TargetDecisions}
 
   @callback classify(list(EmailJanitor.Message.t()), String.t(), keyword()) ::
-              {:ok, String.t() | map()} | {:keep, :unreadable_content} | {:error, term()}
+              {:ok, String.t() | map()}
+              | {:keep, :unreadable_content}
+              | {:invalid, :decision}
+              | {:error, term()}
 
   def propose({adapter, options}, messages, instructions, %Inbox{} = inbox) do
     call(adapter, options, messages, instructions, inbox, &Decision.parse/1)
@@ -30,6 +33,9 @@ defmodule EmailJanitor.Classifier do
 
       {:error, _} ->
         {:error, :model_unavailable}
+
+      {:invalid, :decision} ->
+        {:error, :invalid_decision}
 
       _ ->
         {:error, :invalid_decision}

@@ -182,7 +182,7 @@ defmodule EmailJanitor.ConversationPlannerTest do
 
     log =
       capture_log(fn ->
-        assert {:error, :model_unavailable} =
+        assert {:error, :invalid_model_output} =
                  SDK.object(
                    Content.new("trusted"),
                    Content.new("PRIVATE_INPUT_SENTINEL"),

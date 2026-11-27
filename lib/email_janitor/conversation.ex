@@ -5,6 +5,7 @@ defmodule EmailJanitor.Conversation do
   alias EmailJanitor.Conversation.{
     Context,
     ExplicitSelection,
+    Instructions,
     Ledger,
     Lookup,
     Outcome,
@@ -39,18 +40,18 @@ defmodule EmailJanitor.Conversation do
     evidence =
       case previous do
         nil ->
-          {:ok, [], []}
+          {:ok, [], [], false}
 
         receipt ->
-          case Lookup.load(ctx, receipt.references) do
-            {:ok, _, _} = found -> found
-            _ when is_nil(pending) -> {:ok, [], []}
+          case Lookup.load(ctx, receipt.context_references) do
+            {:ok, refs, messages} -> {:ok, refs, messages, not receipt.search_complete}
+            _ when is_nil(pending) -> {:ok, [], [], false}
             error -> error
           end
       end
 
-    with {:ok, refs, messages} <- evidence do
-      propose(ctx, request_id, request, snapshot, refs, messages, false, 2)
+    with {:ok, refs, messages, truncated} <- evidence do
+      propose(ctx, request_id, request, snapshot, refs, messages, truncated, 2)
     end
   end
 
@@ -126,8 +127,15 @@ defmodule EmailJanitor.Conversation do
   defp teach(ctx, receipt, proposal, snapshot) do
     target = if proposal.preference_target == :all, do: :all, else: {:inbox, ctx.inbox.id}
 
+    current = if proposal.preference_target == :all, do: snapshot.global, else: snapshot.local
+
+    changed =
+      with {:ok, instruction} <-
+             Instructions.edit(current, proposal.replace_instructions, proposal.instruction),
+           do: Preferences.replace(ctx.scope, target, snapshot, instruction, receipt.id)
+
     {status, revision} =
-      case Preferences.replace(ctx.scope, target, snapshot, proposal.instruction, receipt.id) do
+      case changed do
         {:ok, change} -> {if(change.changed, do: :updated, else: :unchanged), change.revision}
         _ -> {:failed, nil}
       end

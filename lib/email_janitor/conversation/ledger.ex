@@ -1,16 +1,22 @@
 defmodule EmailJanitor.Conversation.Ledger do
   @moduledoc "Pins effect selection before execution without retaining a conversation transcript."
   import Ecto.Query
+  alias EmailJanitor.Owner
   alias EmailJanitor.Conversation.{Plan, Receipt, Reference}
   alias EmailJanitor.Store.{Mailbox, Scope}
 
-  def install(%Scope{} = scope),
-    do:
-      Ecto.Migrator.up(scope.repo, 8, EmailJanitor.Conversation.Migration,
+  def install(%Scope{} = scope) do
+    for {version, module} <- [
+          {8, EmailJanitor.Conversation.Migration},
+          {9, EmailJanitor.Conversation.OwnershipMigration}
+        ] do
+      Ecto.Migrator.up(scope.repo, version, module,
         prefix: scope.prefix,
         log: false,
         telemetry_event: nil
       )
+    end
+  end
 
   def get(%Scope{} = scope, inbox_id, conversation_id, request_id) do
     cutoff = cutoff()
@@ -102,7 +108,8 @@ defmodule EmailJanitor.Conversation.Ledger do
                 context_references: Enum.map(refs, &metadata/1),
                 search_complete: plan.search_complete,
                 preference_status: if(plan.preference_target == :none, do: :none, else: :pending)
-              },
+              }
+              |> struct(Owner.capture()),
               prefix: scope.prefix,
               log: false,
               telemetry_event: nil
@@ -112,7 +119,7 @@ defmodule EmailJanitor.Conversation.Ledger do
             if existing.operation == plan.operation and
                  existing.preference_target == plan.preference_target and
                  existing.references == metadata,
-               do: existing,
+               do: own(scope, existing),
                else: scope.repo.rollback(:request_conflict)
 
           _ ->
@@ -221,6 +228,9 @@ defmodule EmailJanitor.Conversation.Ledger do
       receipt =
         get(scope, inbox_id, conversation_id, request_id) || scope.repo.rollback(:unknown_request)
 
+      if receipt.completed, do: scope.repo.rollback(:request_complete)
+      if not Owner.owns?(receipt), do: scope.repo.rollback(:request_in_flight)
+
       case fun.(receipt) do
         %Ecto.Changeset{} = changes ->
           scope.repo.update!(changes, prefix: scope.prefix, log: false, telemetry_event: nil)
@@ -237,6 +247,23 @@ defmodule EmailJanitor.Conversation.Ledger do
       log: false,
       telemetry_event: nil
     ) || scope.repo.rollback(:unknown_inbox)
+  end
+
+  defp own(_scope, %Receipt{completed: true} = receipt), do: receipt
+
+  defp own(scope, receipt) do
+    cond do
+      Owner.owns?(receipt) ->
+        receipt
+
+      is_nil(receipt.owner_runtime) or Owner.proof(receipt) == :dead ->
+        receipt
+        |> Ecto.Changeset.change(Owner.capture())
+        |> scope.repo.update!(prefix: scope.prefix, log: false, telemetry_event: nil)
+
+      true ->
+        scope.repo.rollback(:request_in_flight)
+    end
   end
 
   defp cutoff, do: DateTime.add(DateTime.utc_now(), -604_800)
