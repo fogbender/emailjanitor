@@ -74,7 +74,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           release = pkgs.runCommand "emailjanitor-release-check" {
-            nativeBuildInputs = [ self.packages.${system}.emailjanitor ];
+            nativeBuildInputs = [ self.packages.${system}.emailjanitor pkgs.python3 ];
           } ''
             export HOME="$TMPDIR"
             export ERL_CRASH_DUMP=/dev/null
@@ -85,6 +85,8 @@
               true = File.regular?(Application.app_dir(:email_janitor, "priv/prompts/classify.txt"))
               true = Code.ensure_loaded?(EmailJanitor.Mail.SDK)
             '
+            python3 ${./scripts/check-release-cookie.py} \
+              ${self.packages.${system}.emailjanitor} email_janitor ${pkgs.coreutils}/bin/base64
             touch "$out"
           '';
         });

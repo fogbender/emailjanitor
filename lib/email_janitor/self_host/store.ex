@@ -44,9 +44,12 @@ defmodule EmailJanitor.SelfHost.Store do
 
   def authorize_owner(_), do: {:error, :unauthorized}
 
-  def connect(subject, %OAuth.Result{} = result, timezone) do
-    with true <- owner?(subject),
-         true <- subject?(result.subject),
+  def connect(subject, result, timezone) do
+    if owner?(subject), do: connect_verified(result, timezone), else: {:error, :unauthorized}
+  end
+
+  defp connect_verified(%OAuth.Result{} = result, timezone) do
+    with true <- subject?(result.subject),
          {:ok, box} <- Inbox.new(inbox_id(result.subject), result.email),
          {:ok, _} <- Digest.Clock.local(DateTime.utc_now(), timezone),
          {:ok, token} <- token_data(result.token),
@@ -96,9 +99,11 @@ defmodule EmailJanitor.SelfHost.Store do
             }
 
         if binding.google_subject != result.subject, do: scope.repo.rollback(:invalid_connection)
-        resumed = binding.state in [:pending, :active]
+        resumed = binding.state != :disconnected
 
         if readdressed do
+          readdress_checkpoint!(scope, box.id, mailbox.address, box.address)
+
           scope.repo.update_all(
             from(m in Mailbox, where: m.id == ^box.id),
             [inc: [instruction_version: 1], set: [address: box.address, updated_at: now]],
@@ -110,7 +115,8 @@ defmodule EmailJanitor.SelfHost.Store do
           timezone: timezone,
           token_ciphertext: cipher,
           token_version: binding.token_version + 1,
-          state: if(resumed, do: binding.state, else: :pending),
+          state: if(binding.state == :active, do: :active, else: :pending),
+          reset_baseline: binding.reset_baseline or not resumed,
           epoch: if(resumed and not readdressed, do: binding.epoch, else: binding.epoch + 1)
         }
 
@@ -122,14 +128,13 @@ defmodule EmailJanitor.SelfHost.Store do
         box
       end)
     else
-      false -> {:error, :unauthorized}
       _ -> {:error, :invalid_connection}
     end
   rescue
     _ -> {:error, :invalid_connection}
   end
 
-  def connect(_, _, _), do: {:error, :invalid_connection}
+  defp connect_verified(_, _), do: {:error, :invalid_connection}
 
   def inboxes(subject) do
     if owner?(subject) do
@@ -184,6 +189,7 @@ defmodule EmailJanitor.SelfHost.Store do
                  scope.repo.update!(
                    Ecto.Changeset.change(binding,
                      state: :disconnected,
+                     reset_baseline: true,
                      token_ciphertext: nil,
                      epoch: binding.epoch + 1,
                      token_version: binding.token_version + 1
@@ -205,6 +211,76 @@ defmodule EmailJanitor.SelfHost.Store do
       end
     else
       {:error, :unauthorized}
+    end
+  end
+
+  @doc false
+  def refs do
+    scope = SelfHost.scope()
+
+    {:ok,
+     scope.repo.all(
+       from(b in Binding,
+         where: b.state in [:pending, :active],
+         order_by: b.id,
+         select: {b.id, b.epoch}
+       ),
+       prefix: scope.prefix
+     )}
+  rescue
+    _ -> {:error, :self_host_unavailable}
+  end
+
+  @doc false
+  def fetch_binding({id, epoch}) when is_binary(id) and is_integer(epoch) do
+    scope = SelfHost.scope()
+
+    case scope.repo.one(
+           from(b in Binding,
+             join: m in Mailbox,
+             on: m.id == b.id,
+             where: b.id == ^id and b.epoch == ^epoch and b.state in [:pending, :active],
+             select: {b, m.address}
+           ),
+           prefix: scope.prefix
+         ) do
+      {binding, address} -> {:ok, binding, %Inbox{id: id, address: address}}
+      _ -> {:error, :inbox_unavailable}
+    end
+  rescue
+    _ -> {:error, :self_host_unavailable}
+  end
+
+  def fetch_binding(_), do: {:error, :inbox_unavailable}
+
+  @doc false
+  def guard(ref, %Inbox{} = expected) do
+    case fetch_binding(ref) do
+      {:ok, _, ^expected} -> :ok
+      _ -> {:error, :inbox_unavailable}
+    end
+  end
+
+  @doc false
+  def activate({id, _} = ref) do
+    case transaction(fn scope ->
+           lock_mailbox(scope, id)
+
+           case fetch_binding(ref) do
+             {:ok, binding, _} ->
+               scope.repo.update!(
+                 Ecto.Changeset.change(binding, state: :active, reset_baseline: false),
+                 prefix: scope.prefix
+               )
+
+               :ok
+
+             _ ->
+               scope.repo.rollback(:inbox_unavailable)
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      error -> error
     end
   end
 
@@ -237,6 +313,23 @@ defmodule EmailJanitor.SelfHost.Store do
   defp inbox_id(subject),
     do: "google-" <> Base.encode16(:crypto.hash(:sha256, subject), case: :lower)
 
+  defp readdress_checkpoint!(scope, id, old_address, new_address) do
+    alias EmailJanitor.Gmail.Ingestion.Checkpoint
+
+    case scope.repo.get(Checkpoint, id, prefix: scope.prefix) do
+      nil ->
+        :ok
+
+      %Checkpoint{address: ^old_address} = checkpoint ->
+        scope.repo.update!(Ecto.Changeset.change(checkpoint, address: new_address),
+          prefix: scope.prefix
+        )
+
+      _ ->
+        scope.repo.rollback(:invalid_connection)
+    end
+  end
+
   defp retire_replaced_subjects(scope, subject, address) do
     bindings =
       scope.repo.all(
@@ -258,6 +351,7 @@ defmodule EmailJanitor.SelfHost.Store do
       scope.repo.update!(
         Ecto.Changeset.change(binding,
           state: :disconnected,
+          reset_baseline: true,
           token_ciphertext: nil,
           epoch: binding.epoch + 1,
           token_version: binding.token_version + 1

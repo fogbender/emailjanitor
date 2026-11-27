@@ -12,9 +12,17 @@ inside an optional module.
 | 3 | Conversational preferences/receipts | `Preferences.install/1` |
 | 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` |
 | 5 | Daily digest metadata | `Digest.install/1` |
+| 6 | Target categories, remaining candidate/cancelled metadata and review fences | `Store.install/1` |
+| 7 | Restoration intent metadata | Restoration installer (in development) |
+| 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
+| 9 | Conversation execution ownership | Conversation installer (in development) |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
+| 12 | Staged digest action headers | `Digest.install_staging/1` |
+| 100 | Opt-in single-user owner and encrypted bindings | `SelfHost.Store.install/1` |
+| 101 | Single-user browser attempts and sessions | `SelfHost.Web.install/1` (in development) |
 
-Versions 6–9 are unallocated. Changes to an already released schema require a new
+Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's
 global `public` schema has its own independent registry and migration table.
+Versions 100–101 apply only to the opt-in fixed `ej_selfhost` scope.
