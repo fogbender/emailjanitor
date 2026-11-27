@@ -547,3 +547,31 @@ Policy adapters must explicitly implement `retire_candidate_messages/4` to suppo
 partial metadata withdrawal. Legacy `retire_candidate/4` is used only when all
 remaining work is withdrawn; unsupported partial retirement rolls back before
 changing either host metadata or the core candidate.
+
+## Exact-message restoration and search
+
+`Gmail.SDK.search(inbox_id, query, options)` returns at most ten message/thread
+references and an explicit `truncated` flag. It uses only generated SDK metadata
+fields and never logs or persists the query. Callers must refine ambiguous or
+truncated searches before selecting effects; message bodies require an explicit
+subsequent scoped fetch.
+
+`Restore.apply(scope, inbox, effect_uuid, action_uuid, exact_ids, gmail, options)`
+restores only confirmed applied IDs from that exact scoped Janitor action.
+Migration 7 is installed with the core. Requested IDs are protected durably
+before the single generated-SDK add-INBOX operation; read/unread and all other
+labels are preserved. The source action is not blanket-marked restored. Receipt
+UUIDs bind the action and exact selection; duplicate or ambiguous effects never
+auto-dispatch again. Proven dead owners with no dispatch marker may be cancelled,
+allowing a fresh explicit request UUID. Overlapping unresolved effects stay blocked.
+
+Hosts pass `authorize: fn -> :ok | {:error, atom} end` and the current
+`expected_instruction_version:`. Authorization is bounded DB-only work and runs
+again under the final mailbox fence; disconnect must atomically increment that
+mailbox version. An Inbox UUID must retain one immutable Google subject: address
+changes for that subject are allowed, a different subject needs a new Inbox UUID.
+The host guard enforces that invariant for the referenced action. Credentials
+are frozen and verified before durable admission. Callers must not persist the
+prepared closure. Forget/delete workflows remove manual_restore_protections
+and restore_effects before actions/inboxes. No bodies, search text or tokens
+enter either restoration table.

@@ -19,6 +19,7 @@ defmodule EmailJanitor.Store do
     Ecto.Migrator.up(repo, 1, Migration, prefix: prefix, log: false)
     Ecto.Migrator.up(repo, 2, CandidateMigration, prefix: prefix, log: false)
     Ecto.Migrator.up(repo, 6, TargetMigration, prefix: prefix, log: false)
+    Ecto.Migrator.up(repo, 7, EmailJanitor.Restore.Migration, prefix: prefix, log: false)
   end
 
   def add_inbox(%Scope{} = scope, %Inbox{} = inbox) do
@@ -673,15 +674,28 @@ defmodule EmailJanitor.Store do
   end
 
   def restored_ids(%Scope{} = scope, inbox_id) do
-    scope.repo.all(
-      from(a in Action,
-        where: a.inbox_id == ^inbox_id and a.state == :restored,
-        select: a.restored_message_ids
-      ),
-      prefix: scope.prefix
-    )
-    |> List.flatten()
-    |> MapSet.new()
+    confirmed =
+      scope.repo.all(
+        from(a in Action,
+          where: a.inbox_id == ^inbox_id and a.state == :restored,
+          select: a.restored_message_ids
+        ),
+        prefix: scope.prefix,
+        log: false
+      )
+      |> List.flatten()
+
+    requested =
+      scope.repo.all(
+        from(p in EmailJanitor.Restore.Protection,
+          where: p.inbox_id == ^inbox_id,
+          select: p.message_id
+        ),
+        prefix: scope.prefix,
+        log: false
+      )
+
+    MapSet.new(confirmed ++ requested)
   end
 
   defp fresh_recovery_history(%Action{dispatch_started_at: nil}, _), do: :ok
