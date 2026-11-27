@@ -1,7 +1,7 @@
 defmodule EmailJanitor.Policy do
   @moduledoc """
   Host-owned transactional admission and durable-result settlement; single-user
-  default is unlimited. Both callbacks execute on the scoped repo's connection
+  default is unlimited. Callbacks execute on the scoped repo's connection
   inside an inbox/action lock transaction. Keep them bounded database operations,
   never provider/network calls. A settlement error rolls back its side effects;
   the already durable Gmail outcome remains available for a later retry.
