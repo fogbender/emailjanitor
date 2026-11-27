@@ -179,6 +179,20 @@ defmodule EmailJanitor.RestoreTest do
     assert effects(ctx) == [] and read(ctx).restores == []
   end
 
+  for mode <- [:ok, :timeout, {:rejected, :forbidden}] do
+    test "duplicate restore #{inspect(mode)} rejects a stale mailbox binding before returning state",
+         ctx do
+      Agent.update(ctx.state, &%{&1 | mode: unquote(mode)})
+      _ = restore(ctx)
+      before = read(ctx).restores
+
+      assert {:error, :wrong_inbox} =
+               restore(%{ctx | box: %{ctx.box | address: "stale@example.com"}})
+
+      assert read(ctx).restores == before
+    end
+  end
+
   test "host binding and mailbox version are checked after preparation and at final fence", ctx do
     counter = start_supervised!({Agent, fn -> 0 end}, id: :guard)
 
@@ -950,6 +964,89 @@ defmodule EmailJanitor.RestoreTest do
 
     assert [%EmailJanitor.Worker.Candidate{requested: true, request_version: 2}] =
              Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx).restores == [["message-1"]]
+  end
+
+  for {selection, refresh} <- [
+        {:new, true},
+        {:same, true},
+        {:new, false},
+        {:same, false},
+        {:changed, false}
+      ] do
+    test "manual queue #{selection} refresh=#{refresh} distinguishes new authority from ordinary discovery",
+         ctx do
+      check_manual_queue_after_restore(ctx, unquote(selection), unquote(refresh))
+    end
+  end
+
+  defp check_manual_queue_after_restore(ctx, selection, refresh) do
+    alias EmailJanitor.Worker
+    :ok = Worker.install(ctx.scope)
+
+    {:ok, _} =
+      EmailJanitor.Gmail.Ingestion.baseline(ctx.scope, ctx.box, %{
+        history_id: "100",
+        expires_at: DateTime.add(DateTime.utc_now(), 604_800)
+      })
+
+    candidate = seed_candidate(ctx, ["message-1", "message-3"], -60)
+
+    if selection != :new do
+      ids = if selection == :changed, do: candidate.message_ids, else: ["message-1"]
+
+      :ok =
+        Worker.queue_manual(ctx.scope, ctx.box, candidate.id, "thread-1", ids,
+          authority_id: candidate.id
+        )
+    end
+
+    policy = %EmailJanitor.Policy{
+      adapter: __MODULE__.Policy,
+      context: %{owner: self(), scope: ctx.scope, inbox: ctx.box}
+    }
+
+    assert {:unresolved, effect_id} =
+             restore(ctx, policy: policy, on_restored: fn _, _ -> {:error, :retry} end)
+
+    before = Repo.get_by(Worker.Candidate, [candidate_id: candidate.id], prefix: ctx.scope.prefix)
+
+    :ok =
+      Worker.queue_manual(ctx.scope, ctx.box, candidate.id, "thread-1", ["message-1"],
+        authority_id: candidate.id,
+        refresh_authority: refresh
+      )
+
+    if before && refresh do
+      :ok =
+        Worker.Ledger.finish_candidate(
+          ctx.scope,
+          ctx.box,
+          before,
+          :unsupported_policy,
+          DateTime.utc_now()
+        )
+    end
+
+    assert {:done, ^effect_id} =
+             Restore.settle(
+               ctx.scope,
+               ctx.box,
+               effect_id,
+               Keyword.put(trusted_options(), :policy, policy)
+             )
+
+    core = Repo.get!(EmailJanitor.Store.Candidate, candidate.id, prefix: ctx.scope.prefix)
+    row = Repo.get_by!(Worker.Candidate, [candidate_id: candidate.id], prefix: ctx.scope.prefix)
+
+    if refresh do
+      assert core.remaining_message_ids == ["message-1", "message-3"]
+      assert row.message_ids == ["message-1"] and row.requested and not row.contract_blocked
+    else
+      assert core.remaining_message_ids == ["message-3"]
+      assert row.status == :retired and row.message_ids == [] and not row.requested
+    end
 
     assert read(ctx).restores == [["message-1"]]
   end

@@ -129,7 +129,8 @@ defmodule EmailJanitor.Restore do
                {:ok, effect_id} <- Ecto.UUID.cast(effect_id),
                {:ok, action_id} <- Ecto.UUID.cast(action_id),
                true <- valid_ids?(ids),
-               :ok <- authorized(authorize) do
+               :ok <- authorized(authorize),
+               :ok <- readable_inbox(scope, inbox) do
             ids = Enum.sort(ids)
 
             case existing(scope, inbox, effect_id, action_id, ids) do
