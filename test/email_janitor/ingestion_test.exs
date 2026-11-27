@@ -34,7 +34,7 @@ end
 
 defmodule EmailJanitor.IngestionTest.PubSub do
   def pull(config), do: {:ok, config[:deliveries]}
-  def acknowledge(config, [delivery]), do: config[:ack].(delivery)
+  def acknowledge(config, deliveries), do: config[:ack].(deliveries)
 end
 
 defmodule EmailJanitor.IngestionTest.MigrationRepo do
@@ -395,6 +395,98 @@ defmodule EmailJanitor.IngestionTest do
              )
 
     assert {:ok, %Checkpoint{cursor: "100", requested_id: "102"}} =
+             Ingestion.checkpoint(scope, box.id)
+  end
+
+  test "a full pull records every hint before one generated SDK batch acknowledgement", %{
+    scope: scope,
+    box: box
+  } do
+    baseline(scope, box)
+    observer = self()
+
+    {:ok, config} =
+      EmailJanitor.Google.PubSub.Config.new(
+        "projects/emailjanitor-test/subscriptions/mailbox",
+        fn -> {:ok, Content.new("SERVICE_TOKEN_SENTINEL")} end,
+        adapter: Tesla.Mock
+      )
+
+    Tesla.Mock.mock(fn env ->
+      if String.ends_with?(env.url, ":pull") do
+        messages =
+          for id <- 101..200 do
+            %{
+              "ackId" => "ack-#{id}",
+              "message" => %{
+                "messageId" => "pubsub-#{id}",
+                "data" =>
+                  Base.encode64(
+                    Jason.encode!(%{"emailAddress" => box.address, "historyId" => "#{id}"})
+                  )
+              }
+            }
+          end
+
+        Tesla.Mock.json(%{"receivedMessages" => messages})
+      else
+        assert %{"ackIds" => ids} = Jason.decode!(env.body)
+        assert MapSet.new(ids) == MapSet.new(for id <- 101..200, do: "ack-#{id}")
+        assert length(ids) == 100
+
+        task =
+          Task.async(fn ->
+            Sandbox.unboxed_run(TestRepo, fn -> Ingestion.checkpoint(scope, box.id) end)
+          end)
+
+        assert {:ok, %Checkpoint{requested_id: "200", cursor: "100"}} = Task.await(task)
+        send(observer, :batch_acknowledged)
+        Tesla.Mock.json(%{})
+      end
+    end)
+
+    assert {:ok, %{recorded: 100, acknowledged: 100, failed: 0}} =
+             NotificationWorker.poll_once({EmailJanitor.Google.PubSub, config}, fn _ ->
+               {:ok, scope, box}
+             end)
+
+    assert_received :batch_acknowledged
+    refute_received :batch_acknowledged
+  end
+
+  test "a failed batch ack leaves every durable hint retryable and excludes bad routes", %{
+    scope: scope,
+    box: box
+  } do
+    baseline(scope, box)
+    observer = self()
+
+    deliveries =
+      for id <- ["101", "102"],
+          do: %{delivery(id) | ack_id: Content.new("ack-#{id}"), message_id: "pubsub-#{id}"}
+
+    rejected = %EmailJanitor.Google.PubSub.Rejected{}
+    unknown = %{delivery("103") | email_address: "other@acme.com"}
+
+    config = [
+      deliveries: deliveries ++ [rejected, unknown],
+      ack: fn stored ->
+        assert Enum.map(stored, & &1.history_id) == ["101", "102"]
+        send(observer, :one_failed_batch)
+        {:error, :unavailable}
+      end
+    ]
+
+    assert {:ok, %{recorded: 2, acknowledged: 0, failed: 4}} =
+             NotificationWorker.poll_once({PubSub, config}, fn
+               "owner@acme.com" -> {:ok, scope, box}
+               _ -> {:error, :unknown}
+             end)
+
+    assert_received :one_failed_batch
+    refute_received :one_failed_batch
+
+    assert {:ok, %Checkpoint{requested_id: "102", cursor: "100"}} =
              Ingestion.checkpoint(scope, box.id)
   end
 
