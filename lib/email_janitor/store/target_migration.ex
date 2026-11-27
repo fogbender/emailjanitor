@@ -5,6 +5,7 @@ defmodule EmailJanitor.Store.TargetMigration do
   def change do
     alter table(:actions) do
       add(:message_categories, :map, null: false, default: %{})
+      add(:remaining_metadata_ids, {:array, :text})
     end
 
     alter table(:action_candidates) do
