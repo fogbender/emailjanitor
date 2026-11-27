@@ -25,7 +25,11 @@ defmodule EmailJanitor.Worker do
     :outer_transaction,
     :connection_changed,
     :activation_failed,
-    :invalid_activation
+    :invalid_activation,
+    :model_rejected,
+    :gmail_unavailable,
+    :unreadable_content,
+    :invalid_thread_snapshot
   ]
 
   def install(scope), do: Ledger.install(scope)
@@ -47,7 +51,7 @@ defmodule EmailJanitor.Worker do
         result = run_inbox(config, now)
         # Reports have fixed atoms only; never report raw SDK/model envelopes.
         status = status(result)
-        report(config, status)
+        report(config, report_status(result))
 
         {:ok,
          %{
@@ -148,6 +152,14 @@ defmodule EmailJanitor.Worker do
         :idle
 
       arrival ->
+        Ledger.attempted(
+          config.scope,
+          config.inbox,
+          checkpoint.generation,
+          arrival.message_id,
+          now
+        )
+
         review_arrival(config, checkpoint, arrival.message_id, instructions, version, now)
     end
   end
@@ -239,7 +251,7 @@ defmodule EmailJanitor.Worker do
 
     # A handled local failure must not activate the inbox-wide scheduler backoff,
     # otherwise that backoff can always outlast the item's own retry deferral.
-    if inbox_failure?(error), do: error, else: :deferred
+    if inbox_failure?(error), do: error, else: {:deferred, status(error)}
   end
 
   defp inbox_failure?({:error, reason})
@@ -248,7 +260,11 @@ defmodule EmailJanitor.Worker do
               :forbidden,
               :rate_limited,
               :wrong_inbox,
-              :connection_changed
+              :connection_changed,
+              :model_unavailable,
+              :gmail_unavailable,
+              :eligibility_unavailable,
+              :self_mail_unavailable
             ],
        do: true
 
@@ -419,7 +435,7 @@ defmodule EmailJanitor.Worker do
           now
         )
 
-        if inbox_failure?(result), do: result, else: :deferred
+        if inbox_failure?(result), do: result, else: {:deferred, status(result)}
     end
   end
 
@@ -447,7 +463,7 @@ defmodule EmailJanitor.Worker do
       now
     )
 
-    if inbox_failure?(error), do: error, else: :deferred
+    if inbox_failure?(error), do: error, else: {:deferred, status(error)}
   end
 
   defp recheck_candidate(config, checkpoint, candidate, instructions, version, now) do
@@ -504,9 +520,9 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :skipped
 
-      _ ->
+      error ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :retry, now)
-        :deferred
+        if inbox_failure?(error), do: error, else: {:deferred, status(error)}
     end
   end
 
@@ -589,16 +605,16 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :blocked
 
-      _ ->
+      error ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :retry, now)
-        :deferred
+        if inbox_failure?(error), do: error, else: {:deferred, status(error)}
     end
   end
 
   defp finish_recheck(config, _checkpoint, candidate, _snapshot, _version, now, error) do
     reason = if error == {:error, :invalid_decision}, do: :invalid_decision, else: :retry
     Ledger.finish_candidate(config.scope, config.inbox, candidate, reason, now)
-    :deferred
+    if inbox_failure?(error), do: error, else: {:deferred, status(error)}
   end
 
   defp processed(config, checkpoint, ids, outcome) do
@@ -695,6 +711,8 @@ defmodule EmailJanitor.Worker do
   defp more?(_), do: false
   defp status({result, more}) when is_boolean(more), do: status(result)
 
+  defp status({:deferred, reason}) when is_atom(reason), do: :deferred
+
   defp status(value)
        when value in [
               :idle,
@@ -711,6 +729,10 @@ defmodule EmailJanitor.Worker do
 
   defp status({:error, reason}) when reason in @fixed_errors, do: reason
   defp status(_), do: :worker_unavailable
+
+  defp report_status({result, more}) when is_boolean(more), do: report_status(result)
+  defp report_status({:deferred, reason}) when reason in @fixed_errors, do: reason
+  defp report_status(result), do: status(result)
 
   defp report(config, value) do
     try do

@@ -3,6 +3,10 @@ defmodule EmailJanitor.Worker.Migration do
   use Ecto.Migration
 
   def change do
+    alter table(:gmail_arrivals) do
+      add(:last_attempt_at, :utc_datetime_usec)
+    end
+
     create table(:janitor_worker_receipts, primary_key: false) do
       add(:inbox_id, references(:inboxes, type: :text), primary_key: true)
       add(:action_id, references(:actions, type: :uuid), primary_key: true)
@@ -127,6 +131,21 @@ defmodule EmailJanitor.Worker.Candidate do
     field(:attempts, :integer, default: 0)
     field(:invalid_attempts, :integer, default: 0)
     field(:next_attempt_at, :utc_datetime_usec)
+    timestamps(type: :utc_datetime_usec)
+  end
+end
+
+defmodule EmailJanitor.Worker.Arrival do
+  @moduledoc false
+  use Ecto.Schema
+  @primary_key false
+  schema "gmail_arrivals" do
+    field(:inbox_id, :string, primary_key: true)
+    field(:generation, Ecto.UUID, primary_key: true)
+    field(:message_id, :string, primary_key: true)
+    field(:observed_history_id, :string)
+    field(:status, Ecto.Enum, values: [:pending, :processed])
+    field(:last_attempt_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
   end
 end

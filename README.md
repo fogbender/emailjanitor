@@ -431,6 +431,12 @@ model output stops automatic candidate retries after eight attempts while keepin
 provenance for an explicit requeue. Unsupported policy contracts stay pending and
 probe only revision metadata until content/instruction versions change; hosts must
 bump the mailbox version when correcting a policy/configuration incompatibility.
+Request-specific400/413/422 model rejections defer only that conversation;
+authentication,429,5xx and transport outages preserve inbox-wide backoff.
+Reports retain the underlying fixed failure reason even for local deferrals.
+Durable last-attempt ordering lets never-attempted arrivals run before due failed
+retries. Bulk host backlog discovery preserves requested backoff and exhausted
+invalid-output caps; only an explicit exact candidate recheck resets them.
 Notification wake-ups preserve failure backoff. Due local work schedules another
 bounded step promptly instead of waiting the ordinary polling interval.
 Terminal policy settlement retries

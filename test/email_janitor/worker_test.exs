@@ -144,7 +144,7 @@ defmodule EmailJanitor.WorkerTest do
     )
 
     Agent.update(ctx.state, &%{&1 | model: :error})
-    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+    assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
     assert {:ok, [_]} = pending(ctx)
 
     assert [%Deferral{status: :transient, instruction_version: 2}] =
@@ -281,7 +281,7 @@ defmodule EmailJanitor.WorkerTest do
 
     logs =
       capture_log(fn ->
-        assert {:ok, %{status: :deferred}} = Worker.step(config)
+        assert {:ok, %{status: :self_mail_unavailable}} = Worker.step(config)
       end)
 
     refute logs =~ "PRIVATE_RECEIPT_FAILURE"
@@ -475,7 +475,7 @@ defmodule EmailJanitor.WorkerTest do
       }
     )
 
-    assert {:ok, %{status: :deferred, more?: false}} = Worker.step(ctx.config)
+    assert {:ok, %{status: :model_unavailable, more?: false}} = Worker.step(ctx.config)
     assert length(read(ctx.state).model_inputs) == 1
     assert {:ok, %{status: :idle, more?: false}} = Worker.step(ctx.config)
     assert length(read(ctx.state).model_inputs) == 1
@@ -518,7 +518,9 @@ defmodule EmailJanitor.WorkerTest do
     count = length(read(ctx.state).model_inputs)
     assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
     assert length(read(ctx.state).model_inputs) == count
-    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+    [%Candidate{candidate_id: id}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
 
     assert [%Candidate{attempts: 0, requested: true}] =
              Repo.all(Candidate, prefix: ctx.scope.prefix)
@@ -596,7 +598,7 @@ defmodule EmailJanitor.WorkerTest do
     assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == before
   end
 
-  test "real scheduler unions transient snapshot failures instead of alternating sibling IDs",
+  test "real scheduler unions malformed snapshot siblings instead of alternating IDs",
        ctx do
     observer = self()
 
@@ -633,7 +635,7 @@ defmodule EmailJanitor.WorkerTest do
     assert_receive {:reported_worker_status, :done}, 2_000
     assert read(ctx.state).mutations == [["z-new"]]
 
-    assert [%Deferral{status: :transient, message_ids: ["a-old-1", "a-old-2"]}] =
+    assert [%Deferral{status: :unreadable, message_ids: ["a-old-1", "a-old-2"]}] =
              Repo.all(Deferral, prefix: ctx.scope.prefix)
 
     assert {:ok, pending} = pending(ctx)
@@ -648,7 +650,7 @@ defmodule EmailJanitor.WorkerTest do
     Agent.update(ctx.state, &%{&1 | model: :error})
 
     for _ <- 1..7 do
-      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+      assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
       advance(ctx.clock, 901)
     end
 
@@ -666,7 +668,7 @@ defmodule EmailJanitor.WorkerTest do
     Agent.update(ctx.state, &%{&1 | model: :error})
 
     for _ <- 1..7 do
-      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+      assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
       advance(ctx.clock, 901)
     end
 
@@ -717,6 +719,100 @@ defmodule EmailJanitor.WorkerTest do
     assert {:ok, pending} = pending(ctx)
     assert Enum.sort(Enum.map(pending, & &1.message_id)) == ["bad-1", "bad-2", "bad-3"]
     assert length(read(ctx.state).model_inputs) == 4
+  end
+
+  test "global model outage backs off instead of bursting through several due threads", ctx do
+    observer = self()
+    messages = Enum.map(1..4, &Fixtures.message(id: "arrival-#{&1}", thread_id: "thread-#{&1}"))
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          model: :error,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    config = %{
+      ctx.config
+      | report: fn status ->
+          send(observer, {:global_outcome, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    assert_receive {:global_outcome, :model_unavailable}, 1_000
+    refute_receive {:global_outcome, _}, 250
+    assert length(read(ctx.state).model_inputs) == 1
+    assert read(ctx.state).mutations == []
+  end
+
+  test "local content rejection reports its fixed reason while scheduling other mail", ctx do
+    observer = self()
+    Agent.update(ctx.state, &%{&1 | model: :rejected})
+
+    config = %{
+      ctx.config
+      | report: fn status ->
+          send(observer, {:reported, status})
+          :ok
+        end
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert_receive {:reported, :model_rejected}
+    assert {:ok, [_]} = pending(ctx)
+    assert read(ctx.state).mutations == []
+  end
+
+  test "bulk host requeue preserves requested candidate backoff and invalid cap", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.state, &%{&1 | model: :error})
+    assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
+    [before] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert before.attempts == 1 and before.requested
+    for _ <- 1..5, do: assert({:ok, 0} == Worker.queue_backlog(ctx.scope, ctx.box))
+    [after_bulk] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert after_bulk.attempts == before.attempts
+    assert after_bulk.next_attempt_at == before.next_attempt_at
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    assert length(read(ctx.state).model_inputs) == 2
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, before.candidate_id)
+
+    assert [%Candidate{attempts: 0, requested: true, next_attempt_at: nil}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "attempt ordering gives a new healthy arrival priority over a due failed retry", ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(id: "a-old", thread_id: "bad-thread"),
+            Fixtures.message(id: "z-new", thread_id: "healthy-thread")
+          ],
+          arrivals: %{"100" => %{through: "101", ids: ["a-old", "z-new"]}}
+      }
+    )
+
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_outages: ["bad-thread"]]}}
+    assert {:ok, %{status: :gmail_unavailable}} = Worker.step(config)
+    advance(ctx.clock, 61)
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert read(ctx.state).mutations == [["z-new"]]
   end
 
   defp await_blocked(_backend, 0),

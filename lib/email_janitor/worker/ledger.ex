@@ -2,9 +2,9 @@ defmodule EmailJanitor.Worker.Ledger do
   @moduledoc false
   import Ecto.Query
   alias EmailJanitor.Gmail.Ingestion
-  alias EmailJanitor.Gmail.Ingestion.{Arrival, Checkpoint}
+  alias EmailJanitor.Gmail.Ingestion.Checkpoint
   alias EmailJanitor.Store.{Action, Scope}
-  alias EmailJanitor.Worker.{Deferral, Receipt, Watch, Candidate}
+  alias EmailJanitor.Worker.{Arrival, Deferral, Receipt, Watch, Candidate}
 
   def install(%Scope{} = scope) do
     case Ingestion.install(scope) do
@@ -83,12 +83,27 @@ defmodule EmailJanitor.Worker.Ledger do
         where:
           a.inbox_id == ^inbox.id and a.generation == ^checkpoint.generation and
             a.status == :pending and is_nil(d.thread_id),
-        order_by: [asc: a.inserted_at, asc: a.message_id],
+        order_by: [asc_nulls_first: a.last_attempt_at, asc: a.inserted_at, asc: a.message_id],
         limit: 1
       ),
       prefix: scope.prefix,
       log: false
     )
+  end
+
+  def attempted(scope, inbox, generation, id, now) do
+    scope.repo.update_all(
+      from(a in Arrival,
+        where:
+          a.inbox_id == ^inbox.id and
+            a.generation == ^generation and a.message_id == ^id and a.status == :pending
+      ),
+      [set: [last_attempt_at: now]],
+      prefix: scope.prefix,
+      log: false
+    )
+
+    :ok
   end
 
   def targets(scope, inbox, generation, ids) do
@@ -276,7 +291,7 @@ defmodule EmailJanitor.Worker.Ledger do
         where:
           c.inbox_id == ^inbox.id and c.status == :pending and c.requested and
             (is_nil(c.next_attempt_at) or c.next_attempt_at <= ^now),
-        order_by: [asc: c.updated_at, asc: c.candidate_id],
+        order_by: [asc_nulls_first: c.next_attempt_at, asc: c.updated_at, asc: c.candidate_id],
         limit: 1
       ),
       prefix: scope.prefix,
@@ -331,7 +346,8 @@ defmodule EmailJanitor.Worker.Ledger do
         left_join: a in Action,
         on: a.inbox_id == p.inbox_id and a.id == p.candidate_id,
         where:
-          p.inbox_id == ^inbox.id and p.status == :pending and
+          p.inbox_id == ^inbox.id and p.status == :pending and not p.requested and
+            p.invalid_attempts < 8 and
             ((not is_nil(c.id) and c.thread_id == p.thread_id) or
                (a.state == :cancelled and is_nil(a.dispatch_started_at) and
                   a.thread_id == p.thread_id)),
@@ -341,7 +357,9 @@ defmodule EmailJanitor.Worker.Ledger do
     {count, _} =
       scope.repo.update_all(
         from(p in Candidate,
-          where: p.inbox_id == ^inbox.id and p.candidate_id in subquery(candidates)
+          where:
+            p.inbox_id == ^inbox.id and not p.requested and p.invalid_attempts < 8 and
+              p.candidate_id in subquery(candidates)
         ),
         [set: [requested: true, attempts: 0, invalid_attempts: 0, next_attempt_at: nil]],
         prefix: scope.prefix,

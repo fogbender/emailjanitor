@@ -54,9 +54,16 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   def thread_snapshot(_, thread, options) do
     Agent.get_and_update(options[:state], fn state ->
       result =
-        if thread in Keyword.get(options, :snapshot_failures, []),
-          do: {:error, :gmail_unavailable},
-          else: {:ok, %ThreadSnapshot{thread_id: thread, fingerprint: state.revision}}
+        cond do
+          thread in Keyword.get(options, :snapshot_outages, []) ->
+            {:error, :gmail_unavailable}
+
+          thread in Keyword.get(options, :snapshot_failures, []) ->
+            {:error, :invalid_thread_snapshot}
+
+          true ->
+            {:ok, %ThreadSnapshot{thread_id: thread, fingerprint: state.revision}}
+        end
 
       {result, %{state | calls: state.calls ++ [:snapshot]}}
     end)
@@ -121,7 +128,7 @@ defmodule EmailJanitor.WorkerTest.Classifier do
                    messages,
                    &(&1.thread_id in Keyword.get(options, :failed_threads, []))
                  ),
-                 do: :error,
+                 do: :rejected,
                  else: state.model
                ) do
             :unreadable ->
@@ -132,6 +139,9 @@ defmodule EmailJanitor.WorkerTest.Classifier do
 
             :invalid ->
               {:ok, %{}}
+
+            :rejected ->
+              {:error, :model_rejected}
 
             mode ->
               action = if mode == :keep, do: "keep", else: "done"
