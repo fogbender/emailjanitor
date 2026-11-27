@@ -21,7 +21,10 @@ release even if the NixOS host uses another nixpkgs. Import that flake module in
 the image. The lower-level path module `nix/module.nix` still requires an explicit
 `services.emailjanitor.package`; supply the flake package when using it. An
 operator can supply another reviewed package. Direct source imports also filter
-Git working trees to tracked files, excluding ignored/untracked files. The release contains
+Git working trees outside the store to tracked files, excluding ignored/untracked
+files. Use `git+file:` refs for local working-tree flake inputs; `path:` copies the
+whole directory into the store before our source filter runs, so its copy cannot
+provide that privacy guarantee. The release contains
 the reviewed engine and SDK transport; merely starting it does not configure an
 inbox or establish that supervised host workers are ready. Single-user host
 startup, Google connection/chat, exact scoped migrations, runtime secrets and

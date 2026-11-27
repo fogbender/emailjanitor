@@ -23,8 +23,15 @@ let
     ];
   };
   service = host.config.systemd.services.emailjanitor;
+  differentHost = host.extendModules {
+    modules = [{ nixpkgs.overlays = [(final: prev: {
+      coreutils = prev.coreutils.overrideAttrs { pname = "different-host-coreutils"; };
+    })]; }];
+  };
 in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/environment";
    assert host.config.services.emailjanitor.package.drvPath == outputs.packages.x86_64-linux.emailjanitor.drvPath;
+   assert differentHost.pkgs.coreutils.drvPath != pkgs.coreutils.drvPath;
+   assert differentHost.config.services.emailjanitor.package.drvPath == outputs.packages.x86_64-linux.emailjanitor.drvPath;
    assert service.serviceConfig.User == "emailjanitor";
    assert service.environment.ERL_CRASH_DUMP == "/dev/null";
    assert service.serviceConfig.LimitCORE == 0;

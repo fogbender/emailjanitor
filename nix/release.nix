@@ -5,7 +5,8 @@ let
   source = lib.fileset.toSource {
     root = src;
     fileset = lib.fileset.intersection
-      (if builtins.pathExists (src + /.git) then lib.fileset.gitTracked src else src)
+      (if !(lib.path.hasStorePathPrefix src) && builtins.pathExists (src + /.git)
+       then lib.fileset.gitTracked src else src)
       (lib.fileset.unions [
       (src + /mix.exs)
       (src + /mix.lock)
