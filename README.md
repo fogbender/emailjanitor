@@ -138,7 +138,11 @@ honor the same bounded mutation contract.
 
 Adapters that resolve credentials or verify the Google account must implement the
 optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
-and returns an opaque zero-argument mutation closure. Only invoke that closure
+and returns an opaque zero-argument mutation closure with already-resolved,
+frozen credentials valid for at least the entire 60-second execution window.
+The closure performs only the exact-ID Gmail mutation, with transport timeouts
+strictly below the 30-second watchdog; it must not refresh/resolve credentials,
+check a profile, or perform other preparatory I/O. Only invoke that closure
 inside the executor's durable dispatch fence; never persist it or its captured
 credentials in a job. Preparation failure or termination creates no intent and
 reserves no quota. Legacy lightweight adapters remain supported through
