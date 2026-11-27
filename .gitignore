@@ -8,3 +8,5 @@
 /.env
 /.env.*
 *.beam
+
+/bridge/google-auth/node_modules/

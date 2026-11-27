@@ -1,0 +1,27 @@
+{
+  "name": "@emailjanitor/google-token-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Private root-owned Google federation token helper; never receives email content",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "emailjanitor-google-token": "cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "google-auth-library": "11.3.4"
+  },
+  "devDependencies": {
+    "nock": "14.0.10"
+  },
+  "files": [
+    "cli.mjs",
+    "token.mjs"
+  ]
+}
