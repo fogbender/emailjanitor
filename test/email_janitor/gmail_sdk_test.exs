@@ -164,6 +164,46 @@ defmodule EmailJanitor.GmailSDKTest do
     assert {:ok, "100"} = SDK.history_id("inbox-1", options())
   end
 
+  test "thread revision snapshot uses only metadata and changes with the provider revision" do
+    snapshots =
+      for revision <- ["100", "101"] do
+        mock(fn env ->
+          assert env.method == :get
+          assert String.ends_with?(env.url, "/threads/thread-1")
+          assert env.query[:format] == "minimal"
+          assert env.query[:fields] == "id,historyId"
+          Tesla.Mock.json(%{"id" => "thread-1", "historyId" => revision})
+        end)
+
+        assert {:ok, snapshot} = SDK.thread_snapshot("inbox-1", "thread-1", options())
+        assert snapshot.thread_id == "thread-1" and byte_size(snapshot.fingerprint) == 64
+        refute inspect(snapshot) =~ "TOKEN_SENTINEL"
+        snapshot
+      end
+
+    assert hd(snapshots).fingerprint != List.last(snapshots).fingerprint
+  end
+
+  test "thread snapshots reject mismatched IDs, absent or invalid history and wrong account" do
+    for body <- [
+          %{"id" => "other", "historyId" => "100"},
+          %{"id" => "thread-1"},
+          %{"id" => "thread-1", "historyId" => "invalid"}
+        ] do
+      mock(fn _ -> Tesla.Mock.json(body) end)
+
+      assert {:error, :invalid_thread_snapshot} =
+               SDK.thread_snapshot("inbox-1", "thread-1", options())
+    end
+
+    mock(
+      fn _ -> flunk("wrong identity must not reach thread metadata") end,
+      %{"emailAddress" => "other@acme.com", "historyId" => "100"}
+    )
+
+    assert {:error, :wrong_inbox} = SDK.thread_snapshot("inbox-1", "thread-1", options())
+  end
+
   test "arrival lookup requests only ID and thread ID metadata" do
     mock(fn env ->
       assert env.method == :get
@@ -793,6 +833,24 @@ defmodule EmailJanitor.GmailSDKTest do
     refute log =~ "PRIVATE_BODY_SENTINEL"
   end
 
+  test "oversized full thread bodies are stable unreadable content, including compressed replies" do
+    body = String.duplicate("PRIVATE_BODY_SENTINEL", 450_000)
+
+    for response <- [
+          %Tesla.Env{status: 200, body: body},
+          %Tesla.Env{status: 200, body: :zlib.gzip(body), headers: [{"content-encoding", "gzip"}]}
+        ] do
+      mock(fn _ -> response end)
+
+      logs =
+        capture_log(fn ->
+          assert {:error, :invalid_thread} = SDK.thread("inbox-1", "thread-1", options())
+        end)
+
+      refute logs =~ "PRIVATE_BODY_SENTINEL"
+    end
+  end
+
   test "compressed and uncompressed oversized responses stop before SDK JSON decoding" do
     body =
       Jason.encode!(%{
@@ -868,5 +926,23 @@ defmodule EmailJanitor.GmailSDKTest do
 
   test "invalid parser inputs do not raise or retain raw response content" do
     assert {:error, :invalid_message} = Parser.message(%{body: "PRIVATE_BODY_SENTINEL"})
+  end
+
+  test "404 types identify the requested resource and never misidentify a missing profile" do
+    mock(fn _ -> Tesla.Mock.json(%{"error" => "PRIVATE_RESPONSE"}, status: 404) end)
+    assert {:error, :thread_not_found} = SDK.thread("inbox-1", "thread-1", options())
+    assert {:error, :thread_not_found} = SDK.thread_snapshot("inbox-1", "thread-1", options())
+    assert {:error, :message_not_found} = SDK.thread_id("inbox-1", "message-1", options())
+
+    Tesla.Mock.mock(fn env ->
+      assert String.ends_with?(env.url, "/profile")
+      Tesla.Mock.json(%{"error" => "PRIVATE_RESPONSE"}, status: 404)
+    end)
+
+    assert {:error, :not_found} = SDK.thread("inbox-1", "thread-1", options())
+    assert {:error, :not_found} = SDK.thread_snapshot("inbox-1", "thread-1", options())
+    assert {:error, :not_found} = SDK.thread_id("inbox-1", "message-1", options())
+    assert {:error, :not_found} = SDK.history("inbox-1", "100", options())
+    assert {:error, :not_found} = SDK.ingestion_batch("inbox-1", "100", options())
   end
 end

@@ -29,5 +29,10 @@ defmodule EmailJanitor.Gmail.BoundedResponse do
       result ->
         result
     end
+  rescue
+    error in Tesla.Middleware.Compression.Error ->
+      if error.reason == :max_body_size_exceeded,
+        do: {:error, :response_too_large},
+        else: {:error, :invalid_compression}
   end
 end

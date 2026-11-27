@@ -17,7 +17,7 @@ defmodule EmailJanitor.Gmail.SDK do
       with true <- Parser.valid_id?(thread_id),
            {:ok, connection, _} <- verified(inbox_id, opts),
            {:ok, %Model.Thread{id: ^thread_id, messages: messages}} <-
-             call(fn ->
+             thread_call(fn ->
                Users.gmail_users_threads_get(connection, "me", thread_id, format: "full")
              end),
            true <- is_list(messages) and length(messages) <= 200,
@@ -25,10 +25,52 @@ defmodule EmailJanitor.Gmail.SDK do
            true <- Enum.all?(converted, &(&1.thread_id == thread_id)) do
         {:ok, converted}
       else
+        {:error, :response_too_large} -> {:error, :invalid_thread}
         {:error, _} = error -> error
         _ -> {:error, :invalid_thread}
       end
     end)
+  end
+
+  @doc "Read only a thread's provider revision, without downloading message content."
+  def thread_snapshot(inbox_id, thread_id, opts) do
+    guarded(fn ->
+      with true <- Parser.valid_id?(thread_id),
+           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, %Model.Thread{id: ^thread_id, historyId: revision}} <-
+             thread_call(fn ->
+               Users.gmail_users_threads_get(connection, "me", thread_id,
+                 format: "minimal",
+                 fields: "id,historyId"
+               )
+             end),
+           true <- history_id?(revision) do
+        {:ok,
+         %EmailJanitor.Gmail.ThreadSnapshot{
+           thread_id: thread_id,
+           fingerprint:
+             :crypto.hash(:sha256, :erlang.term_to_binary({thread_id, revision}))
+             |> Base.encode16(case: :lower)
+         }}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_thread_snapshot}
+      end
+    end)
+  end
+
+  defp thread_call(fun) do
+    case call(fun) do
+      {:error, :not_found} -> {:error, :thread_not_found}
+      result -> result
+    end
+  end
+
+  defp message_call(fun) do
+    case call(fun) do
+      {:error, :not_found} -> {:error, :message_not_found}
+      result -> result
+    end
   end
 
   @impl true
@@ -46,7 +88,7 @@ defmodule EmailJanitor.Gmail.SDK do
       with true <- Parser.valid_id?(message_id),
            {:ok, connection, _} <- verified(inbox_id, opts),
            {:ok, %Model.Message{id: ^message_id, threadId: thread_id}} <-
-             call(fn ->
+             message_call(fn ->
                Users.gmail_users_messages_get(connection, "me", message_id,
                  format: "minimal",
                  fields: "id,threadId"
@@ -551,6 +593,7 @@ defmodule EmailJanitor.Gmail.SDK do
       {:error, %Tesla.Env{status: 403, body: body}} -> {:error, forbidden_reason(body)}
       {:error, %Tesla.Env{status: 404}} -> {:error, :not_found}
       {:error, %Tesla.Env{status: 429}} -> {:error, :rate_limited}
+      {:error, :response_too_large} -> {:error, :response_too_large}
       _ -> {:error, :gmail_unavailable}
     end
   rescue

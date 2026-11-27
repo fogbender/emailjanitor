@@ -147,7 +147,7 @@ defmodule EmailJanitor.Executor do
   defp fetch_review(scope, inbox, thread_id, gmail, options, version, opts) do
     with {:ok, {stored_version, started_at}} <- Store.review_snapshot(scope, inbox.id),
          true <- stored_version == version,
-         {:ok, current} <- safe(fn -> gmail.thread(inbox.id, thread_id, options) end),
+         {:ok, current} <- safe_thread(fn -> gmail.thread(inbox.id, thread_id, options) end),
          true <-
            is_list(current) and Enum.all?(current, &match?(%Message{thread_id: ^thread_id}, &1)) do
       inbox_ids = exact_inbox_ids(current)
@@ -181,6 +181,12 @@ defmodule EmailJanitor.Executor do
   end
 
   defp current_contacts(context, current, gmail, options) do
+    with {:ok, current} <- Reviewer.filter_self_mail(current, context.opts) do
+      contact_filtered(context, current, gmail, options)
+    end
+  end
+
+  defp contact_filtered(context, current, gmail, options) do
     if exact_inbox_ids(current) == [] do
       {:ok, MapSet.new()}
     else
@@ -229,12 +235,18 @@ defmodule EmailJanitor.Executor do
              proposal.instruction_version,
              opts
            ),
-         {:ok, contacted} <- current_contacts(context, current, gmail, options) do
+         {:ok, contacted} <- current_contacts(context, current, gmail, options),
+         {:ok, safeguard_messages} <- Reviewer.filter_self_mail(current, context.opts) do
       reason =
         if exact_inbox_ids(current) == [],
           do: {:keep, :no_matching_inbox_messages},
           else:
-            Safeguards.evaluate(current, inbox, contacted, Store.restored_ids(scope, inbox.id))
+            Safeguards.evaluate(
+              safeguard_messages,
+              inbox,
+              contacted,
+              Store.restored_ids(scope, inbox.id)
+            )
 
       case reason do
         {:keep, reason} ->
@@ -452,6 +464,35 @@ defmodule EmailJanitor.Executor do
         _ -> {:halt, {:error, :protected_sender}}
       end
     end)
+  end
+
+  defp safe_thread(fun) do
+    case fun.() do
+      {:ok, _} = result ->
+        result
+
+      {:error, :thread_not_found} = error ->
+        error
+
+      {:error, reason}
+      when reason in [
+             :invalid_thread,
+             :invalid_message,
+             :invalid_mime,
+             :invalid_headers,
+             :invalid_date,
+             :unreadable_content,
+             :response_too_large
+           ] ->
+        {:error, :unreadable_content}
+
+      _ ->
+        {:error, :gmail_unavailable}
+    end
+  rescue
+    _ -> {:error, :gmail_unavailable}
+  catch
+    _, _ -> {:error, :gmail_unavailable}
   end
 
   defp safe(fun) do
