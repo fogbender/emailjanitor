@@ -8,6 +8,57 @@
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in {
+      packages = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          google-auth-bridge = pkgs.buildNpmPackage {
+            pname = "emailjanitor-google-token";
+            version = "0.1.0";
+            src = ./bridge/google-auth;
+            nodejs = pkgs.nodejs_22;
+            npmDepsHash = "sha256-EYI2Fz+mWTgzO2kxk6pDo5mUvfyiNBN+gG0/IIjfm/4=";
+            npmFlags = [ "--ignore-scripts" ];
+            dontNpmBuild = true;
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+            doCheck = true;
+            checkPhase = "npm test";
+            postInstall = ''
+              rm "$out/bin/emailjanitor-google-token"
+              makeBinaryWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-google-token" \
+                --add-flags "-i ${pkgs.nodejs_22}/bin/node $out/lib/node_modules/@emailjanitor/google-token-bridge/cli.mjs"
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              printf 'echo BASH_ENV_RAN >&2; exit 0\n' >bridge.bash-env
+              set +e
+              NODE_OPTIONS='--require=/nonexistent-emailjanitor-module' \
+                BASH_ENV="$PWD/bridge.bash-env" \
+                NODE_DEBUG=http GOOGLE_SDK_NODE_LOGGING='*' \
+                NODE_USE_ENV_PROXY=1 NODE_TLS_REJECT_UNAUTHORIZED=0 \
+                HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+                ALL_PROXY=http://127.0.0.1:9 NO_PROXY="" \
+                NODE_PATH=/nonexistent-emailjanitor-modules \
+                OPENSSL_CONF=/nonexistent-emailjanitor-openssl \
+                SSL_CERT_FILE=/nonexistent-emailjanitor-ca SSL_CERT_DIR=/nonexistent-emailjanitor-certs \
+                NODE_REDIRECT_WARNINGS=bridge.warnings \
+                "$out/bin/emailjanitor-google-token" >bridge.stdout 2>bridge.stderr
+              janitor_bridge_status=$?
+              set -e
+              test "$janitor_bridge_status" -eq 1
+              test ! -s bridge.stdout
+              test ! -e bridge.warnings
+              printf 'Google service token refresh failed.\n' >bridge.expected
+              cmp bridge.expected bridge.stderr
+              runHook postInstallCheck
+            '';
+            meta = {
+              description = "Root-owned SDK helper for short-lived Google federation tokens";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "emailjanitor-google-token";
+            };
+          };
+        });
       devShells = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
         in {
@@ -19,6 +70,7 @@
               postgresql_17
               git
               jq
+              nodejs_22
               opentofu
               sops
             ];

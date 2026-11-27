@@ -197,6 +197,35 @@ defmodule EmailJanitor.PolicyTest do
     assert [] = Agent.get(ctx.state, & &1.calls)
   end
 
+  test "bounded unreadable model input preserves previously identified pending work", ctx do
+    Req.Test.stub(__MODULE__, fn _ -> flunk("Unreadable model input must not send HTTP") end)
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    {:ok, config} =
+      EmailJanitor.Models.Config.new(:azure, "gpt-4o-mini", "SYNTHETIC_KEY",
+        base_url: "https://janitor-test.openai.azure.com/openai",
+        deployment: "janitor-eval"
+      )
+
+    assert {:keep, :unreadable_content} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {TestGmail, [state: ctx.state]},
+               {EmailJanitor.Models.SDK,
+                [config: config, http_options: [plug: {Req.Test, __MODULE__}]]},
+               String.duplicate("p", 32_001),
+               1,
+               policy: policy(ctx, :block)
+             )
+
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["reserve", ["message-1"]]] = events()
+    assert Agent.get(ctx.state, & &1.calls) == []
+  end
+
   test "transient Gmail and model failures retain pending work", ctx do
     assert {:blocked, :upgrade_required} = execute(ctx, :block)
     assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
