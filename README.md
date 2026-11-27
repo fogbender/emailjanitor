@@ -162,7 +162,9 @@ or used to call `reconnect/4` automatically.
 trusted email-to-scope/Inbox router, commits a coalesced history hint, and only then
 acknowledges it. Failed routes or commits remain unacknowledged. A crash after
 commit can safely redeliver the same hint. Hosts must supervise this bounded step
-and periodically call `Ingestion.catch_up/3` even with no notifications: Gmail can
+outside host transactions: ingestion writes reject outer transactions so an ack
+cannot outrun its commit. Hosts must periodically call `Ingestion.catch_up/3`
+even with no notifications: Gmail can
 delay or drop them. Catch-up atomically queues discovered message IDs and advances
 the cursor only for complete, non-regressing history, with generation/cursor CAS.
 Independent-connection tests cover commits, rollback and competing snapshots.

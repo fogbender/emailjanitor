@@ -431,7 +431,12 @@ defmodule EmailJanitor.Gmail.Ingestion do
 
   defp require!(_, true, _), do: :ok
   defp require!(scope, false, reason), do: scope.repo.rollback(reason)
-  defp transaction(scope, operation), do: scope.repo.transaction(operation, log: false)
+
+  defp transaction(scope, operation) do
+    if scope.repo.in_transaction?(),
+      do: {:error, :outer_transaction},
+      else: scope.repo.transaction(operation, log: false)
+  end
 
   defp protect(operation) do
     case operation.() do

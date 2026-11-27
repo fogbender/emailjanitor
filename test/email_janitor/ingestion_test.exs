@@ -428,6 +428,37 @@ defmodule EmailJanitor.IngestionTest do
              Ingestion.checkpoint(scope, box.id)
   end
 
+  test "an outer host transaction cannot acknowledge an uncommitted signal", %{
+    scope: scope,
+    box: box
+  } do
+    baseline(scope, box)
+    owner = self()
+
+    config = [
+      deliveries: [delivery()],
+      ack: fn _ ->
+        send(owner, :ack)
+        :ok
+      end
+    ]
+
+    assert {:ok, :checked} =
+             TestRepo.transaction(fn ->
+               assert {:error, :outer_transaction} = Ingestion.record_signal(scope, box, "102")
+
+               assert {:ok, %{recorded: 0, acknowledged: 0, failed: 1}} =
+                        NotificationWorker.poll_once({PubSub, config}, fn _ ->
+                          {:ok, scope, box}
+                        end)
+
+               :checked
+             end)
+
+    refute_received :ack
+    assert {:ok, %Checkpoint{requested_id: nil}} = Ingestion.checkpoint(scope, box.id)
+  end
+
   test "generated Pub/Sub SDK and committed signal storage cooperate before exact acknowledgement",
        %{scope: scope, box: box} do
     baseline(scope, box)
