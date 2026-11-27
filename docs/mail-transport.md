@@ -46,6 +46,14 @@ pre-dispatch rendering/credential failure leaves `pending` and can be retried.
 This intentionally favors a missing email over a duplicate after ambiguous SES
 acceptance. Calling from an outer database transaction is rejected.
 
+An optional sixth `Outbox.deliver` argument is a trusted DB-only admission callback.
+It executes after rendering/credential resolution, inside the short transaction
+that locks the pending outbox row and commits its send fence. A rejected check
+rolls back both host metadata and the fence; the provider remains outside SQL.
+The digest layer uses this to reserve its current local dispatch day atomically.
+Outgoing plain text is bounded to 3 MiB; maintained-SDK wire and conservative MIME
+size tests keep it below SES v1's 10 MB message limit. Incoming MIME remains 1 MiB.
+
 Remaining host integration: select the day's activity once, reserve its listing
 and outbox intent atomically in a host-owned workflow, schedule 21:00 in the
 browser timezone, retain only IDs/typed metadata, and regenerate transient text.

@@ -142,7 +142,10 @@ defmodule EmailJanitor.MailSDKTest do
              Message.new("injected\r\nBcc: bad@example.com", Content.new("text"))
 
     assert {:error, :invalid_outgoing_content} =
-             Message.new("subject", Content.new(String.duplicate("x", 131_073)))
+             Message.new(
+               "subject",
+               Content.new(String.duplicate("x", Message.max_text_bytes() + 1))
+             )
   end
 
   test "SQS pull returns only redacted transient notification and receipt handle" do

@@ -57,16 +57,23 @@ defmodule EmailJanitor.Mail.Outbox do
 
   def get(%Scope{} = scope, id), do: scope.repo.get(Outgoing, id, prefix: scope.prefix)
 
-  def deliver(%Scope{} = scope, id, %Config{} = config, authorize, render)
-      when is_function(authorize, 1) and is_function(render, 1) do
+  def deliver(
+        %Scope{} = scope,
+        id,
+        %Config{} = config,
+        authorize,
+        render,
+        admission \\ fn _ -> :ok end
+      )
+      when is_function(authorize, 1) and is_function(render, 1) and is_function(admission, 1) do
     if scope.repo.in_transaction?() do
       {:error, :outer_transaction}
     else
-      Owner.run(fn -> do_deliver(scope, id, config, authorize, render) end)
+      Owner.run(fn -> do_deliver(scope, id, config, authorize, render, admission) end)
     end
   end
 
-  defp do_deliver(scope, id, config, authorize, render) do
+  defp do_deliver(scope, id, config, authorize, render, admission) do
     with %Outgoing{state: :pending} = row <- get(scope, id),
          {:ok, %Inbox{id: inbox_id, address: address} = inbox} <- authorize.(row.inbox_id),
          true <- inbox_id == row.inbox_id,
@@ -77,12 +84,7 @@ defmodule EmailJanitor.Mail.Outbox do
          # committed fence. No SQL transaction may contain a provider call.
          {:ok, ^inbox} <- authorize.(row.inbox_id),
          :ok <- Owner.dispatch_window(),
-         {1, _} <-
-           scope.repo.update_all(
-             from(o in Outgoing, where: o.id == ^id and o.state == :pending),
-             [set: [state: :dispatching, updated_at: DateTime.utc_now()]],
-             prefix: scope.prefix
-           ) do
+         {:ok, :claimed} <- claim_dispatch(scope, id, admission) do
       result = Owner.bounded(fn -> SDK.send(config, prepared, inbox, message) end)
 
       {state, provider_id} =
@@ -101,7 +103,32 @@ defmodule EmailJanitor.Mail.Outbox do
     else
       %Outgoing{state: :sent} -> :ok
       %Outgoing{} -> {:error, :unresolved_delivery}
+      {:error, :mail_admission_rejected} -> {:error, :mail_admission_rejected}
       _ -> {:error, :mail_unavailable}
     end
+  end
+
+  # Host-owned DB-only admission commits with the fence. No provider/renderer
+  # runs in this transaction; a rejected check rolls back both host state/fence.
+  defp claim_dispatch(scope, id, admission) do
+    scope.repo.transaction(fn ->
+      row =
+        scope.repo.one(
+          from(o in Outgoing, where: o.id == ^id and o.state == :pending, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if is_nil(row), do: scope.repo.rollback(:already_dispatched)
+      if admission.(row) != :ok, do: scope.repo.rollback(:mail_admission_rejected)
+
+      {1, _} =
+        scope.repo.update_all(
+          from(o in Outgoing, where: o.id == ^id and o.state == :pending),
+          [set: [state: :dispatching, updated_at: DateTime.utc_now()]],
+          prefix: scope.prefix
+        )
+
+      :claimed
+    end)
   end
 end
