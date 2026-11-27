@@ -30,7 +30,12 @@ destination nor arbitrary header options. Replies carry `In-Reply-To`,
 Rendering and SDK failures produce fixed errors; the existing privacy observers
 and one-attempt transport policy remain in force. Raw MIME is never persisted.
 
-SES replaces the generated Message-ID and Date, so delivery evidence continues
+Reply IDs use random UUIDs on the configured sender domain, and Date uses UTC,
+so rendering never performs hostname discovery. The adapter normalizes text line
+endings to CRLF and corrects gen_smtp 1.3.0's semicolon folding in Subject without
+changing the body or other headers.
+
+SES replaces the supplied Message-ID and Date, so delivery evidence continues
 to use its returned provider ID. The existing IAM module permits both send
 operations only for the configured Janitor identity and From address.
 See [SES SendRawEmail requirements](https://docs.aws.amazon.com/ses/latest/APIReference/API_SendRawEmail.html).
