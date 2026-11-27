@@ -10,3 +10,4 @@
 *.beam
 
 /bridge/google-auth/node_modules/
+/browser/node_modules/

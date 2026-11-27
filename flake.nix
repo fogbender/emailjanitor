@@ -119,6 +119,12 @@
               export LANG=C.UTF-8
             '';
           };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          browser = pkgs.mkShell {
+            inputsFrom = [ self.devShells.${system}.default ];
+            packages = with pkgs; [ chromium openssl curl python3 ];
+            JANITOR_BROWSER_EXECUTABLE = "${pkgs.chromium}/bin/chromium";
+          };
         });
     };
 }

@@ -27,6 +27,7 @@ for prefix <- [
   EmailJanitor.Preferences.install(scope)
   EmailJanitor.Mail.Store.install(scope)
   EmailJanitor.Digest.install(scope)
+  EmailJanitor.SelfHost.Web.install(scope)
 end
 
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)
