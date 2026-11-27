@@ -43,29 +43,43 @@ defmodule EmailJanitor.Gmail.Ingestion do
     end)
   end
 
-  @doc "Seed an initial connection from its watch response, never from an INBOX scan."
-  def baseline(%Scope{} = scope, %Inbox{} = inbox, watch), do: establish(scope, inbox, nil, watch)
+  @doc "First connection only. Optional bounded activation callback commits with the baseline."
+  def baseline(scope, inbox, watch, options \\ [])
 
-  @doc "Deliberate disconnect+reconnect only: reset eligibility; never use for OAuth reconsent or refresh."
-  def reconnect(%Scope{} = scope, %Inbox{} = inbox, generation, watch) when is_binary(generation),
-    do: establish(scope, inbox, generation, watch)
+  def baseline(%Scope{} = scope, %Inbox{} = inbox, watch, options) when is_list(options),
+    do: establish(scope, inbox, nil, watch, options)
 
-  defp establish(scope, inbox, expected, %{history_id: id, expires_at: %DateTime{} = expiry}) do
+  @doc "Deliberate disconnect+reconnect only; never use for OAuth reconsent or refresh."
+  def reconnect(scope, inbox, generation, watch, options \\ [])
+
+  def reconnect(%Scope{} = scope, %Inbox{} = inbox, generation, watch, options)
+      when is_binary(generation) and is_list(options),
+      do: establish(scope, inbox, generation, watch, options)
+
+  @doc "Activate a resumed existing generation without changing baseline, cursor or eligibility."
+  def activate(%Scope{} = scope, %Inbox{} = inbox, generation, options \\ []) do
+    protect(fn ->
+      transaction(scope, fn ->
+        registered = registered!(scope, inbox, options)
+        current = present!(scope, inbox)
+        require!(scope, current.generation == generation, :generation_changed)
+        activate!(scope, registered, current, options)
+        current
+      end)
+    end)
+  end
+
+  defp establish(
+         scope,
+         inbox,
+         expected,
+         %{history_id: id, expires_at: %DateTime{} = expiry},
+         options
+       ) do
     protect(fn ->
       with true <- history_id?(id) and DateTime.compare(expiry, DateTime.utc_now()) == :gt do
         transaction(scope, fn ->
-          registered =
-            scope.repo.one(
-              from(m in Mailbox, where: m.id == ^inbox.id, lock: "FOR NO KEY UPDATE"),
-              prefix: scope.prefix,
-              log: false
-            )
-
-          require!(
-            scope,
-            match?(%Mailbox{address: address} when address == inbox.address, registered),
-            :wrong_inbox
-          )
+          registered = registered!(scope, inbox, options)
 
           current = locked(scope, inbox.id)
 
@@ -97,14 +111,18 @@ defmodule EmailJanitor.Gmail.Ingestion do
             log: false
           )
 
-          if current do
-            scope.repo.update!(Ecto.Changeset.change(current, Map.delete(values, :inbox_id)),
-              prefix: scope.prefix,
-              log: false
-            )
-          else
-            scope.repo.insert!(struct!(Checkpoint, values), prefix: scope.prefix, log: false)
-          end
+          checkpoint =
+            if current do
+              scope.repo.update!(Ecto.Changeset.change(current, Map.delete(values, :inbox_id)),
+                prefix: scope.prefix,
+                log: false
+              )
+            else
+              scope.repo.insert!(struct!(Checkpoint, values), prefix: scope.prefix, log: false)
+            end
+
+          activate!(scope, registered, checkpoint, options)
+          checkpoint
         end)
       else
         _ -> {:error, :invalid_watch}
@@ -112,7 +130,52 @@ defmodule EmailJanitor.Gmail.Ingestion do
     end)
   end
 
-  defp establish(_, _, _, _), do: {:error, :invalid_watch}
+  defp establish(_, _, _, _, _), do: {:error, :invalid_watch}
+
+  defp registered!(scope, inbox, options) do
+    mailbox =
+      scope.repo.one(from(m in Mailbox, where: m.id == ^inbox.id, lock: "FOR NO KEY UPDATE"),
+        prefix: scope.prefix,
+        log: false
+      )
+
+    require!(
+      scope,
+      match?(%Mailbox{address: address} when address == inbox.address, mailbox),
+      :wrong_inbox
+    )
+
+    expected = Keyword.get(options, :expected_instruction_version, mailbox.instruction_version)
+
+    require!(
+      scope,
+      is_integer(expected) and expected > 0 and expected == mailbox.instruction_version,
+      :instructions_changed
+    )
+
+    require!(
+      scope,
+      is_function(Keyword.get(options, :on_baseline, fn _ -> :ok end), 1),
+      :invalid_activation
+    )
+
+    mailbox
+  end
+
+  defp activate!(scope, _mailbox, checkpoint, options) do
+    callback = Keyword.get(options, :on_baseline, fn _ -> :ok end)
+
+    result =
+      try do
+        callback.(checkpoint)
+      rescue
+        _ -> :failed
+      catch
+        _, _ -> :failed
+      end
+
+    require!(scope, result == :ok, :activation_failed)
+  end
 
   @doc "Commit a coalesced wake-up hint before acknowledging a pulled delivery."
   def record_signal(%Scope{} = scope, %Inbox{} = inbox, hint) do
@@ -348,6 +411,16 @@ defmodule EmailJanitor.Gmail.Ingestion do
 
         {:error, reason} = error when reason in @provider_errors ->
           error
+
+        {:error, reason}
+        when reason in [
+               :invalid_thread,
+               :invalid_mime,
+               :invalid_message,
+               :invalid_headers,
+               :invalid_date
+             ] ->
+          {:error, :unreadable_content}
 
         _ ->
           {:error, :eligibility_unavailable}

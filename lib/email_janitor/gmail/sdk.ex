@@ -25,6 +25,7 @@ defmodule EmailJanitor.Gmail.SDK do
            true <- Enum.all?(converted, &(&1.thread_id == thread_id)) do
         {:ok, converted}
       else
+        {:error, :response_too_large} -> {:error, :invalid_thread}
         {:error, _} = error -> error
         _ -> {:error, :invalid_thread}
       end
@@ -43,6 +44,33 @@ defmodule EmailJanitor.Gmail.SDK do
       {:error, :not_found} -> {:error, :message_not_found}
       result -> result
     end
+  end
+
+  @doc "Read only a thread's provider revision, without downloading message content."
+  def thread_snapshot(inbox_id, thread_id, opts) do
+    guarded(fn ->
+      with true <- Parser.valid_id?(thread_id),
+           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, %Model.Thread{id: ^thread_id, historyId: revision}} <-
+             thread_call(fn ->
+               Users.gmail_users_threads_get(connection, "me", thread_id,
+                 format: "minimal",
+                 fields: "id,historyId"
+               )
+             end),
+           true <- history_id?(revision) do
+        {:ok,
+         %EmailJanitor.Gmail.ThreadSnapshot{
+           thread_id: thread_id,
+           fingerprint:
+             :crypto.hash(:sha256, :erlang.term_to_binary({thread_id, revision}))
+             |> Base.encode16(case: :lower)
+         }}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_thread_snapshot}
+      end
+    end)
   end
 
   @impl true
@@ -118,6 +146,46 @@ defmodule EmailJanitor.Gmail.SDK do
     end)
   end
 
+  @doc "Bounded metadata-only search; callers must refine truncated/ambiguous selections."
+  def search(inbox_id, query, opts) do
+    guarded(fn ->
+      with true <- is_binary(query) and byte_size(query) in 1..1024 and String.valid?(query),
+           true <- not String.contains?(query, ["\r", "\n", <<0>>]),
+           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, %Model.ListMessagesResponse{messages: messages, nextPageToken: next}} <-
+             call(fn ->
+               Users.gmail_users_messages_list(connection, "me",
+                 q: query,
+                 maxResults: 11,
+                 fields: "messages(id,threadId),nextPageToken"
+               )
+             end),
+           messages = messages || [],
+           true <- is_list(messages) and length(messages) <= 11,
+           true <- is_nil(next) or (is_binary(next) and byte_size(next) in 1..4096),
+           true <-
+             Enum.all?(messages, fn
+               %Model.Message{id: id, threadId: thread} ->
+                 Parser.valid_id?(id) and Parser.valid_id?(thread)
+
+               _ ->
+                 false
+             end),
+           ids = Enum.map(messages, & &1.id),
+           true <- Enum.uniq(ids) == ids do
+        {:ok,
+         %{
+           messages:
+             Enum.take(messages, 10) |> Enum.map(&%{message_id: &1.id, thread_id: &1.threadId}),
+           truncated: length(messages) > 10 or not is_nil(next)
+         }}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_search}
+      end
+    end)
+  end
+
   @impl true
   def contacted(inbox_id, keys, opts) do
     guarded(fn ->
@@ -170,6 +238,59 @@ defmodule EmailJanitor.Gmail.SDK do
       else
         {:error, _} = error -> error
         _ -> {:error, :invalid_message_ids}
+      end
+    end)
+  end
+
+  @doc "Prepare an exact-ID INBOX restoration with frozen, verified credentials."
+  def prepare_add_inbox(inbox_id, ids, opts) do
+    guarded(fn ->
+      with true <-
+             is_list(ids) and length(ids) in 1..1000 and Enum.all?(ids, &Parser.valid_id?/1),
+           true <- Enum.uniq(ids) == ids,
+           {:ok, connection, _} <- verified(inbox_id, opts) do
+        config = Keyword.fetch!(opts, :config)
+
+        prepared =
+          Tesla.client(Tesla.Client.middleware(connection), Config.mutation_transport(config))
+
+        {:ok, fn -> dispatch_add(prepared, ids) end}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_message_ids}
+      end
+    end)
+  end
+
+  @doc "Exact-ID INBOX restoration; no read/unread or other label changes."
+  def add_inbox(inbox_id, ids, opts) do
+    guarded(fn ->
+      with {:ok, dispatch} <- prepare_add_inbox(inbox_id, ids, opts), do: dispatch.()
+    end)
+  end
+
+  defp dispatch_add(connection, ids) do
+    guarded(fn ->
+      with :ok <- EmailJanitor.TransportPrivacy.check(),
+           {:ok, _} <-
+             call(fn ->
+               Users.gmail_users_messages_batch_modify(connection, "me",
+                 body: %Model.BatchModifyMessagesRequest{ids: ids, addLabelIds: ["INBOX"]}
+               )
+             end) do
+        :ok
+      else
+        {:error, :unsafe_http_observers} ->
+          {:rejected, :unsafe_http_observers}
+
+        {:error, reason} when reason in [:authorization_required, :forbidden, :rate_limited] ->
+          {:rejected, reason}
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          {:error, :gmail_unavailable}
       end
     end)
   end
@@ -565,6 +686,7 @@ defmodule EmailJanitor.Gmail.SDK do
       {:error, %Tesla.Env{status: 403, body: body}} -> {:error, forbidden_reason(body)}
       {:error, %Tesla.Env{status: 404}} -> {:error, :not_found}
       {:error, %Tesla.Env{status: 429}} -> {:error, :rate_limited}
+      {:error, :response_too_large} -> {:error, :response_too_large}
       _ -> {:error, :gmail_unavailable}
     end
   rescue
@@ -596,10 +718,21 @@ defmodule EmailJanitor.Gmail.SDK do
 
   defp guarded(fun) do
     case fun.() do
-      :ok -> :ok
-      {:ok, _} = result -> result
-      {:error, _} = error -> error
-      _ -> {:error, :gmail_unavailable}
+      :ok ->
+        :ok
+
+      {:ok, _} = result ->
+        result
+
+      {:rejected, reason} = proof
+      when reason in [:authorization_required, :forbidden, :rate_limited, :unsafe_http_observers] ->
+        proof
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :gmail_unavailable}
     end
   rescue
     _ -> {:error, :gmail_unavailable}

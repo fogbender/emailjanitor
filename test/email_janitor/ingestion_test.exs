@@ -368,6 +368,55 @@ defmodule EmailJanitor.IngestionTest do
     assert Enum.map(pending, & &1.message_id) == ["message-1", "message-2"]
   end
 
+  test "trusted disconnected notifications acknowledge without checkpoint while unknown stays unacked",
+       %{scope: scope, box: box} do
+    observer = self()
+    known = delivery()
+    unknown = %{delivery() | email_address: "unknown@acme.com", ack_id: "unknown-ack"}
+
+    config = [
+      deliveries: [known, unknown],
+      ack: fn deliveries ->
+        send(observer, {:acked_routes, Enum.map(deliveries, & &1.ack_id)})
+        :ok
+      end
+    ]
+
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+
+    assert {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 1}} =
+             NotificationWorker.poll_once({PubSub, config}, fn
+               address when address == box.address -> {:ignore, :disconnected}
+               _ -> {:error, :unknown_inbox}
+             end)
+
+    assert_receive {:acked_routes, [id]}
+    assert id == known.ack_id
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+    assert TestRepo.all(Arrival, prefix: scope.prefix) == []
+  end
+
+  test "failed ignored acknowledgement can redeliver and unsupported ignore routes fail closed",
+       %{scope: scope, box: box} do
+    config = [deliveries: [delivery()], ack: fn _ -> {:error, :temporary} end]
+
+    assert {:ok, %{recorded: 0, ignored: 1, acknowledged: 0, failed: 1}} =
+             NotificationWorker.poll_once({PubSub, config}, fn _ -> {:ignore, :disconnected} end)
+
+    config = Keyword.put(config, :ack, fn _ -> :ok end)
+
+    assert {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 0}} =
+             NotificationWorker.poll_once({PubSub, config}, fn _ -> {:ignore, :disconnected} end)
+
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+
+    config =
+      Keyword.put(config, :ack, fn _ -> flunk("unknown ignore reason must not acknowledge") end)
+
+    assert {:ok, %{recorded: 0, ignored: 0, acknowledged: 0, failed: 1}} =
+             NotificationWorker.poll_once({PubSub, config}, fn _ -> {:ignore, :unknown} end)
+  end
+
   test "ack happens after commit; crash after recording safely redelivers", %{
     scope: scope,
     box: box
@@ -967,6 +1016,159 @@ defmodule EmailJanitor.IngestionTest do
 
     assert {:skip, :prebaseline_inbox} =
              Ingestion.eligible_thread(scope, box, checkpoint.generation, "message-1", adapter)
+  end
+
+  test "host activation and first baseline commit together or roll back together", %{
+    scope: scope,
+    box: box
+  } do
+    Ecto.Adapters.SQL.query!(
+      TestRepo,
+      ~s|CREATE TABLE "#{scope.prefix}".activation_probe (generation text NOT NULL)|,
+      [],
+      log: false
+    )
+
+    callback = fn checkpoint ->
+      assert TestRepo.in_transaction?()
+
+      Ecto.Adapters.SQL.query!(
+        TestRepo,
+        ~s|INSERT INTO "#{scope.prefix}".activation_probe VALUES ($1)|,
+        [checkpoint.generation],
+        log: false
+      )
+
+      {:error, :stale_epoch}
+    end
+
+    assert {:error, :activation_failed} =
+             Ingestion.baseline(scope, box, watch(),
+               on_baseline: callback,
+               expected_instruction_version: 1
+             )
+
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+
+    assert %{rows: []} =
+             Ecto.Adapters.SQL.query!(
+               TestRepo,
+               ~s(SELECT * FROM "#{scope.prefix}".activation_probe),
+               [],
+               log: false
+             )
+
+    callback = fn checkpoint ->
+      assert TestRepo.in_transaction?()
+
+      Ecto.Adapters.SQL.query!(
+        TestRepo,
+        ~s|INSERT INTO "#{scope.prefix}".activation_probe VALUES ($1)|,
+        [checkpoint.generation],
+        log: false
+      )
+
+      :ok
+    end
+
+    assert {:ok, checkpoint} =
+             Ingestion.baseline(scope, box, watch(),
+               on_baseline: callback,
+               expected_instruction_version: 1
+             )
+
+    assert %{rows: [[generation]]} =
+             Ecto.Adapters.SQL.query!(
+               TestRepo,
+               ~s(SELECT * FROM "#{scope.prefix}".activation_probe),
+               [],
+               log: false
+             )
+
+    assert generation == checkpoint.generation
+  end
+
+  test "reauthorization activation preserves cursor, generation and pending arrivals", %{
+    scope: scope,
+    box: box
+  } do
+    first = baseline(scope, box)
+
+    assert {:ok, _} =
+             Ingestion.catch_up(scope, box, gmail(fn _ -> {:ok, history(["message-1"])} end))
+
+    assert {:ok, :ok} = Ingestion.record_signal(scope, box, "150")
+
+    callback = fn checkpoint ->
+      assert TestRepo.in_transaction?()
+      assert checkpoint.generation == first.generation
+      assert checkpoint.cursor == "102" and checkpoint.requested_id == "150"
+      :ok
+    end
+
+    assert {:ok, resumed} =
+             Ingestion.activate(scope, box, first.generation,
+               on_baseline: callback,
+               expected_instruction_version: 1
+             )
+
+    assert resumed.baseline_id == first.baseline_id and resumed.generation == first.generation
+    assert {:ok, [%Arrival{message_id: "message-1"}]} = Ingestion.pending(scope, box)
+
+    assert {:error, :generation_changed} =
+             Ingestion.activate(scope, box, Ecto.UUID.generate(),
+               on_baseline: fn _ -> flunk("stale generation cannot activate") end
+             )
+  end
+
+  test "failed reconnect activation retains original baseline and discovery provenance", %{
+    scope: scope,
+    box: box
+  } do
+    first = baseline(scope, box)
+
+    assert {:ok, _} =
+             Ingestion.catch_up(scope, box, gmail(fn _ -> {:ok, history(["message-1"])} end))
+
+    assert {:error, :activation_failed} =
+             Ingestion.reconnect(scope, box, first.generation, watch("500"),
+               on_baseline: fn _ -> {:error, :epoch_changed} end
+             )
+
+    assert {:ok, checkpoint} = Ingestion.checkpoint(scope, box.id)
+
+    assert checkpoint.generation == first.generation and checkpoint.baseline_id == "100" and
+             checkpoint.cursor == "102"
+
+    assert {:ok, [%Arrival{message_id: "message-1"}]} = Ingestion.pending(scope, box)
+  end
+
+  test "version invalidation blocks activation before the host callback and masks callback errors",
+       %{scope: scope, box: box} do
+    TestRepo.update_all(EmailJanitor.Store.Mailbox, [set: [instruction_version: 2]],
+      prefix: scope.prefix,
+      log: false
+    )
+
+    assert {:error, :instructions_changed} =
+             Ingestion.baseline(scope, box, watch(),
+               expected_instruction_version: 1,
+               on_baseline: fn _ -> flunk("stale version cannot activate") end
+             )
+
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, :activation_failed} =
+                 Ingestion.baseline(scope, box, watch(),
+                   expected_instruction_version: 2,
+                   on_baseline: fn _ -> raise "PRIVATE_ACTIVATION_SENTINEL" end
+                 )
+      end)
+
+    refute log =~ "PRIVATE_ACTIVATION_SENTINEL"
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
   end
 
   test "deleted arrivals and archive-only threads are skipped without fetching more content", %{

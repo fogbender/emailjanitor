@@ -186,8 +186,8 @@ part of this metadata.
   Do not wrap execution in a host transaction: it is rejected so the intent is
   committed before Gmail is called. Low-level store ownership APIs are internal
   executor primitives; hosts use the policy-aware Executor APIs above.
-- Pure history-based ambiguous-action reconciliation decisions. Its live Gmail
-  history consumer and automatic recovery worker are not implemented yet.
+- Pure history-based ambiguous-action reconciliation and the shared bounded
+  worker below, backed by the authenticated Gmail history adapter.
 
 The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
 has separate HTTP-transport tests; model tests exercise both real SDK pipelines
@@ -203,7 +203,7 @@ here; full SaaS authorization is a later integration gate.
 ## Model privacy boundary
 
 Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
-duration and a fixed status (`:ok`, `:error`, `:invalid` or `:keep`, including preflight keeps
+duration and a fixed status (`:ok`, `:error`, `:invalid`, or `:keep`, including preflight keeps
 that never reach a model). The adapter removes the pinned SDK's
 request lifecycle telemetry before dispatch, including the upstream exception
 event that can otherwise contain raw text despite `payloads: :none`. Provider
@@ -320,7 +320,9 @@ so recovery can reject a snapshot fetched before its ownership barrier.
 `renew_watch/3` register all mailbox changes with a provisioned Pub/Sub topic;
 their registration cursor must not replace an existing processed-history cursor.
 `stop_watch/2` stops this application's watch on deliberate disconnection.
-The automatic notification/watch-renewal/reconciliation worker remains future work.
+The shared worker below handles watch renewal, guarded review/execution and
+durable reconciliation when supplied by a trusted host. A separate supervised
+notification poller records Pub/Sub hints.
 
 Text parts are base64url-decoded transiently, HTML is converted to readable text,
 and body content is wrapped in `Content`. Attachment bodies are not fetched.
@@ -359,9 +361,24 @@ OAuth refresh or reconsent after revoked credentials resumes the existing
 generation and cursor. It must never be interpreted as deliberate disconnection
 or used to call `reconnect/4` automatically.
 
+Hosts can use `baseline/4`, `reconnect/5` and `activate/4` with
+`on_baseline: fn checkpoint -> :ok end` and `expected_instruction_version:`.
+The bounded database callback runs inside the mailbox-to-checkpoint transaction;
+it binds the private connection epoch and active state to that exact generation.
+A callback error rolls back both host activation and checkpoint/arrival changes.
+`activate/4` resumes an existing generation without changing its cursor or baseline.
+Perform watch/profile requests outside this transaction. Disconnect must lock the
+mailbox and increment its version before changing private connection ownership;
+the host callback rechecks the captured epoch and group/inbox ownership.
+
 `NotificationWorker.poll_once/2` resolves each notification through the host's
 trusted email-to-scope/Inbox router, commits a coalesced history hint, and only then
-acknowledges it. Failed routes or commits remain unacknowledged. A crash after
+acknowledges it. Failed routes or commits remain unacknowledged.
+A trusted host may return `{:ignore, :disconnected}` only for an exact stored,
+deliberately disconnected inbox identity; it is acknowledged without a checkpoint
+write or cleanup wake. Arbitrary unknown addresses remain unacknowledged. A revoked
+credential for an existing bound epoch may still route normal metadata hints;
+recording them never requires Gmail OAuth credentials or runs cleanup. A crash after
 commit can safely redeliver the same hint. Hosts must supervise this bounded step
 outside host transactions: ingestion writes reject outer transactions so an ack
 cannot outrun its commit. Hosts must periodically call `Ingestion.catch_up/3`
@@ -412,6 +429,114 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
+
+
+## Shared autonomous inbox worker
+
+`Worker.install(scope)` idempotently installs the core, ingestion and scoped
+migration 11 worker metadata. The host creates one `Worker.Config` per inbox,
+binding its Scope/Inbox, Gmail and classifier adapters, current preferences,
+current connection authorization, configured Pub/Sub topic and policy. Gmail
+adapters used by the worker also implement watch/renew, thread lookup,
+`thread_snapshot/3`, bounded ingestion and complete reconciliation history.
+The Google-generated SDK supplies these operations; thread snapshots request
+only `id,historyId` and never message content.
+
+`Worker.step(config)` performs bounded work: settle/recover one durable action,
+resume or atomically establish the host connection baseline, renew its watch,
+commit one history batch, and review one conversation with at most five known
+new-arrival targets. An ordinary restart or OAuth reconsent resumes the existing
+generation. Only an explicit `lifecycle: {:reconnect, previous_generation}` can
+establish a new baseline. The `on_baseline` callback and expected preference
+version atomically bind that generation to the host's captured connection epoch;
+no watch or model call runs inside the activation transaction.
+
+`Worker.Server` supervises these steps with bounded concurrency (default two,
+maximum eight), one active task per trusted inbox reference, bounded task
+lifetimes and retry backoff. Supply `list: fn -> {:ok, refs} end` and
+`resolve: fn ref -> {:ok, config} end` as bounded host database operations;
+provider/model calls run in supervised tasks. Periodic catch-up remains necessary
+even when Pub/Sub notifications are absent. Supervise the authenticated
+`Gmail.NotificationWorker.Server` pull loop separately (trusted `source:`
+adapter/config, database-only `router:`, optional `wake:` callback), and call
+`Worker.Server.wake/1` after committing notifications when lower latency is needed.
+That generic wake preserves failure backoff. Only a trusted explicit auth/config
+repair or upgrade uses `wake/2` with a host-derived reference to reset that one
+inbox's backoff; new references must still appear in the trusted list callback.
+
+The host's `authorize` callback is checked again inside admission. It must use
+bounded local database checks, and explicit disconnect/binding changes must lock
+the core mailbox and increment its instruction version in the same transaction.
+That version is checked again at the final dispatch fence. Worker admission uses
+the Store's fresh clock under that lock, rather than a timestamp captured before
+watch/model requests. Free-plan policy receives the complete raw INBOX snapshot,
+including protected context, even though paid/unlimited cleanup may select only
+eligible targets. Read/unread and other labels are never changed.
+
+Configure `self_mail: fn headers -> Mail.Outbox.self_delivery?(scope, inbox.id,
+configured_sender, headers) end` using the shared mail component when installed.
+Only a successful delivery recorded for this exact scope, inbox, sender and
+current Message-ID establishes Janitor mail. The callback removes such mail from
+both model targets and model context; a matching sender alone establishes
+nothing. Receipt lookup failure keeps mail pending and never feeds digest
+upgrade wording to classification. This exemption does not authorize feedback.
+
+Worker rows retain only IDs, revision hashes, versions, timestamps and fixed
+outcomes, never bodies, credentials or raw model/provider responses. Stable
+`:unreadable_content` keeps arrivals pending and probes only minimal thread
+revision metadata every fifteen minutes until the revision or instructions
+change; transient failures remain retryable with exponential backoff. Invalid
+model output stops automatic candidate retries after eight consecutive invalid attempts while keeping
+provenance for an explicit requeue. Unsupported policy contracts stay pending and
+probe only revision metadata until content/instruction versions change; hosts must
+bump the mailbox version when correcting a policy/configuration incompatibility.
+Request-specific 400/413/422 model rejections defer only that conversation;
+authentication, 429, 5xx, quota/policy and transport outages preserve inbox-wide backoff.
+Four distinct rejected/invalid conversations without a successful classification
+trip inbox backoff too, bounding misconfiguration-induced400 bursts. Four repeated
+rejections for unchanged content switch to metadata-only probes; candidate caps
+remain paused until an explicit exact recheck.
+Reports retain the underlying fixed failure reason even for local deferrals.
+Durable last-attempt ordering lets never-attempted arrivals run before due failed
+retries. Bulk host backlog discovery preserves requested backoff and exhausted
+invalid-output caps; only an explicit exact candidate recheck resets them.
+Notification wake-ups preserve failure backoff. Due local work schedules another
+bounded step promptly instead of waiting the ordinary polling interval.
+Terminal policy settlement retries
+across restarts. Ambiguous mutations require fresh complete ordered history and
+are never blindly sent again. Expired ingestion history explicitly pauses in
+`:gap`; rebaselining cannot recover the unobserved outage backlog.
+
+`Worker.queue_recheck(scope, inbox, candidate_uuid)` and `queue_backlog/2` queue
+only previously identified metadata provenance, including actions cancelled
+before dispatch. They accept no arbitrary Gmail IDs. Fresh review, current
+connection generation, original identified IDs, restore/contact guards and policy
+admission are all rechecked before mutation. The host supplies `allow_recheck`
+for current paid/unlimited access; `{:blocked, :upgrade_required}` leaves
+provenance intact without repeatedly classifying unpaid requests. Requeue known
+backlog after an upgrade. Previously identified candidates can be rechecked after
+an explicit reconnect without making unknown pre-baseline mail eligible.
+`Worker.queue_manual(scope, inbox, candidate_uuid, thread_id, exact_ids,
+ authority_id: original_grant_uuid)` is a trusted host-only bridge for explicit
+chat selections that predate the arrival baseline. The host must first verify
+its durable authenticated manual-selection grant and current paid/unlimited
+access. This API only binds existing scoped pending/cancelled-no-dispatch core
+metadata; it never grants arbitrary archives or creates arrival records. The
+host supplies `allow_manual_recheck(authority_uuid, all_source_ids)`, which
+defaults to failure. It must verify every ID against active original grants,
+current account identity and authorization, both before message fetch and at
+admission. Original authority survives fresh actions and deliberate reconnect;
+partial withdrawal must reject a source containing any withdrawn ID. Repeated
+discovery preserves retry deadlines and caps. A missing exact partial-retirement
+capability pauses the affected candidate until explicit repair/recheck, without
+repeated classifier calls or fallback to a whole-candidate withdrawal.
+
+Candidate attempts carry a durable request version: selection changes and
+explicit repairs increment it, while completion compares the version it began
+with. A stale run cannot clear new selected IDs or overwrite repaired counters.
+Unreadable candidate threads follow the same metadata-only deferral as arrivals.
+Final admission preserves valid upgrade refusals and revoked-manual-proof
+statuses; a quota/provider outage still uses inbox-wide backoff.
 
 ## Google workload token helper
 
@@ -469,3 +594,69 @@ Policy adapters must explicitly implement `retire_candidate_messages/4` to suppo
 partial metadata withdrawal. Legacy `retire_candidate/4` is used only when all
 remaining work is withdrawn; unsupported partial retirement rolls back before
 changing either host metadata or the core candidate.
+
+## Exact-message restoration and search
+
+`Gmail.SDK.search(inbox_id, query, options)` returns at most ten message/thread
+references and an explicit `truncated` flag. It uses only generated SDK metadata
+fields and never logs or persists the query. Callers must refine ambiguous or
+truncated searches before selecting effects; message bodies require an explicit
+subsequent scoped fetch.
+
+`Restore.apply(scope, inbox, effect_uuid, action_uuid, exact_ids, gmail, options)`
+restores only confirmed applied IDs from that exact scoped Janitor action.
+Migration 7 is installed with the core. Requested IDs are protected durably
+before the single generated-SDK add-INBOX operation; read/unread and all other
+labels are preserved. The source action is not blanket-marked restored. Receipt
+UUIDs bind the action and exact selection; duplicate or ambiguous effects never
+auto-dispatch again. Proven dead owners with no dispatch marker may be cancelled,
+allowing a fresh explicit request UUID. Overlapping unresolved effects stay blocked.
+
+`Restore.outcome/3` reads an effect without network access: positive wire proof
+is `{:done, id}`, a live owner is `{:prepared, id}`, proven dead pre-dispatch
+owners are `{:cancelled, id}`, and dispatched or unknown-owner ambiguity remains
+`{:unresolved, id}`. `Restore.overlap_outcome/4` distinguishes live overlapping
+requests from permanent ambiguity; a completed wire awaiting only reporting does
+not block a new explicit request. These reads do not dispatch or settle effects.
+
+Hosts must pass `authorize: fn -> :ok | {:error, atom} end` and the current
+`expected_instruction_version:`. Authorization is bounded DB-only work and runs
+again under the final mailbox fence; disconnect must atomically increment that
+mailbox version. An Inbox UUID must retain one immutable Google subject: address
+changes for that subject are allowed, a different subject needs a new Inbox UUID.
+The host guard enforces that invariant for the referenced action. Credentials
+are frozen and verified before durable admission. Callers must not persist the
+prepared closure. Forget/delete workflows remove manual_restore_protections
+and restore_effects before actions/inboxes. No bodies, search text or tokens
+enter either restoration table.
+
+The source action records the full fresh observed thread IDs. Admission and
+the final dispatch fence both check restoration protections under the mailbox
+lock; a sibling cannot slip through a concurrent restore. Pre-migration prepared
+intents without observed context must cancel and obtain a fresh review.
+
+Only authoritative 401/403/429 responses from the generated SDK's single
+batch-modify call produce an unapplied rejection proof. Those receipts cancel
+and permit a fresh explicit request UUID after repair. Transport failures remain
+ambiguous and never automatically repeat the Gmail mutation.
+An observer-privacy refusal detected locally before HTTP is also a no-wire proof;
+it cancels that effect instead of leaving a permanent ambiguous reservation.
+
+A successful restore durably records `Effect.applied_at` and the exact original
+action's `restored_message_ids` before reporting settlement. The bounded DB-only
+`on_restored(action_id, exact_ids)` callback can withdraw pending digest activity;
+hosts with digests must wire it. Callback failure preserves positive wire proof.
+`Restore.pending_settlements/3`, `Restore.settle/4` and duplicate-UUID calls retry
+only DB settlement, without Gmail. Requested protections are not positive wire
+evidence; historical action IDs keep an old restore from withdrawing newer work.
+Restoration settlement uses the trusted `policy:` option for exact retirement of
+older pending/cancelled metadata, without charging or refunding quota. It uses
+the positive effect timestamp and per-ID review fences, preserves unrelated IDs
+and newer accepted requests, and never constructs an invented review snapshot.
+Hosts that persist worker candidates must also retire the same exact IDs from
+`Worker.Ledger` in their policy callback in that transaction, preserving unrelated
+arrival provenance. Repeated exact retirement is idempotent.
+Explicit rechecks and changed manual selections atomically fence older reviews;
+ordinary scheduler discovery does not refresh that authority.
+The 30s mutation watchdog ends after the provider call; positive proof and
+reporting use the remaining overall 60s owner budget, including database waits.
