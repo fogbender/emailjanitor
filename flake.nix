@@ -27,7 +27,7 @@
             version = "0.1.0";
             src = ./bridge/google-auth;
             nodejs = pkgs.nodejs_22;
-            npmDepsHash = "sha256-EYI2Fz+mWTgzO2kxk6pDo5mUvfyiNBN+gG0/IIjfm/4=";
+            npmDepsHash = "sha256-guVbJYRmU1jMjKI2sehAzxmtue/yA+Dwl5CjaYkwee0=";
             npmFlags = [ "--ignore-scripts" ];
             dontNpmBuild = true;
             nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
@@ -35,8 +35,11 @@
             checkPhase = "npm test";
             postInstall = ''
               rm "$out/bin/emailjanitor-google-token"
+              rm "$out/bin/emailjanitor-google-revoke"
               makeBinaryWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-google-token" \
                 --add-flags "-i ${pkgs.nodejs_22}/bin/node $out/lib/node_modules/@emailjanitor/google-token-bridge/cli.mjs"
+              makeBinaryWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-google-revoke" \
+                --add-flags "-i ${pkgs.coreutils}/bin/timeout --signal=KILL 13s ${pkgs.nodejs_22}/bin/node --max-old-space-size=64 $out/lib/node_modules/@emailjanitor/google-token-bridge/revoke-cli.mjs"
             '';
             doInstallCheck = true;
             installCheckPhase = ''
@@ -61,6 +64,16 @@
               test ! -e bridge.warnings
               printf 'Google service token refresh failed.\n' >bridge.expected
               cmp bridge.expected bridge.stderr
+              set +e
+              printf '{}\n' | NODE_OPTIONS='--require=/nonexistent-emailjanitor-module' \
+                BASH_ENV="$PWD/bridge.bash-env" NODE_DEBUG='*' \
+                "$out/bin/emailjanitor-google-revoke" >revoke.stdout 2>revoke.stderr
+              janitor_revoke_status=$?
+              set -e
+              test "$janitor_revoke_status" -eq 1
+              test ! -s revoke.stdout
+              printf 'Google grant revocation unavailable.\n' >revoke.expected
+              cmp revoke.expected revoke.stderr
               runHook postInstallCheck
             '';
             meta = {

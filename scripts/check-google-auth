@@ -4,5 +4,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../bridge/google-auth"
 npm ci --ignore-scripts --no-audit --no-fund
 node --check token.mjs
 node --check cli.mjs
+node --check revoke.mjs
+node --check revoke-cli.mjs
 npm test
 npm audit
