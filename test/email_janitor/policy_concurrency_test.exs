@@ -556,6 +556,15 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
         )
       end)
 
+    prior_fence =
+      database(fn ->
+        TestRepo.get_by!(
+          Store.ReviewFence,
+          [inbox_id: ctx.inbox.id, message_id: "message-2"],
+          prefix: ctx.scope.prefix
+        ).reviewed_at
+      end)
+
     parent = self()
 
     {pid, monitor} =
@@ -608,12 +617,14 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
 
     database(fn ->
-      assert %Store.ReviewFence{} =
-               TestRepo.get_by(
-                 Store.ReviewFence,
-                 [inbox_id: ctx.inbox.id, message_id: "message-2"],
-                 prefix: ctx.scope.prefix
-               )
+      fresh_fence =
+        TestRepo.get_by(
+          Store.ReviewFence,
+          [inbox_id: ctx.inbox.id, message_id: "message-2"],
+          prefix: ctx.scope.prefix
+        )
+
+      assert DateTime.compare(fresh_fence.reviewed_at, prior_fence) == :gt
 
       assert [%{message_ids: ["message-2"]}] =
                TestRepo.all(
