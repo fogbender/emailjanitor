@@ -109,7 +109,9 @@ defmodule EmailJanitor.Store do
 
       action = get(scope, inbox_id, id)
 
-      with %Action{state: state} when state in [:intent, :unresolved] <- action,
+      # A live executor owns :intent. Even complete history fetched before its
+      # network request completes cannot prove the mutation did not happen.
+      with %Action{state: :unresolved} <- action,
            {:ok, resolution} <- Reconciliation.resolve(action, history) do
         # Mixed batches stay blocked as a whole. Do not unprotect removed/restored
         # IDs merely to retry an unseen member; a later per-message recovery worker
@@ -121,9 +123,11 @@ defmodule EmailJanitor.Store do
             true -> :done
           end
 
-        {1, _} =
+        {count, _} =
           scope.repo.update_all(
-            from(a in Action, where: a.id == ^id and a.inbox_id == ^inbox_id),
+            from(a in Action,
+              where: a.id == ^id and a.inbox_id == ^inbox_id and a.state == :unresolved
+            ),
             [
               set: [
                 state: next,
@@ -135,7 +139,7 @@ defmodule EmailJanitor.Store do
             prefix: scope.prefix
           )
 
-        {next, resolution}
+        if count == 1, do: {next, resolution}, else: scope.repo.rollback(:state_changed)
       else
         nil -> scope.repo.rollback(:unknown_action)
         %Action{} -> scope.repo.rollback(:state_changed)
