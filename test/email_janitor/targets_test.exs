@@ -1,6 +1,8 @@
 defmodule EmailJanitor.TargetClassifier do
   @behaviour EmailJanitor.Classifier
   def classify(messages, _, opts) do
+    if hook = opts[:hook], do: hook.()
+
     if observer = opts[:observer],
       do: send(observer, {:target_review, Enum.map(messages, &{&1.id, &1.cleanup_target})})
 
