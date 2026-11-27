@@ -36,6 +36,27 @@ defmodule EmailJanitor.ConversationFixtureGmail do
     if opts[:kill_after_apply], do: Process.exit(self(), :kill)
     result
   end
+
+  def prepare_add_inbox(_inbox, ids, opts) do
+    {:ok,
+     fn ->
+       Agent.get_and_update(opts[:state], fn state ->
+         if opts[:reject_restore] do
+           {{:rejected, :rate_limited},
+            %{state | calls: state.calls ++ [{:restore_attempt, ids}]}}
+         else
+           messages =
+             Enum.map(state.messages, fn message ->
+               if message.id in ids,
+                 do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
+                 else: message
+             end)
+
+           {:ok, %{state | messages: messages, calls: state.calls ++ [{:restore, ids}]}}
+         end
+       end)
+     end}
+  end
 end
 
 defmodule EmailJanitor.ConversationFixtureBlockedPolicy do
@@ -1420,5 +1441,45 @@ defmodule EmailJanitor.ConversationTest do
     end
 
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "the real restore engine returns confirmed messages and preserves unread state", t do
+    Agent.update(t.state, &%{&1 | messages: [message(id: "abc123", thread_id: "def456")]})
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    ctx = context(ctx, operation: :restore, target: :none)
+    id = Ecto.UUID.generate()
+    assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Undo."))
+    assert Content.read(reply) =~ "returned 1 email"
+    [mail] = Agent.get(t.state, & &1.messages)
+    assert MapSet.new(mail.labels) == MapSet.new(["INBOX", "UNREAD", "IMPORTANT"])
+    assert Agent.get(t.state, & &1.calls) == [["abc123"], {:restore, ["abc123"]}]
+    [effect] = TestRepo.all(EmailJanitor.Restore.Effect, prefix: ctx.scope.prefix)
+    assert {:done, _} = EmailJanitor.Restore.outcome(ctx.scope, ctx.inbox, effect.id)
+    assert {:ok, ^reply} = Conversation.respond(ctx, id, Content.new("Retry same request."))
+    assert Agent.get(t.state, & &1.calls) == [["abc123"], {:restore, ["abc123"]}]
+  end
+
+  test "real post-intent rate rejection finishes from durable cancelled proof on the first reply",
+       t do
+    Agent.update(t.state, &%{&1 | messages: [message(id: "abc123", thread_id: "def456")]})
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    {gmail, opts} = ctx.gmail
+
+    ctx = %{
+      context(ctx, operation: :restore, target: :none)
+      | gmail: {gmail, Keyword.put(opts, :reject_restore, true)}
+    }
+
+    id = Ecto.UUID.generate()
+    assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Undo."))
+    assert Content.read(reply) =~ "could not restore"
+    refute Content.read(reply) =~ "try again"
+    [effect] = TestRepo.all(EmailJanitor.Restore.Effect, prefix: ctx.scope.prefix)
+    assert {:cancelled, _} = EmailJanitor.Restore.outcome(ctx.scope, ctx.inbox, effect.id)
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+    assert {:ok, ^reply} = Conversation.respond(ctx, id, Content.new("Retry."))
+    assert Agent.get(t.state, & &1.calls) == [["abc123"], {:restore_attempt, ["abc123"]}]
   end
 end
