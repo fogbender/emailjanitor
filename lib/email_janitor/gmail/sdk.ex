@@ -129,10 +129,37 @@ defmodule EmailJanitor.Gmail.SDK do
   @impl true
   def remove_inbox(inbox_id, ids, opts) do
     guarded(fn ->
+      with {:ok, dispatch} <- prepare_remove_inbox(inbox_id, ids, opts), do: dispatch.()
+    end)
+  end
+
+  @doc """
+  Verify/freeze credentials, mailbox and exact IDs before the durable dispatch marker.
+  The returned transient closure sends only batchModify with a 15-second default
+  transport budget. Never persist the closure or inspect its captured environment.
+  """
+  def prepare_remove_inbox(inbox_id, ids, opts) do
+    guarded(fn ->
       with true <-
              is_list(ids) and length(ids) in 1..1000 and Enum.all?(ids, &Parser.valid_id?/1),
            true <- length(Enum.uniq(ids)) == length(ids),
-           {:ok, connection, _} <- verified(inbox_id, opts),
+           {:ok, connection, _} <- verified(inbox_id, opts) do
+        config = Keyword.fetch!(opts, :config)
+
+        prepared =
+          Tesla.client(Tesla.Client.middleware(connection), Config.mutation_transport(config))
+
+        {:ok, fn -> dispatch_remove(prepared, ids) end}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_message_ids}
+      end
+    end)
+  end
+
+  defp dispatch_remove(connection, ids) do
+    guarded(fn ->
+      with :ok <- EmailJanitor.TransportPrivacy.check(),
            {:ok, _} <-
              call(fn ->
                Users.gmail_users_messages_batch_modify(connection, "me",
@@ -141,8 +168,9 @@ defmodule EmailJanitor.Gmail.SDK do
              end) do
         :ok
       else
+        {:error, :unsafe_http_observers} -> {:error, :gmail_unavailable}
         {:error, _} = error -> error
-        _ -> {:error, :invalid_message_ids}
+        _ -> {:error, :gmail_unavailable}
       end
     end)
   end

@@ -113,6 +113,14 @@ INBOX. Sent-mail searches have no age cutoff, and search matches are checked
 against actual To/Cc/Bcc metadata so partial-address matches do not establish a
 relationship. Incomplete search or authorization failures stop execution.
 
+`prepare_remove_inbox/3` resolves/refreshes credentials and verifies the profile
+before an executor records dispatch. Its transient zero-argument closure performs
+only the generated exact-ID batchModify request, with a default 10-second request
+plus 5-second connect budget under the 30-second owner watchdog. Legacy
+`remove_inbox/3` composes preparation and invocation. Hosts must never persist
+closures, credentials, or captured environments; custom test transports must
+honor the same bounded mutation contract.
+
 `history/3` fetches all pages and exposes ordered INBOX label changes plus arrival
 and deletion IDs. Expired history, failed pages, pagination loops and limits
 produce explicitly incomplete evidence, which must never authorize a retry.
@@ -126,6 +134,8 @@ The automatic notification/watch-renewal/reconciliation worker remains future wo
 
 Text parts are base64url-decoded transiently, HTML is converted to readable text,
 and body content is wrapped in `Content`. Attachment bodies are not fetched.
+Filename and Content-Disposition attachment markers both exclude a part, even
+when Google provides unnamed plain/HTML attachment data inline.
 Unsupported/malformed MIME and oversized text fail conservatively; this slice
 supports UTF-8 text. The HTTP tests use synthetic responses and a per-connection
 Tesla mock; no account tokens or actual mailbox bodies are test fixtures.

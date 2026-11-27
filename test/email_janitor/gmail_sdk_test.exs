@@ -80,6 +80,51 @@ defmodule EmailJanitor.GmailSDKTest do
     assert {:error, :wrong_inbox} = SDK.thread("another-inbox", "thread-1", config: config)
   end
 
+  test "preparing a mutation freezes its verified token and exact IDs before dispatch" do
+    owner = self()
+
+    {:ok, config} =
+      Config.new(
+        inbox(),
+        fn ->
+          send(owner, :resolved_token)
+          {:ok, Content.new("TOKEN_SENTINEL")}
+        end,
+        adapter: Tesla.Mock
+      )
+
+    Tesla.Mock.mock(fn env ->
+      assert {"authorization", "Bearer TOKEN_SENTINEL"} in env.headers
+
+      if String.ends_with?(env.url, "/profile") do
+        send(owner, :profile_verified)
+        Tesla.Mock.json(%{"emailAddress" => "owner@acme.com", "historyId" => "100"})
+      else
+        send(owner, :batch_sent)
+        assert Jason.decode!(env.body) == %{"ids" => ["message-1"], "removeLabelIds" => ["INBOX"]}
+        %Tesla.Env{status: 204, body: ""}
+      end
+    end)
+
+    assert {:ok, dispatch} = SDK.prepare_remove_inbox("inbox-1", ["message-1"], config: config)
+    assert is_function(dispatch, 0)
+    refute inspect(dispatch) =~ "TOKEN_SENTINEL"
+    assert_received :resolved_token
+    assert_received :profile_verified
+    refute_received :batch_sent
+    assert :ok = dispatch.()
+    assert_received :batch_sent
+    refute_received :resolved_token
+    refute_received :profile_verified
+  end
+
+  test "default prepared mutation leaves watchdog headroom and keeps TLS verification" do
+    {:ok, config} = Config.new(inbox(), fn -> {:ok, "token"} end)
+    assert {Tesla.Adapter.Httpc, options} = Config.mutation_transport(config)
+    assert options[:timeout] + options[:connect_timeout] <= 15_000
+    assert options[:ssl][:verify] == :verify_peer
+  end
+
   test "OAuth token for a different account cannot read or modify a mailbox" do
     mock(
       fn _ -> flunk("wrong identity must not reach mailbox API") end,
@@ -340,6 +385,49 @@ defmodule EmailJanitor.GmailSDKTest do
         Tesla.Mock.json(%{"id" => "thread-1", "messages" => [gmail_message(payload)]})
       end)
 
+      assert {:error, :invalid_message} = SDK.thread("inbox-1", "thread-1", options())
+    end
+  end
+
+  test "unnamed text attachments with inline data stay outside classifier content" do
+    for mime <- ["text/plain", "text/html"] do
+      disposition = [
+        %{"name" => "cOnTeNt-DiSpOsItIoN", "value" => " AtTaChMeNt ; filename=ignored.txt"}
+      ]
+
+      attachment = part(mime, "PRIVATE_ATTACHMENT_SENTINEL", %{"headers" => disposition})
+
+      visible =
+        part("text/plain", "VISIBLE_MESSAGE", %{
+          "headers" => [%{"name" => "Content-Disposition", "value" => "inline"}]
+        })
+
+      mock(fn _ ->
+        Tesla.Mock.json(%{
+          "id" => "thread-1",
+          "messages" => [
+            gmail_message(%{"mimeType" => "multipart/mixed", "parts" => [visible, attachment]})
+          ]
+        })
+      end)
+
+      assert {:ok, [message]} = SDK.thread("inbox-1", "thread-1", options())
+      assert Content.read(message.body) =~ "VISIBLE_MESSAGE"
+      refute Content.read(message.body) =~ "PRIVATE_ATTACHMENT_SENTINEL"
+
+      for parts <- [[attachment], [part("text/plain", ""), attachment]] do
+        mock(fn _ ->
+          Tesla.Mock.json(%{
+            "id" => "thread-1",
+            "messages" => [gmail_message(%{"mimeType" => "multipart/mixed", "parts" => parts})]
+          })
+        end)
+
+        assert {:error, :invalid_message} = SDK.thread("inbox-1", "thread-1", options())
+      end
+
+      root = gmail_message(attachment) |> update_in(["payload", "headers"], &(&1 ++ disposition))
+      mock(fn _ -> Tesla.Mock.json(%{"id" => "thread-1", "messages" => [root]}) end)
       assert {:error, :invalid_message} = SDK.thread("inbox-1", "thread-1", options())
     end
   end

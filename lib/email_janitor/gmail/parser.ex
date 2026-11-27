@@ -59,11 +59,13 @@ defmodule EmailJanitor.Gmail.Parser do
 
   defp parts(_, depth) when depth > 30, do: {:error, :invalid_mime}
 
-  defp parts(%Google.MessagePart{filename: filename}, _)
-       when is_binary(filename) and filename != "",
-       do: {:ok, []}
-
   defp parts(%Google.MessagePart{} = part, depth) do
+    if attachment?(part), do: {:ok, []}, else: readable_parts(part, depth)
+  end
+
+  defp parts(_, _), do: {:error, :invalid_mime}
+
+  defp readable_parts(part, depth) do
     with {:ok, own} <- text(part),
          children = part.parts || [],
          true <- is_list(children) and length(children) <= 100,
@@ -82,16 +84,27 @@ defmodule EmailJanitor.Gmail.Parser do
     end
   end
 
-  defp parts(_, _), do: {:error, :invalid_mime}
-
   defp omitted_attachment?(_, depth) when depth > 30, do: true
 
-  defp omitted_attachment?(%Google.MessagePart{filename: name}, _)
-       when is_binary(name) and name != "",
-       do: true
-
   defp omitted_attachment?(%Google.MessagePart{} = part, depth),
-    do: Enum.any?(part.parts || [], &omitted_attachment?(&1, depth + 1))
+    do: attachment?(part) or Enum.any?(part.parts || [], &omitted_attachment?(&1, depth + 1))
+
+  defp attachment?(%Google.MessagePart{filename: name}) when is_binary(name) and name != "",
+    do: true
+
+  defp attachment?(%Google.MessagePart{} = part) do
+    case headers(part.headers || []) do
+      {:ok, headers} ->
+        Enum.any?(headers, fn {name, value} ->
+          String.downcase(name) == "content-disposition" and
+            value |> String.split(";", parts: 2) |> hd() |> String.trim() |> String.downcase() ==
+              "attachment"
+        end)
+
+      _ ->
+        raise ArgumentError, "invalid MIME headers"
+    end
+  end
 
   # AMP is an alternative representation, and related inline images are visual
   # resources. Omit them only when supported readable text is also available.
@@ -99,7 +112,7 @@ defmodule EmailJanitor.Gmail.Parser do
   defp optional_visual_parts("multipart/alternative", children) do
     if Enum.any?(
          children,
-         &(&1.mimeType in ["text/plain", "text/html"] and &1.filename in [nil, ""])
+         &(&1.mimeType in ["text/plain", "text/html"] and not attachment?(&1))
        ) do
       Enum.split_with(children, &(&1.mimeType != "text/x-amp-html"))
     else
