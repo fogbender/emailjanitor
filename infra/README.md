@@ -41,6 +41,11 @@ Google Cloud project**, gives Gmail permission to publish, and creates a dedicat
 consumer service account with access only to its pull subscription. It does not
 create an OAuth client or perform mailbox consent. It also provisions workload identity
 federation restricted to the AWS runtime role, without service account key files.
+The same module accepts a dedicated Azure managed identity for the separate
+private SaaS composition; the stock self-host reference remains AWS only. See
+[notification trust resources](modules/gmail_notifications/README.md). Its
+`external_account_configuration` output is non-secret SDK metadata, never a token
+or a service-account private key.
 The setup CLI must generate the non-secret external-account credential
 configuration from the provider/service-account outputs for the runtime SDK. OAuth audience must support the intended Google accounts. An External
 Testing app can expire Gmail refresh tokens after seven days.
