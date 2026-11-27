@@ -3,7 +3,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
   import Ecto.Query
   alias EmailJanitor.{Content, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.{Binding, Cipher, Config, Repo, Store}
+  alias EmailJanitor.SelfHost.{Binding, Cipher, Config, Credentials, Repo, Store}
 
   setup_all do
     start_supervised!(
@@ -69,6 +69,180 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
           })
         )
     }
+  end
+
+  defp with_token(result, changes) do
+    data = Jason.decode!(Content.read(result.token)) |> Map.merge(changes)
+    %{result | token: Content.new(Jason.encode!(data))}
+  end
+
+  defp refresh_fixture(ctx, callback) do
+    {:ok, oauth} =
+      OAuth.Config.new(
+        "synthetic-client",
+        "PRIVATE_OAUTH_CLIENT_SECRET",
+        "https://janitor.example.com/auth/google/callback"
+      )
+
+    Req.Test.stub(:self_host_refresh, callback)
+
+    Application.put_env(:email_janitor, :self_host_config, %{
+      ctx.config
+      | google_oauth: %{oauth | http_options: [plug: {Req.Test, :self_host_refresh}]}
+    })
+  end
+
+  test "each resolver uses only its own scoped encrypted token and rejects stale epochs", ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, first} = SelfHost.connect(owner, result(), "Etc/UTC")
+
+    second_result =
+      with_token(result("work", "work@example.com"), %{
+        "access_token" => "PRIVATE_OTHER_ACCOUNT_TOKEN"
+      })
+
+    {:ok, second} = SelfHost.connect(owner, second_result, "Etc/UTC")
+    first_binding = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+    second_binding = Repo.get!(Binding, second.id, prefix: ctx.scope.prefix)
+    assert {:ok, a} = Credentials.token({first.id, first_binding.epoch})
+    assert {:ok, b} = Credentials.token({second.id, second_binding.epoch})
+    assert Content.read(a) == "PRIVATE_GOOGLE_ACCESS_SENTINEL"
+    assert Content.read(b) == "PRIVATE_OTHER_ACCOUNT_TOKEN"
+
+    assert {:error, :google_credentials_unavailable} =
+             Credentials.token({first.id, first_binding.epoch + 1})
+
+    assert :ok = Store.activate({first.id, first_binding.epoch})
+    assert :ok = Store.guard({first.id, first_binding.epoch}, first)
+  end
+
+  test "real Google OAuth SDK refresh preserves the grant without changing connection epoch",
+       ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    old = with_token(result(), %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, box} = SelfHost.connect(owner, old, "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    parent = self()
+
+    refresh_fixture(ctx, fn conn ->
+      assert conn.host == "oauth2.googleapis.com"
+      assert conn.request_path == "/token"
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert URI.decode_query(body)["refresh_token"] == "PRIVATE_GOOGLE_REFRESH_SENTINEL"
+      send(parent, :refreshed_once)
+
+      Req.Test.json(conn, %{
+        "access_token" => "PRIVATE_REFRESHED_ACCESS_SENTINEL",
+        "token_type" => "Bearer",
+        "expires_in" => 3600
+      })
+    end)
+
+    assert {:ok, token} = Credentials.token({box.id, before.epoch})
+    assert Content.read(token) == "PRIVATE_REFRESHED_ACCESS_SENTINEL"
+    assert_receive :refreshed_once
+    after_binding = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert after_binding.epoch == before.epoch
+    assert after_binding.token_version == before.token_version + 1
+    assert {:ok, content} = SelfHost.open("gmail-token", box.id, after_binding.token_ciphertext)
+
+    assert Jason.decode!(Content.read(content))["refresh_token"] ==
+             "PRIVATE_GOOGLE_REFRESH_SENTINEL"
+
+    assert {:ok, _} = Credentials.token({box.id, before.epoch})
+    refute_receive :refreshed_once
+  end
+
+  test "a refresh in flight cannot republish credentials after disconnect", ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    old = with_token(result(), %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, box} = SelfHost.connect(owner, old, "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    parent = self()
+
+    refresh_fixture(ctx, fn conn ->
+      send(parent, {:refresh_waiting, self()})
+
+      receive do
+        :continue -> :ok
+      after
+        5000 -> flunk("refresh barrier expired")
+      end
+
+      Req.Test.json(conn, %{
+        "access_token" => "PRIVATE_STALE_REFRESHED_TOKEN",
+        "token_type" => "Bearer",
+        "expires_in" => 3600
+      })
+    end)
+
+    task = Task.async(fn -> Credentials.token({box.id, before.epoch}) end)
+    assert_receive {:refresh_waiting, callback}, 5000
+    assert :ok = SelfHost.disconnect(owner, box.id)
+    send(callback, :continue)
+    assert {:error, :google_credentials_unavailable} = Task.await(task, 5000)
+    saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert saved.state == :disconnected
+    assert saved.token_ciphertext == nil
+    assert saved.epoch > before.epoch
+    assert {:error, :inbox_unavailable} = Store.guard({box.id, before.epoch}, box)
+  end
+
+  test "a revoked refresh grant clears credentials and invalidates prepared work", ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    old = with_token(result(), %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, box} = SelfHost.connect(owner, old, "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    {:ok, version} = EmailJanitor.Store.instruction_version(ctx.scope, box.id)
+
+    refresh_fixture(ctx, fn conn ->
+      conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    assert {:error, :reauthorization_required} = Credentials.token({box.id, before.epoch})
+    saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert saved.state == :reauthorization_required
+    assert saved.token_ciphertext == nil
+    assert saved.epoch == before.epoch + 1
+    assert {:ok, next} = EmailJanitor.Store.instruction_version(ctx.scope, box.id)
+    assert next == version + 1
+  end
+
+  test "late refresh cannot overwrite newer consent even when the connection epoch is preserved",
+       ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    old = with_token(result(), %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, box} = SelfHost.connect(owner, old, "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    parent = self()
+
+    refresh_fixture(ctx, fn conn ->
+      send(parent, {:refresh_waiting, self()})
+
+      receive do
+        :continue -> :ok
+      after
+        5000 -> flunk("refresh barrier expired")
+      end
+
+      Req.Test.json(conn, %{
+        "access_token" => "PRIVATE_STALE_REFRESHED_TOKEN",
+        "token_type" => "Bearer",
+        "expires_in" => 3600
+      })
+    end)
+
+    task = Task.async(fn -> Credentials.token({box.id, before.epoch}) end)
+    assert_receive {:refresh_waiting, callback}, 5000
+    consent = with_token(result(), %{"access_token" => "PRIVATE_NEW_CONSENT_TOKEN"})
+    assert {:ok, ^box} = SelfHost.connect(owner, consent, "Etc/UTC")
+    send(callback, :continue)
+    assert {:error, :google_credentials_unavailable} = Task.await(task, 5000)
+    saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert saved.epoch == before.epoch
+    assert saved.token_version == before.token_version + 1
+    assert {:ok, content} = SelfHost.open("gmail-token", box.id, saved.token_ciphertext)
+    assert Jason.decode!(Content.read(content))["access_token"] == "PRIVATE_NEW_CONSENT_TOKEN"
   end
 
   test "initial verified owner email pins an immutable Google subject" do

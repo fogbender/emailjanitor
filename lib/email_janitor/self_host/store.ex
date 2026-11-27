@@ -209,6 +209,75 @@ defmodule EmailJanitor.SelfHost.Store do
   end
 
   @doc false
+  def refs do
+    scope = SelfHost.scope()
+
+    {:ok,
+     scope.repo.all(
+       from(b in Binding,
+         where: b.state in [:pending, :active],
+         order_by: b.id,
+         select: {b.id, b.epoch}
+       ),
+       prefix: scope.prefix
+     )}
+  rescue
+    _ -> {:error, :self_host_unavailable}
+  end
+
+  @doc false
+  def fetch_binding({id, epoch}) when is_binary(id) and is_integer(epoch) do
+    scope = SelfHost.scope()
+
+    case scope.repo.one(
+           from(b in Binding,
+             join: m in Mailbox,
+             on: m.id == b.id,
+             where: b.id == ^id and b.epoch == ^epoch and b.state in [:pending, :active],
+             select: {b, m.address}
+           ),
+           prefix: scope.prefix
+         ) do
+      {binding, address} -> {:ok, binding, %Inbox{id: id, address: address}}
+      _ -> {:error, :inbox_unavailable}
+    end
+  rescue
+    _ -> {:error, :self_host_unavailable}
+  end
+
+  def fetch_binding(_), do: {:error, :inbox_unavailable}
+
+  @doc false
+  def guard(ref, %Inbox{} = expected) do
+    case fetch_binding(ref) do
+      {:ok, _, ^expected} -> :ok
+      _ -> {:error, :inbox_unavailable}
+    end
+  end
+
+  @doc false
+  def activate({id, _} = ref) do
+    case transaction(fn scope ->
+           lock_mailbox(scope, id)
+
+           case fetch_binding(ref) do
+             {:ok, binding, _} ->
+               scope.repo.update!(Ecto.Changeset.change(binding, state: :active),
+                 prefix: scope.prefix
+               )
+
+               :ok
+
+             _ ->
+               scope.repo.rollback(:inbox_unavailable)
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      error -> error
+    end
+  end
+
+  @doc false
   def token_data(%Content{} = content) do
     with true <- byte_size(Content.read(content)) <= 65_536,
          {:ok, token} when is_map(token) <- Jason.decode(Content.read(content)),
