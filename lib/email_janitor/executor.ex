@@ -32,19 +32,23 @@ defmodule EmailJanitor.Executor do
         version,
         opts \\ []
       ) do
-    {result, _policy} =
-      review_with_context(
-        scope,
-        inbox,
-        thread_id,
-        {gmail, options},
-        classifier,
-        instructions,
-        version,
-        if(is_list(opts), do: Keyword.delete(opts, :context_factory), else: opts)
-      )
+    if Keyword.keyword?(opts) do
+      {result, _policy} =
+        review_with_context(
+          scope,
+          inbox,
+          thread_id,
+          {gmail, options},
+          classifier,
+          instructions,
+          version,
+          Keyword.delete(opts, :context_factory)
+        )
 
-    result
+      result
+    else
+      {:error, :executor_unavailable}
+    end
   end
 
   @doc """

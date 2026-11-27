@@ -187,18 +187,25 @@ defmodule EmailJanitor.ReviewContextTest do
              )
   end
 
-  test "bad legacy options remain a fixed error rather than crashing the caller", t do
-    assert {:error, :executor_unavailable} =
-             Executor.review(
-               t.scope,
-               t.box,
-               "thread-1",
-               t.gmail,
-               {TestClassifier, []},
-               "",
-               1,
-               :bad
-             )
+  test "malformed legacy options remain fixed errors rather than crashing the caller", t do
+    for options <- [
+          :bad,
+          [:bad, {:context_factory, fn _ -> :invalid end}],
+          [{:a, 1} | :tail],
+          [{"not-an-atom", 1}]
+        ] do
+      assert {:error, :executor_unavailable} =
+               Executor.review(
+                 t.scope,
+                 t.box,
+                 "thread-1",
+                 t.gmail,
+                 {TestClassifier, []},
+                 "",
+                 1,
+                 options
+               )
+    end
   end
 
   test "a refusing factory preserves pending candidates without retiring through the base policy",
