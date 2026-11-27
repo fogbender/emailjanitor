@@ -3,8 +3,10 @@ defmodule EmailJanitor.Google.Revocation do
   Bounded official-SDK revocation of a stored Google refresh token.
 
   The trusted host supplies the pinned executable and retains its encrypted
-  credential until `:ok`. `:refresh_token_invalid` is deliberately not success:
-  a crash after remote success needs visible pending/manual cleanup. Hosts block
+  credential until positive confirmation. `:refresh_token_invalid` establishes
+  only that this saved credential is unusable; it does not claim project-wide
+  revocation. A host may retire that capability after permanently stopping all
+  old attempts, with truthful local-access wording. Hosts block
   new grants for the same Google subject/project while revocation is pending.
   """
   alias EmailJanitor.Content

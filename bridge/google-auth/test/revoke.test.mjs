@@ -11,7 +11,7 @@ afterEach(() => {nock.cleanAll(); nock.enableNetConnect();});
 test('official SDK revokes the offline refresh token even when its associated access token has expired', async () => {
   const stored = {refresh_token: REFRESH, access_token: 'EXPIRED_ACCESS_TOKEN_SENTINEL', expires_at: 1};
   const server = nock('https://oauth2.googleapis.com')
-    .post('/revoke').query({token: stored.refresh_token}).once().reply(200, {});
+    .post('/revoke').query({token: stored.refresh_token}).once().reply(200, '');
   assert.deepEqual(await revokeRefreshToken({refresh_token: stored.refresh_token}), {status: 'revoked'});
   assert.ok(server.isDone());
 });
@@ -24,7 +24,7 @@ test('repeating HTTP 200 after a simulated post-wire crash converges without a d
   assert.ok(server.isDone());
 });
 
-test('an exact invalid refresh token is typed pending/manual evidence rather than successful erasure', async () => {
+test('an exact invalid refresh token is typed unusable evidence without claiming all project permissions revoked', async () => {
   const server = nock('https://oauth2.googleapis.com')
     .post('/revoke').query({token: REFRESH}).reply(400, {error: 'invalid_token', error_description: REFRESH});
   const result = await revokeRefreshToken({refresh_token: REFRESH});
