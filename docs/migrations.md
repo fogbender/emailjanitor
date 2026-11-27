@@ -10,7 +10,7 @@ inside an optional module.
 | 1 | Core inboxes/actions | `Store.install/1` |
 | 2 | Core action candidates | `Store.install/1` |
 | 3 | Conversational preferences/receipts | `Preferences.install/1` |
-| 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` (in development) |
+| 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` |
 | 5 | Daily digest metadata | Digest installer (in development) |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |

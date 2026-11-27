@@ -40,6 +40,10 @@ defmodule EmailJanitor.MixProject do
       {:stream_data, "~> 1.4", only: :test},
       {:req_llm, "~> 1.31.0"},
       {:ex_aws, "~> 2.8"},
+      {:ex_aws_ses, "== 2.5.0"},
+      {:ex_aws_s3, "== 2.6.1"},
+      {:ex_aws_sqs, "== 3.5.0"},
+      {:sweet_xml, "== 0.7.5"},
       {:ex_aws_auth, "~> 1.6"}
     ]
   end

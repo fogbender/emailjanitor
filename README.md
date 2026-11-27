@@ -1,5 +1,8 @@
 # Email Janitor
 
+The [SES transport foundation](docs/mail-transport.md) documents the metadata-only
+outbox, trusted inbound receipts, short-lived spool and remaining host contracts.
+
 Email Janitor marks unwanted outreach Done while you keep your existing email
 client. This is the MIT-licensed single-user engine and self-hosted service;
 one user can connect multiple Google inboxes. The hosted application's tenancy

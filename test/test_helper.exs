@@ -24,6 +24,7 @@ for prefix <- [
   {:ok, scope} = EmailJanitor.Store.Scope.new(EmailJanitor.TestRepo, prefix)
   EmailJanitor.Store.install(scope)
   EmailJanitor.Preferences.install(scope)
+  EmailJanitor.Mail.Store.install(scope)
 end
 
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)

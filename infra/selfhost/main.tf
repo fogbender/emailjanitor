@@ -173,6 +173,7 @@ output "mail_name_servers" { value = module.mail.name_servers }
 output "sender" { value = module.mail.sender }
 output "spool_bucket" { value = module.mail.spool_bucket }
 output "incoming_queue_url" { value = module.mail.queue_url }
+output "receipt_topic_arn" { value = module.mail.receipt_topic_arn }
 output "gmail_topic" { value = module.gmail_notifications.topic }
 output "gmail_subscription" { value = module.gmail_notifications.subscription }
 output "google_consumer_service_account" { value = module.gmail_notifications.consumer_service_account }
