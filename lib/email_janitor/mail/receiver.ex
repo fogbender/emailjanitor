@@ -9,6 +9,7 @@ defmodule EmailJanitor.Mail.Receiver do
       job(:receipt_intake, fn _ -> receive_once(config) end, 45_000),
       job(:incoming_processing, fn _ -> process_once(config) end, 40_000),
       job(:authenticated_feedback, fn _ -> feedback_once(config) end, 1_100_000),
+      job(:feedback_metadata_cleanup, fn _ -> purge_feedback(config) end, 30_000),
       job(:spool_cleanup, fn marker -> sweep(config, marker) end, 1_100_000),
       job(:orphan_cleanup, fn marker -> sweep_orphans(config, marker) end, 1_100_000)
     ]
@@ -79,6 +80,14 @@ defmodule EmailJanitor.Mail.Receiver do
       {:ok, :idle} -> {:next, nil, 1_000}
       {:ok, _} -> {:next, nil, 0}
       _ -> {:next, nil, 60_000}
+    end
+  end
+
+  @doc false
+  def purge_feedback(config) do
+    case Feedback.Ledger.purge(config.transport_scope, DateTime.utc_now()) do
+      :ok -> {:next, nil, 60_000}
+      _ -> :failed
     end
   end
 

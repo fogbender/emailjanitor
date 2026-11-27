@@ -51,4 +51,38 @@ defmodule EmailJanitor.MailJobTest do
     assert :sys.get_state(server).task == nil
     GenServer.stop(server)
   end
+
+  for stop <- [:server_death, :deadline] do
+    test "#{stop} stops nested Owner work as well as its direct job task" do
+      assert_nested_cancellation(unquote(stop))
+    end
+  end
+
+  defp assert_nested_cancellation(stop) do
+    observer = self()
+
+    {:ok, server} =
+      Job.start_link(
+        timeout_ms: if(stop == :deadline, do: 500, else: 5_000),
+        run: fn _ ->
+          EmailJanitor.Owner.run(
+            fn ->
+              send(observer, {:nested_owner, self()})
+
+              receive do
+                :never -> :ok
+              end
+            end,
+            30_000
+          )
+        end
+      )
+
+    Process.unlink(server)
+    assert_receive {:nested_owner, task}, 5_000
+    monitor = Process.monitor(task)
+    if stop == :server_death, do: Process.exit(server, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^task, _}, 5_000
+    if stop == :deadline, do: GenServer.stop(server)
+  end
 end
