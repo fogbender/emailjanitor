@@ -58,21 +58,68 @@ export function validateConfiguration(config) {
 export function hardenEnvironment() {
   // This dedicated process never selects ambient user credentials or proxies.
   for (const key of Object.keys(process.env)) {
-    if (/^(?:AWS_|GOOGLE_|GCLOUD_|DEBUG$|NODE_DEBUG$|NODE_OPTIONS$|HTTPS?_PROXY$|ALL_PROXY$|https?_proxy$|all_proxy$)/.test(key)) {
+    if (/^(?:AWS_|GOOGLE_|GCLOUD_|NODE_|DEBUG$|(?:HTTPS?|ALL|NO)_PROXY$|SSL_CERT_(?:FILE|DIR)$|OPENSSL_CONF$)/i.test(key)) {
       delete process.env[key];
     }
   }
+}
+
+// google-auth-library 11.3.4 adds this audience after signing. Seed its own
+// signer with the fixed header before delegation; the SDK retains all metadata,
+// signing and subject-token serialization. This pinned internal seam is covered
+// by actual SDK signed-header tests and must be rechecked on every SDK upgrade.
+function audienceBoundAwsClient({AwsClient, AwsRequestSigner}) {
+  return class extends AwsClient {
+    async retrieveSubjectToken() {
+      if (!this.awsRequestSigner) {
+        const audience = this.audience;
+        class BoundSigner extends AwsRequestSigner {
+          getRequestOptions(options) {
+            const headers = new Headers(options.headers);
+            headers.set('x-goog-cloud-target-resource', audience);
+            return super.getRequestOptions({...options, headers});
+          }
+        }
+        this.region = await this.awsSecurityCredentialsSupplier.getAwsRegion(this.supplierContext);
+        this.awsRequestSigner = new BoundSigner(() =>
+          this.awsSecurityCredentialsSupplier.getAwsSecurityCredentials(this.supplierContext), this.region);
+      }
+      const subject = await super.retrieveSubjectToken();
+      verifyAwsSubject(subject, this.audience);
+      return subject;
+    }
+  };
+}
+
+export function verifyAwsSubject(subject, audience) {
+  const request = JSON.parse(decodeURIComponent(subject));
+  if (!allowed(request, ['url', 'method', 'headers']) || request.method !== 'POST' ||
+    !Array.isArray(request.headers) || request.headers.length !== 5) invalid();
+  const headers = new Map(request.headers.map(header => {
+    if (!allowed(header, ['key', 'value']) || typeof header.key !== 'string' || typeof header.value !== 'string') invalid();
+    return [header.key.toLowerCase(), header.value];
+  }));
+  const expected = ['authorization', 'host', 'x-amz-date', 'x-amz-security-token', 'x-goog-cloud-target-resource'];
+  if (headers.size !== 5 || !expected.every(key => headers.has(key)) ||
+    headers.get('x-goog-cloud-target-resource') !== audience ||
+    !/SignedHeaders=host;x-amz-date;x-amz-security-token;x-goog-cloud-target-resource, Signature=[a-f0-9]{64}$/.test(headers.get('authorization'))) invalid();
+  const url = new URL(request.url);
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash ||
+    !/^sts\.[a-z0-9-]{5,30}\.amazonaws\.com$/.test(url.hostname) || headers.get('host') !== url.host ||
+    url.pathname !== '/' || [...url.searchParams.keys()].sort().join(',') !== 'Action,Version' ||
+    url.searchParams.get('Action') !== 'GetCallerIdentity' || url.searchParams.get('Version') !== '2011-06-15') invalid();
 }
 
 export async function fetchToken(config) {
   try {
     const kind = validateConfiguration(config);
     hardenEnvironment();
-    const {AwsClient, IdentityPoolClient, gaxios} = await import('google-auth-library');
+    const sdk = await import('google-auth-library');
+    const {IdentityPoolClient, gaxios} = sdk;
     const transporter = new gaxios.Gaxios({timeout: 10000, maxRedirects: 0, maxContentLength: 65536});
     transporter.interceptors.request.add({resolved: async options =>
-      ({...options, retry: false, retryConfig: {retry: 0}})});
-    const Client = kind === 'aws' ? AwsClient : IdentityPoolClient;
+      ({...options, retry: false, retryConfig: {retry: 0}, follow: 0, redirect: 'error', size: 65536})});
+    const Client = kind === 'aws' ? audienceBoundAwsClient(sdk) : IdentityPoolClient;
     const client = new Client({...config, transporter, scopes: [PUBSUB], useAuthRequestParameters: false});
     // The pinned SDK creates STS with a separate transport. Configure that SDK
     // object too; all signing, token exchange and impersonation stay in its SDK.
@@ -88,21 +135,28 @@ export async function fetchToken(config) {
   }
 }
 
-async function trustedFile(path) {
-  if (!isAbsolute(path) || await realpath(path) !== resolve(path)) invalid();
-  const info = await lstat(path);
-  if (!info.isFile() || info.uid !== process.geteuid() || (info.mode & 0o022) || info.size > 16384) invalid();
-  return info;
-}
-
 export async function readConfiguration(path) {
-  await trustedFile(path);
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let handle;
   try {
-    const config = JSON.parse(await handle.readFile('utf8'));
+    if (!isAbsolute(path) || await realpath(path) !== resolve(path)) invalid();
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = await handle.stat();
+    if (!info.isFile() || info.uid !== process.geteuid() || (info.mode & 0o022) || info.size > 16384) invalid();
+    // Validate the opened file, and bound reads even if an operator replaces or
+    // grows the configuration concurrently. Never readFile an unbounded source.
+    const buffer = Buffer.alloc(16385);
+    let length = 0;
+    while (length < buffer.length) {
+      const {bytesRead} = await handle.read(buffer, length, buffer.length - length, length);
+      if (!bytesRead) break;
+      length += bytesRead;
+    }
+    if (length > 16384) invalid();
+    const config = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(buffer.subarray(0, length)));
     validateConfiguration(config);
     return config;
-  } finally {await handle.close();}
+  } catch {invalid();}
+  finally {if (handle) await handle.close();}
 }
 
 export async function writeToken(path, token) {

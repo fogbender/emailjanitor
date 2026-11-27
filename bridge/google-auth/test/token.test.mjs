@@ -5,7 +5,8 @@ import {mkdtemp, readFile, writeFile, chmod, lstat, readdir, rm, symlink} from '
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {validateConfiguration, fetchToken, writeToken, readConfiguration} from '../token.mjs';
+import {Readable} from 'node:stream';
+import {validateConfiguration, fetchToken, writeToken, readConfiguration, verifyAwsSubject} from '../token.mjs';
 
 const AUDIENCE = '//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/janitor-aws/providers/aws-ec2';
 const IAM_PATH = '/v1/projects/-/serviceAccounts/janitor-google@janitor-project.iam.gserviceaccount.com:generateAccessToken';
@@ -66,7 +67,9 @@ test('official SDK signs AWS IMDSv2 credentials, exchanges and impersonates for 
     .get('/latest/meta-data/iam/security-credentials/JanitorRole').reply(200, {
       AccessKeyId: 'FAKEACCESSKEY', SecretAccessKey: 'AWS_SECRET_SENTINEL', Token: 'AWS_SESSION_SENTINEL',
     });
+  let actualSubject;
   const sts = mockSts(subject => {
+    actualSubject = subject;
     const request = JSON.parse(decodeURIComponent(subject));
     assert.equal(request.url, 'https://sts.us-east-1.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15');
     assert.equal(request.method, 'POST');
@@ -74,6 +77,10 @@ test('official SDK signs AWS IMDSv2 credentials, exchanges and impersonates for 
     assert.equal(headers['x-goog-cloud-target-resource'], AUDIENCE);
     assert.match(headers.authorization, /^AWS4-HMAC-SHA256 Credential=FAKEACCESSKEY\//);
     assert.match(headers.authorization, /Signature=[a-f0-9]{64}$/);
+    const signed = headers.authorization.match(/SignedHeaders=([^, ]+)/)[1].split(';');
+    for (const name of ['host', 'x-amz-date', 'x-amz-security-token', 'x-goog-cloud-target-resource']) {
+      assert.ok(signed.includes(name), `${name} must be cryptographically bound by the SDK`);
+    }
     assert.equal(headers['x-amz-security-token'], 'AWS_SESSION_SENTINEL');
   });
   const iam = mockIam();
@@ -82,6 +89,17 @@ test('official SDK signs AWS IMDSv2 credentials, exchanges and impersonates for 
   assert.equal(token.access_token, FINAL_TOKEN);
   assert.ok(token.expires_at >= Math.floor(Date.now() / 1000) + 3500);
   assert.ok(metadata.isDone() && sts.isDone() && iam.isDone());
+  assert.doesNotThrow(() => verifyAwsSubject(actualSubject, AUDIENCE));
+  const altered = JSON.parse(decodeURIComponent(actualSubject));
+  altered.headers.find(h => h.key === 'x-goog-cloud-target-resource').value = AUDIENCE + '-other';
+  assert.throws(() => verifyAwsSubject(encodeURIComponent(JSON.stringify(altered)), AUDIENCE));
+  const unexpected = JSON.parse(decodeURIComponent(actualSubject));
+  unexpected.headers.find(h => h.key === 'authorization').value =
+    unexpected.headers.find(h => h.key === 'authorization').value.replace('SignedHeaders=host;', 'SignedHeaders=evil;host;');
+  assert.throws(() => verifyAwsSubject(encodeURIComponent(JSON.stringify(unexpected)), AUDIENCE));
+  const extra = JSON.parse(decodeURIComponent(actualSubject));
+  extra.headers.push({key: 'evil', value: 'unexpected'});
+  assert.throws(() => verifyAwsSubject(encodeURIComponent(JSON.stringify(extra)), AUDIENCE));
 });
 
 test('official SDK exchanges explicitly selected Azure managed identity with no project discovery', async () => {
@@ -125,14 +143,28 @@ test('SDK errors are fixed and STS failures do not retry', async () => {
   assert.equal(attempts, 1);
 });
 
-test('STS redirects never forward subject credentials to another endpoint', async () => {
-  const metadata = mockAzure();
-  const sts = nock('https://sts.googleapis.com').post('/v1/token').reply(302, '', {location: 'https://attacker.example/steal'});
-  let leaked = false;
-  nock('https://attacker.example').post('/steal').reply(() => {leaked = true; return [200, {}];});
+test('STS redirects never forward any method or subject credentials to another endpoint', async () => {
+  let leaked = 0;
+  for (const method of ['get', 'post']) {
+    nock('https://attacker.example').persist()[method]('/steal').reply(() => {leaked++; return [500, {}];});
+  }
+  for (const status of [302, 307, 308]) {
+    const metadata = mockAzure();
+    const sts = nock('https://sts.googleapis.com').post('/v1/token').reply(status, '', {location: 'https://attacker.example/steal'});
+    await assert.rejects(fetchToken(config('azure')), {message: 'federation_failed'});
+    assert.ok(metadata.isDone() && sts.isDone());
+  }
+  assert.equal(leaked, 0);
+});
+
+test('oversized chunked metadata is stopped before its subject token can be exchanged', async () => {
+  const metadata = nock('http://169.254.169.254').get('/metadata/identity/oauth2/token').query(true)
+    .reply(200, () => Readable.from([JSON.stringify({access_token: 'AZURE_SUBJECT_TOKEN_SENTINEL', padding: 'x'.repeat(100000)})]));
+  const sts = mockSts(() => {});
+  mockIam();
   await assert.rejects(fetchToken(config('azure')), {message: 'federation_failed'});
-  assert.ok(metadata.isDone() && sts.isDone());
-  assert.equal(leaked, false);
+  assert.ok(metadata.isDone());
+  assert.equal(sts.isDone(), false);
 });
 
 test('malformed or expiring impersonated tokens cannot replace runtime credentials', async () => {
@@ -166,6 +198,10 @@ test('configuration must be an owned nonwritable regular file, never a symlink',
   await assert.rejects(readConfiguration(alias));
   await chmod(path, 0o666);
   await assert.rejects(readConfiguration(path));
+  await chmod(path, 0o600);
+  await writeFile(path, 'x'.repeat(16385));
+  await assert.rejects(readConfiguration(path), {message: 'invalid_configuration'});
+  await assert.rejects(readConfiguration(directory), {message: 'invalid_configuration'});
 });
 
 test('CLI errors never expose provider/config secrets and preserve existing token', async () => {

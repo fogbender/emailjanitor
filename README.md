@@ -210,7 +210,10 @@ nix develop --command bash scripts/check-infra
 The isolated `google-auth-bridge` Nix package uses Google’s official Node SDK
 for AWS IMDSv2 or an explicitly selected Azure managed identity. It signs and
 exchanges workload credentials and impersonates the provisioned Google service
-account for the Pub/Sub scope. It never receives Gmail credentials, email content,
+account for the Pub/Sub scope. The pinned SDK’s AWS client adds its target header
+after signing; a small SDK subclass supplies the fixed configured audience to
+the official signer before delegation and rejects unexpected signed headers.
+Revalidate that upstream assumption on every SDK upgrade. It never receives Gmail credentials, email content,
 or model input. There is no handwritten SigV4 or STS implementation.
 
 A root-owned scheduled service runs:
@@ -224,8 +227,9 @@ outputs. Only the expected Google STS/IAM endpoints and exact AWS metadata sourc
 or Azure metadata URL with an explicit `client_id` are accepted. Executables,
 ambient AWS keys, custom credential endpoints, proxies, redirects and retries
 are disabled. The helper caps requests at 10 seconds and its process at 45 seconds.
-The Nix launcher removes Node injection/debug options before Node starts; hosts
-must run this isolated launcher without ambient instrumentation or observers.
+The Nix launcher starts Node with an empty environment, excluding startup proxy,
+TLS, module injection and debug settings. Hosts must run this isolated launcher
+without ambient instrumentation or observers.
 
 The config must be owned by the helper user and not group/world writable. Use a
 canonical path, including the direct store path for Nix-generated configuration;

@@ -24,10 +24,8 @@
             checkPhase = "npm test";
             postInstall = ''
               rm "$out/bin/emailjanitor-google-token"
-              makeWrapper ${pkgs.nodejs_22}/bin/node "$out/bin/emailjanitor-google-token" \
-                --add-flags "$out/lib/node_modules/@emailjanitor/google-token-bridge/cli.mjs" \
-                --unset NODE_OPTIONS --unset NODE_DEBUG --unset DEBUG \
-                --unset NODE_EXTRA_CA_CERTS --unset GOOGLE_SDK_NODE_LOGGING
+              makeWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-google-token" \
+                --add-flags "-i ${pkgs.nodejs_22}/bin/node $out/lib/node_modules/@emailjanitor/google-token-bridge/cli.mjs"
             '';
             doInstallCheck = true;
             installCheckPhase = ''
@@ -35,6 +33,13 @@
               set +e
               NODE_OPTIONS='--require=/nonexistent-emailjanitor-module' \
                 NODE_DEBUG=http GOOGLE_SDK_NODE_LOGGING='*' \
+                NODE_USE_ENV_PROXY=1 NODE_TLS_REJECT_UNAUTHORIZED=0 \
+                HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+                ALL_PROXY=http://127.0.0.1:9 NO_PROXY="" \
+                NODE_PATH=/nonexistent-emailjanitor-modules \
+                OPENSSL_CONF=/nonexistent-emailjanitor-openssl \
+                SSL_CERT_FILE=/nonexistent-emailjanitor-ca SSL_CERT_DIR=/nonexistent-emailjanitor-certs \
+                NODE_REDIRECT_WARNINGS=bridge.warnings \
                 "$out/bin/emailjanitor-google-token" >bridge.stdout 2>bridge.stderr
               janitor_bridge_status=$?
               set -e
