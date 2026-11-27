@@ -811,7 +811,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       )
 
     assert {:ok, reply} = Email.render(ctx.owner, ctx.box.id, conversation, request)
-    assert Content.read(reply) =~ "could not recover that conversational answer"
+    assert Content.read(reply) =~ "do not have a saved answer"
     refute Content.read(reply) =~ "No email or instruction changes"
 
     Repo.update!(

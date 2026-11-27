@@ -1244,7 +1244,7 @@ defmodule EmailJanitor.ConversationTest do
     end
 
     assert {:ok, reply} = Conversation.respond(%{ctx | guard: guard}, id, Content.new("Retry."))
-    assert Content.read(reply) =~ "could not recover that conversational answer"
+    assert Content.read(reply) =~ "do not have a saved answer"
     assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
     assert Agent.get(t.state, & &1.calls) == []
   end
@@ -1659,12 +1659,42 @@ defmodule EmailJanitor.ConversationTest do
     assert Content.read(first) == "PRIVATE_UNRETAINED_ANSWER"
     assert_receive :read_only_model_called
     assert {:ok, retry} = Conversation.respond(ctx, id, Content.new("retry"))
-    assert Content.read(retry) =~ "could not recover that conversational answer"
+    assert Content.read(retry) =~ "do not have a saved answer"
     refute Content.read(retry) =~ "No email or instruction changes"
     refute_receive :read_only_model_called
     receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id)
     assert receipt.completed
     refute inspect(receipt) =~ "PRIVATE_UNRETAINED_ANSWER"
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "a fresh empty read-only response uses a neutral resend notice without claiming a lost answer",
+       t do
+    script = fn _, _, _ ->
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new(""),
+         search_complete: true
+       }}
+    end
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               %{t.ctx | model: [script: script]},
+               Ecto.UUID.generate(),
+               Content.new("A question")
+             )
+
+    assert Content.read(reply) ==
+             "I do not have a saved answer to that question. Please send it again."
+
+    refute Content.read(reply) =~ "recover"
+    refute Content.read(reply) =~ "No email or instruction changes"
     assert Agent.get(t.state, & &1.calls) == []
   end
 end
