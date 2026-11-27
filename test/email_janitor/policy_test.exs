@@ -56,6 +56,23 @@ defmodule EmailJanitor.TestPolicy do
     end
   end
 
+  def retire_candidate_messages(context, _inbox, id, ids) do
+    if context.mode == :retire_error do
+      {:error, :unavailable}
+    else
+      record(context, id, "retire", ids)
+
+      Ecto.Adapters.SQL.query!(
+        context.scope.repo,
+        "UPDATE #{context.scope.prefix}.policy_events SET message_ids=ARRAY(SELECT v FROM unnest(message_ids) v WHERE NOT v=ANY($2::text[])) WHERE action_id=$1 AND kind='reserve'",
+        [id, ids],
+        log: false
+      )
+
+      :ok
+    end
+  end
+
   defp record(context, id, kind, ids, rest \\ []) do
     Ecto.Adapters.SQL.query!(
       context.scope.repo,
