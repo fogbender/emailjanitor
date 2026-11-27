@@ -1,6 +1,6 @@
 defmodule EmailJanitor.Conversation do
   @moduledoc "Shared authenticated chat/email workflow. Hosts supply the scope, inbox, policy and connection guard."
-  alias EmailJanitor.{Content, Executor, Preferences, Store}
+  alias EmailJanitor.{Content, Executor, Owner, Preferences, Store}
 
   alias EmailJanitor.Conversation.{
     Context,
@@ -15,6 +15,18 @@ defmodule EmailJanitor.Conversation do
 
   @doc "Handle one transient user message. The caller must authenticate it before constructing Context."
   def respond(%Context{} = ctx, request_id, %Content{} = request) do
+    if ctx.scope.repo.in_transaction?() do
+      {:error, :conversation_unavailable}
+    else
+      Owner.run(fn -> respond_owned(ctx, request_id, request) end)
+    end
+  rescue
+    _ -> {:error, :conversation_unavailable}
+  catch
+    _, _ -> {:error, :conversation_unavailable}
+  end
+
+  defp respond_owned(ctx, request_id, request) do
     with {:ok, request_id} <- Ecto.UUID.cast(request_id),
          {:ok, _} <- Ecto.UUID.cast(ctx.conversation_id),
          true <- not ctx.scope.repo.in_transaction?(),
@@ -22,8 +34,14 @@ defmodule EmailJanitor.Conversation do
          :ok <- ctx.guard.(),
          {:ok, snapshot} <- Preferences.snapshot(ctx.scope, ctx.inbox.id) do
       case Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id) do
-        %Receipt{completed: true} = receipt -> {:ok, Outcome.render(receipt, snapshot)}
-        pending -> plan(ctx, request_id, request, snapshot, pending)
+        %Receipt{completed: true} = receipt ->
+          {:ok, Outcome.render(receipt, snapshot)}
+
+        %Receipt{preference_status: status} = receipt when status != :pending ->
+          resume(ctx, receipt, snapshot)
+
+        pending ->
+          plan(ctx, request_id, request, snapshot, pending)
       end
     else
       _ -> {:error, :conversation_unavailable}
@@ -35,11 +53,11 @@ defmodule EmailJanitor.Conversation do
   end
 
   defp plan(ctx, request_id, request, snapshot, pending) do
-    previous = pending || Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id)
+    previous = Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
     ctx = %{ctx | model: Keyword.put(ctx.model, :previous_effects, previous_effects(previous))}
 
     evidence =
-      case previous do
+      case pending || previous do
         nil ->
           {:ok, [], [], false}
 
@@ -106,16 +124,58 @@ defmodule EmailJanitor.Conversation do
       if receipt.completed do
         {:ok, Outcome.render(receipt, snapshot)}
       else
-        with :ok <- teach(ctx, receipt, proposal, snapshot),
-             {:ok, current} <- Preferences.snapshot(ctx.scope, ctx.inbox.id),
-             :ok <- effects(ctx, receipt, selected, current),
-             {:ok, finished} <-
-               Ledger.complete(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id) do
-          if proposal.operation == :answer and proposal.preference_target == :none,
-            do: {:ok, proposal.reply},
-            else: {:ok, Outcome.render(finished, current)}
+        with :ok <- teach(ctx, receipt, proposal, snapshot) do
+          finish_effects(ctx, receipt, selected, proposal)
         end
       end
+    end
+  end
+
+  defp resume(ctx, receipt, _snapshot) do
+    with {:ok, refs, _messages} <- Lookup.load(ctx, receipt.references) do
+      # Keep the original action binding even if a later cleanup now appears in
+      # the lookup. Preference completion and exact effect selection are durable.
+      refs =
+        Enum.map(refs, fn ref ->
+          original = Enum.find(receipt.references, &(&1["token"] == ref.token))
+          %{ref | action_id: original["action_id"]}
+        end)
+
+      proposal = %Plan{
+        operation: receipt.operation,
+        references: Enum.map(refs, & &1.token),
+        preference_target: receipt.preference_target,
+        instruction: Content.new(""),
+        replace_instructions: [],
+        query: Content.new(""),
+        reply: Content.new(""),
+        search_complete: receipt.search_complete
+      }
+
+      with {:ok, claimed} <-
+             Ledger.reserve(
+               ctx.scope,
+               ctx.inbox.id,
+               ctx.conversation_id,
+               receipt.id,
+               proposal,
+               refs,
+               ctx.guard
+             ) do
+        finish_effects(ctx, claimed, refs, proposal)
+      end
+    end
+  end
+
+  defp finish_effects(ctx, receipt, refs, proposal) do
+    with {:ok, current} <- Preferences.snapshot(ctx.scope, ctx.inbox.id),
+         :ok <- effects(ctx, receipt, refs, current),
+         {:ok, finished} <-
+           Ledger.complete(ctx.scope, ctx.inbox.id, ctx.conversation_id, receipt.id) do
+      if proposal.operation == :answer and proposal.preference_target == :none and
+           Content.read(proposal.reply) != "",
+         do: {:ok, proposal.reply},
+         else: {:ok, Outcome.render(finished, current)}
     end
   end
 
@@ -179,7 +239,8 @@ defmodule EmailJanitor.Conversation do
                    Content.read(Preferences.text(snapshot)),
                    snapshot.instruction_version,
                    opts
-                 ) do
+                 ),
+               :ok <- ctx.guard.() do
             Executor.execute(ctx.scope, ctx.inbox, proposal, ctx.gmail, opts)
           end
 
@@ -203,7 +264,7 @@ defmodule EmailJanitor.Conversation do
             {"unchanged", nil}
 
           is_nil(action_id) ->
-            {"protected", nil}
+            {"unchanged", nil}
 
           true ->
             effect_id = effect_id(receipt.id, action_id)
@@ -256,6 +317,8 @@ defmodule EmailJanitor.Conversation do
   end
 
   defp cleanup_result(_ctx, {:done, id}), do: {"done", id}
+  defp cleanup_result(_ctx, {:settlement_pending, id, :done}), do: {"done", id}
+  defp cleanup_result(_ctx, {:settlement_pending, id, :unresolved}), do: {"unresolved", id}
   defp cleanup_result(_ctx, {:blocked, :upgrade_required}), do: {"blocked", nil}
 
   defp cleanup_result(_ctx, {:blocked, reason})

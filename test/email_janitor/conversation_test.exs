@@ -16,7 +16,13 @@ defmodule EmailJanitor.ConversationFixtureGmail do
   end
 
   defdelegate thread(inbox, thread, opts), to: EmailJanitor.TestGmail
-  defdelegate contacted(inbox, keys, opts), to: EmailJanitor.TestGmail
+
+  def contacted(inbox, keys, opts) do
+    result = EmailJanitor.TestGmail.contacted(inbox, keys, opts)
+    if hook = opts[:contacted_hook], do: hook.()
+    result
+  end
+
   defdelegate history_id(inbox, opts), to: EmailJanitor.TestGmail
   defdelegate remove_inbox(inbox, ids, opts), to: EmailJanitor.TestGmail
 end
@@ -30,6 +36,14 @@ defmodule EmailJanitor.ConversationFixtureBlockedPolicy do
 
   def reserve(scope, inbox, id, ids, now, _), do: reserve(scope, inbox, id, ids, now)
   def settle(_, _, _, _), do: :ok
+  def retire_candidate(_, _, _, _), do: :ok
+end
+
+defmodule EmailJanitor.ConversationFixtureFailedSettlement do
+  @behaviour EmailJanitor.Policy
+  def reserve(_, _, _, _, _), do: :ok
+  def reserve(_, _, _, _, _, _), do: :ok
+  def settle(_, _, _, _), do: {:error, :temporary_failure}
   def retire_candidate(_, _, _, _), do: :ok
 end
 
@@ -302,5 +316,91 @@ defmodule EmailJanitor.ConversationTest do
     refute Content.read(reply) =~ "uncertain"
     refute Content.read(reply) =~ "returned"
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  for {mode, expected} <- [{nil, "marked 1 email Done"}, {:timeout_after_apply, "uncertain"}] do
+    test "confirmed Gmail outcomes survive failed host settlement: #{inspect(mode)}", t do
+      mode = unquote(mode)
+      ctx = context(t.ctx, target: :none)
+      {gmail, opts} = ctx.gmail
+
+      ctx = %{
+        ctx
+        | gmail: {gmail, Keyword.put(opts, :mode, mode)},
+          policy: %Policy{adapter: EmailJanitor.ConversationFixtureFailedSettlement, context: nil}
+      }
+
+      request_id = Ecto.UUID.generate()
+      assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Mark it Done."))
+      assert Content.read(reply) =~ unquote(expected)
+      refute Content.read(reply) =~ "Please try again"
+      receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+      assert receipt.completed
+      assert hd(receipt.results)["effect_id"]
+      assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    end
+  end
+
+  test "a dead isolated owner resumes pinned effects without asking the model again", t do
+    caller = self()
+    ctx = context(t.ctx, target: :none)
+
+    ctx = %{
+      ctx
+      | execution_options: [
+          policy_for_references: fn _ ->
+            send(caller, {:isolated_owner, self()})
+            Process.exit(self(), :kill)
+          end
+        ]
+    }
+
+    request_id = Ecto.UUID.generate()
+    assert {:error, _} = Conversation.respond(ctx, request_id, Content.new("Mark it Done."))
+    assert_receive {:isolated_owner, owner}
+    refute owner == caller
+    refute Process.alive?(owner)
+    assert Process.alive?(caller)
+    pending = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+    refute pending.completed
+    assert EmailJanitor.Owner.proof(pending) == :dead
+    assert Agent.get(t.state, & &1.calls) == []
+
+    ctx = %{
+      ctx
+      | execution_options: [],
+        model: [
+          script: fn _, _, _ ->
+            raise "a resumed effect must not depend on another model plan"
+          end
+        ]
+    }
+
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "marked 1 email Done"
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id).completed
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "disconnect during review is checked again before executor admission", t do
+    {:ok, connected} = Agent.start_link(fn -> true end)
+    ctx = context(t.ctx, target: :none)
+    {gmail, opts} = ctx.gmail
+
+    ctx = %{
+      ctx
+      | guard: fn -> if Agent.get(connected, & &1), do: :ok, else: {:error, :disconnected} end,
+        gmail:
+          {gmail,
+           Keyword.put(opts, :contacted_hook, fn -> Agent.update(connected, fn _ -> false end) end)}
+    }
+
+    assert {:ok, reply} =
+             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Mark it Done."))
+
+    assert Content.read(reply) =~ "could not finish processing"
+    assert Agent.get(t.state, & &1.calls) == []
+    assert TestRepo.aggregate(Action, :count, :id, prefix: ctx.scope.prefix) == 0
+    Agent.stop(connected)
   end
 end

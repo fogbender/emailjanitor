@@ -33,17 +33,22 @@ defmodule EmailJanitor.Conversation.Ledger do
     )
   end
 
-  def latest(%Scope{} = scope, inbox_id, conversation_id) do
+  def latest(%Scope{} = scope, inbox_id, conversation_id, excluded_id \\ nil) do
     cutoff = DateTime.add(DateTime.utc_now(), -604_800)
 
-    scope.repo.one(
+    query =
       from(r in Receipt,
         where:
           r.inbox_id == ^inbox_id and r.conversation_id == ^conversation_id and
             r.inserted_at >= ^cutoff,
         order_by: [desc: r.inserted_at, desc: r.id],
         limit: 1
-      ),
+      )
+
+    query = if excluded_id, do: from(r in query, where: r.id != ^excluded_id), else: query
+
+    scope.repo.one(
+      query,
       prefix: scope.prefix,
       log: false,
       telemetry_event: nil
@@ -118,7 +123,8 @@ defmodule EmailJanitor.Conversation.Ledger do
           %Receipt{inbox_id: ^inbox_id, conversation_id: ^conversation_id} = existing ->
             if existing.operation == plan.operation and
                  existing.preference_target == plan.preference_target and
-                 existing.references == metadata,
+                 Enum.sort_by(existing.references, & &1["token"]) ==
+                   Enum.sort_by(metadata, & &1["token"]),
                do: own(scope, existing),
                else: scope.repo.rollback(:request_conflict)
 
