@@ -117,6 +117,34 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert :ok = Store.guard({first.id, first_binding.epoch}, first)
   end
 
+  test "the real scheduler accepts bounded binary references and rejects a disconnected epoch",
+       _ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    assert {:ok, [key]} = Store.worker_refs()
+    assert is_binary(key) and byte_size(key) in 1..256
+    assert {:ok, binding, ^box} = Store.fetch_binding(key)
+    assert key != box.id
+    observer = self()
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: &Store.worker_refs/0,
+       resolve: fn reference ->
+         send(observer, {:scheduler_resolved, reference})
+         {:error, :synthetic_stop}
+       end,
+       max_concurrency: 1,
+       interval_ms: 10}
+    )
+
+    assert_receive {:scheduler_resolved, ^key}, 5_000
+    assert {:ok, ^binding, ^box} = Store.fetch_binding(key)
+    assert :ok = SelfHost.disconnect(owner, box.id)
+    assert {:error, :inbox_unavailable} = Store.fetch_binding(key)
+    assert {:error, :inbox_unavailable} = Store.fetch_binding("not-a-binding-key")
+  end
+
   test "real Google OAuth SDK refresh preserves the grant without changing connection epoch",
        ctx do
     {:ok, owner} = SelfHost.authorize_owner(result())
