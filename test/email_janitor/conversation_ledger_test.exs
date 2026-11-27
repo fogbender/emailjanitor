@@ -192,7 +192,7 @@ defmodule EmailJanitor.ConversationLedgerTest do
     receipt = %{receipt | results: [%{"status" => "unresolved"}], preference_status: :failed}
     reply = Outcome.render(receipt, snapshot) |> Content.read()
     assert reply =~ "uncertain"
-    assert reply =~ "could not update"
+    assert reply =~ "could not confirm"
     refute reply =~ "returned"
     refute reply =~ "PRIVATE_REPLY"
     later = %{receipt | results: [], preference_status: :updated, preference_revision: 1}

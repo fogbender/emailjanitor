@@ -16,6 +16,8 @@ defmodule EmailJanitor.Conversation.Ledger do
         telemetry_event: nil
       )
     end
+
+    :ok
   end
 
   def get(%Scope{} = scope, inbox_id, conversation_id, request_id) do
@@ -217,6 +219,19 @@ defmodule EmailJanitor.Conversation.Ledger do
         :none
     end
   end
+
+  @doc false
+  def owns_action?(scope, inbox_id, request_id, action_id),
+    do:
+      scope.repo.exists?(
+        from(b in ActionBinding,
+          where:
+            b.action_id == ^action_id and b.request_id == ^request_id and b.inbox_id == ^inbox_id
+        ),
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
 
   def record_preference(scope, inbox_id, conversation_id, request_id, status, revision)
       when status in [:none, :updated, :unchanged, :failed] and

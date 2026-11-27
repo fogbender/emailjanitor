@@ -60,7 +60,7 @@ defmodule EmailJanitor.Conversation.Outcome do
   end
 
   defp preference(%{preference_status: :failed}, _),
-    do: "I could not update your instructions. Please try again."
+    do: "I could not confirm your instruction update. Please send that instruction again."
 
   defp preference(%{preference_status: :pending}, _),
     do: "An instruction change is still being verified; I cannot confirm its outcome yet."

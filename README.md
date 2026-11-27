@@ -67,6 +67,17 @@ edits, and routes explicit Done requests through the same executor safeguards
 and policy as automatic cleanup. Completion replies come from exact durable
 message outcomes. Hosts must provide the policy and current connection guard;
 model output cannot select a storage scope or a Gmail credential.
+Read-only questions normally receive a transient model answer. If the preceding
+request has uncertain effects, that turn reports its durable status instead of
+letting generated prose claim success. An interrupted instruction update is
+recovered from its saved preference-change receipt; without that proof the user
+is asked to send the instruction again. Pinned message selections are never
+replanned during recovery.
+
+Email hosts can supply `Conversation.Evidence.new/3` as `request_evidence` to keep
+the authenticated author's text separate from untrusted forwarded content.
+`previous_request_id` pins a verified reply to its exact scoped predecessor;
+an expired explicit predecessor never falls back to a newer unrelated request.
 
 `Conversation.Ledger.install/1` installs migrations 8 and 9 for seven-day metadata-only
 request/effect receipts and previous reference IDs. It stores no user request,

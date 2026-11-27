@@ -45,11 +45,11 @@ defmodule EmailJanitor.Conversation do
         %Receipt{completed: true} = receipt ->
           {:ok, Outcome.render(receipt, snapshot)}
 
-        %Receipt{preference_status: status} = receipt when status != :pending ->
+        %Receipt{} = receipt ->
           resume(ctx, receipt, snapshot)
 
-        pending ->
-          plan(ctx, request_id, request, snapshot, pending)
+        nil ->
+          plan(ctx, request_id, request, snapshot, nil)
       end
     else
       _ -> {:error, :conversation_unavailable}
@@ -66,7 +66,11 @@ defmodule EmailJanitor.Conversation do
         do: Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, ctx.previous_request_id),
         else: Ledger.latest(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
 
-    ctx = %{ctx | model: Keyword.put(ctx.model, :previous_effects, previous_effects(previous))}
+    ctx = %{
+      ctx
+      | prior_receipt: previous,
+        model: Keyword.put(ctx.model, :previous_effects, previous_effects(previous))
+    }
 
     evidence =
       case pending || previous do
@@ -145,7 +149,71 @@ defmodule EmailJanitor.Conversation do
     end
   end
 
-  defp resume(ctx, receipt, _snapshot) do
+  defp resume(ctx, receipt, snapshot) do
+    with {:ok, claimed} <- claim_receipt(ctx, receipt) do
+      if claimed.completed do
+        {:ok, Outcome.render(claimed, snapshot)}
+      else
+        with {:ok, claimed} <- recover_preference(ctx, claimed),
+             do: resume_effects(ctx, claimed)
+      end
+    end
+  end
+
+  defp claim_receipt(ctx, receipt) do
+    refs = receipt_refs(ctx, receipt)
+
+    Ledger.reserve(
+      ctx.scope,
+      ctx.inbox.id,
+      ctx.conversation_id,
+      receipt.id,
+      %Plan{
+        operation: receipt.operation,
+        references: Enum.map(refs, & &1.token),
+        preference_target: receipt.preference_target,
+        search_complete: receipt.search_complete
+      },
+      refs,
+      ctx.guard
+    )
+  end
+
+  # A dead workflow may have committed the instruction before recording its
+  # metadata result. Recover only that durable proof; never replan a pinned
+  # selection or persist the original request/instruction proposal for retry.
+  defp recover_preference(ctx, %{preference_status: :pending} = receipt) do
+    expected_key = if receipt.preference_target == :all, do: "all", else: "inbox:" <> ctx.inbox.id
+
+    change =
+      ctx.scope.repo.get(Preferences.Change, receipt.id,
+        prefix: ctx.scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
+
+    {status, revision} =
+      case change do
+        %Preferences.Change{target_key: ^expected_key, revision: revision, changed: changed} ->
+          {if(changed, do: :updated, else: :unchanged), revision}
+
+        _ ->
+          {:failed, nil}
+      end
+
+    Ledger.record_preference(
+      ctx.scope,
+      ctx.inbox.id,
+      ctx.conversation_id,
+      receipt.id,
+      status,
+      revision
+    )
+  end
+
+  defp recover_preference(_, receipt), do: {:ok, receipt}
+
+  defp resume_effects(ctx, receipt) do
     unfinished = unprocessed(receipt, receipt_refs(ctx, receipt))
 
     loaded =
@@ -258,10 +326,22 @@ defmodule EmailJanitor.Conversation do
            Ledger.complete(ctx.scope, ctx.inbox.id, ctx.conversation_id, receipt.id) do
       if proposal.operation == :answer and proposal.preference_target == :none and
            Content.read(proposal.reply) != "",
-         do: {:ok, proposal.reply},
+         do: {:ok, read_only_reply(ctx, proposal, current)},
          else: {:ok, Outcome.render(finished, current)}
     end
   end
+
+  # Free prose cannot certify an earlier ambiguous Gmail request. For that turn
+  # report only durable facts; the user can ask their next question separately.
+  defp read_only_reply(%{prior_receipt: %Receipt{} = prior}, proposal, snapshot) do
+    uncertain =
+      not prior.completed or prior.preference_status in [:pending, :failed] or
+        Enum.any?(prior.results, &(&1["status"] in ["unresolved", "unavailable"]))
+
+    if uncertain, do: Outcome.render(prior, snapshot), else: proposal.reply
+  end
+
+  defp read_only_reply(_, proposal, _), do: proposal.reply
 
   defp teach(_ctx, %{preference_target: :none}, _plan, _snapshot), do: :ok
 
@@ -348,7 +428,7 @@ defmodule EmailJanitor.Conversation do
             {"unchanged", nil}
 
           is_nil(action_id) ->
-            {"unchanged", nil}
+            {"unsupported", nil}
 
           true ->
             effect_id = effect_id(receipt.id, action_id)
@@ -441,7 +521,8 @@ defmodule EmailJanitor.Conversation do
 
           :none ->
             cond do
-              (status == "done" and action) && ref.message_id in action.applied_message_ids ->
+              ((status == "done" and action) && ref.message_id not in action.message_ids) and
+                  Ledger.owns_action?(ctx.scope, ctx.inbox.id, receipt.id, action.id) ->
                 {"unchanged", nil}
 
               status == "done" ->
@@ -471,10 +552,11 @@ defmodule EmailJanitor.Conversation do
   defp restore_result({:existing, :done, id}), do: {"restored", id}
   defp restore_result({:unresolved, id}), do: {"unresolved", id}
 
-  defp restore_result({:existing, state, id}) when state in [:intent, :unresolved],
-    do: {"unresolved", id}
+  defp restore_result({:existing, :unresolved, id}), do: {"unresolved", id}
+  defp restore_result({:existing, :intent, _}), do: {"unavailable", nil}
 
   defp restore_result({:existing, :cancelled, _}), do: {"unsupported", nil}
+  defp restore_result({:error, :restore_pending}), do: {"protected", nil}
 
   defp restore_result({:error, reason})
        when reason in [
@@ -483,14 +565,7 @@ defmodule EmailJanitor.Conversation do
               :unconfirmed_suppression,
               :restore_unsupported,
               :unconfirmed_restoration,
-              :wrong_inbox,
-              :connection_changed,
-              :instructions_changed,
-              :ownership_lost,
-              :dispatch_window_exhausted,
-              :authorization_required,
-              :forbidden,
-              :rate_limited
+              :wrong_inbox
             ],
        do: {"unsupported", nil}
 

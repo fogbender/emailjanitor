@@ -50,6 +50,10 @@ defmodule EmailJanitor.ConversationFixtureBlockedPolicy do
   def retire_candidate(_, _, _, _), do: :ok
 end
 
+defmodule EmailJanitor.ConversationFixtureRestore do
+  def apply(_, _, effect_id, _, _, _, opts), do: opts[:fixture_restore].(effect_id)
+end
+
 defmodule EmailJanitor.ConversationFixtureFailedSettlement do
   @behaviour EmailJanitor.Policy
   def reserve(_, _, _, _, _), do: :ok
@@ -64,7 +68,7 @@ defmodule EmailJanitor.ConversationTest do
   import Ecto.Query
   import ExUnit.CaptureLog
   alias EmailJanitor.{Content, Conversation, Policy, Preferences, Store, TestRepo}
-  alias EmailJanitor.Conversation.{Context, Ledger, Plan, Receipt}
+  alias EmailJanitor.Conversation.{Context, Ledger, Plan, Receipt, Reference}
   alias EmailJanitor.Store.{Action, Scope}
 
   setup do
@@ -893,5 +897,308 @@ defmodule EmailJanitor.ConversationTest do
     end
 
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  for committed <- [true, false] do
+    test "interrupted instruction recovery uses pinned IDs and durable change proof: #{committed}",
+         t do
+      ctx = context(t.ctx)
+      {:ok, ref} = Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+
+      {:ok, deleted_context} =
+        Reference.new(ctx.inbox.id, "deleted-context", "deleted-thread", "", "")
+
+      id = Ecto.UUID.generate()
+      {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.inbox.id)
+
+      plan = %Plan{
+        operation: :done,
+        references: [ref.token],
+        preference_target: :inbox,
+        search_complete: true
+      }
+
+      assert {:ok, _} =
+               EmailJanitor.Owner.workflow(fn ->
+                 result =
+                   Ledger.reserve(
+                     ctx.scope,
+                     ctx.inbox.id,
+                     ctx.conversation_id,
+                     id,
+                     plan,
+                     [ref, deleted_context],
+                     ctx.guard
+                   )
+
+                 if unquote(committed) do
+                   assert {:ok, _} =
+                            Preferences.replace(
+                              ctx.scope,
+                              {:inbox, ctx.inbox.id},
+                              snapshot,
+                              Content.new("Keep receipts."),
+                              id
+                            )
+                 end
+
+                 result
+               end)
+
+      ctx = %{
+        ctx
+        | model: [script: fn _, _, _ -> flunk("an admitted request must not replan") end]
+      }
+
+      assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Retry original request."))
+      assert Content.read(reply) =~ "marked 1 email Done"
+
+      if unquote(committed),
+        do: assert(Content.read(reply) =~ "updated the instructions"),
+        else: assert(Content.read(reply) =~ "could not confirm your instruction")
+
+      receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id)
+      assert receipt.completed
+      assert receipt.preference_status == if(unquote(committed), do: :updated, else: :failed)
+      assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    end
+  end
+
+  test "an interrupted pending correction completes even when its selected email disappeared",
+       t do
+    ctx = context(t.ctx)
+    {:ok, ref} = Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+    id = Ecto.UUID.generate()
+
+    plan = %Plan{
+      operation: :done,
+      references: [ref.token],
+      preference_target: :inbox,
+      search_complete: true
+    }
+
+    assert {:ok, _} =
+             EmailJanitor.Owner.workflow(fn ->
+               Ledger.reserve(
+                 ctx.scope,
+                 ctx.inbox.id,
+                 ctx.conversation_id,
+                 id,
+                 plan,
+                 [ref],
+                 ctx.guard
+               )
+             end)
+
+    {gmail, opts} = ctx.gmail
+
+    ctx = %{
+      ctx
+      | gmail: {gmail, Keyword.put(opts, :thread_error, :thread_not_found)},
+        model: [script: fn _, _, _ -> flunk("no replan") end]
+    }
+
+    assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Retry."))
+    assert Content.read(reply) =~ "could no longer be found"
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "an already archived selected sibling needs no change while the Inbox sibling is marked Done",
+       t do
+    Agent.update(
+      t.state,
+      &%{&1 | messages: [message(), message(id: "message-2", labels: ["UNREAD"])]}
+    )
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               context(t.ctx, target: :none),
+               Ecto.UUID.generate(),
+               Content.new("Mark both Done.")
+             )
+
+    assert Content.read(reply) =~ "marked 1 email Done"
+    assert Content.read(reply) =~ "1 email needed no inbox change"
+    refute Content.read(reply) =~ "safeguard"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "a foreign applied action with the email back in Inbox reports a safeguard", t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    Agent.update(t.state, &%{&1 | messages: [message()]})
+    id = Ecto.UUID.generate()
+    assert {:ok, reply} = Conversation.respond(ctx, id, Content.new("Done again."))
+    assert Content.read(reply) =~ "safeguard"
+    refute Content.read(reply) =~ "needed no inbox change"
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "restore of mail Janitor never suppressed reports unsupported", t do
+    Agent.update(t.state, &%{&1 | messages: [message(labels: ["UNREAD"])]})
+    ctx = context(t.ctx, operation: :restore, target: :none)
+
+    assert {:ok, reply} =
+             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Put that back."))
+
+    assert Content.read(reply) =~ "could not restore"
+    refute Content.read(reply) =~ "needed no inbox change"
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  test "foreign restore ambiguity is terminal and a live own no-wire intent remains retryable",
+       t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    ctx = context(ctx, operation: :restore, target: :none)
+
+    fixture = fn result ->
+      %{
+        ctx
+        | execution_options: [
+            restore_adapter: EmailJanitor.ConversationFixtureRestore,
+            fixture_restore: result
+          ]
+      }
+    end
+
+    foreign_id = Ecto.UUID.generate()
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               fixture.(fn _ -> {:error, :restore_pending} end),
+               foreign_id,
+               Content.new("Undo.")
+             )
+
+    assert Content.read(reply) =~ "safeguard"
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, foreign_id).completed
+
+    id = Ecto.UUID.generate()
+
+    assert {:error, :effects_pending} =
+             Conversation.respond(
+               fixture.(fn effect -> {:existing, :intent, effect} end),
+               id,
+               Content.new("Undo.")
+             )
+
+    refute Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+
+    assert {:ok, cancelled} =
+             Conversation.respond(
+               fixture.(fn effect -> {:existing, :cancelled, effect} end),
+               id,
+               Content.new("Retry.")
+             )
+
+    assert Content.read(cancelled) =~ "could not restore"
+    refute Content.read(cancelled) =~ "uncertain"
+  end
+
+  test "pre-admission restore version changes can retry the same request", t do
+    ctx = context(t.ctx, target: :none)
+    assert {:ok, _} = Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Done."))
+    ctx = context(ctx, operation: :restore, target: :none)
+    id = Ecto.UUID.generate()
+
+    fixture = fn result ->
+      %{
+        ctx
+        | execution_options: [
+            restore_adapter: EmailJanitor.ConversationFixtureRestore,
+            fixture_restore: result
+          ]
+      }
+    end
+
+    assert {:error, :effects_pending} =
+             Conversation.respond(
+               fixture.(fn _ -> {:error, :instructions_changed} end),
+               id,
+               Content.new("Undo.")
+             )
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               fixture.(fn effect -> {:done, effect} end),
+               id,
+               Content.new("Retry.")
+             )
+
+    assert Content.read(reply) =~ "returned 1 email"
+  end
+
+  test "a read-only answer cannot claim success for an earlier uncertain Gmail request", t do
+    ctx = context(t.ctx, target: :none)
+    {gmail, options} = ctx.gmail
+    uncertain = %{ctx | gmail: {gmail, Keyword.put(options, :mode, :error_without_apply)}}
+    assert {:ok, _} = Conversation.respond(uncertain, Ecto.UUID.generate(), Content.new("Done."))
+
+    script = fn _, _, opts ->
+      assert Enum.any?(opts[:previous_effects]["results"], &(&1["status"] == "unresolved"))
+
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new("FALSE_SUCCESS: Yes, I archived it."),
+         search_complete: true
+       }}
+    end
+
+    assert {:ok, reply} =
+             Conversation.respond(
+               %{ctx | model: [script: script]},
+               Ecto.UUID.generate(),
+               Content.new("Did it work?")
+             )
+
+    assert Content.read(reply) =~ "uncertain"
+    refute Content.read(reply) =~ "FALSE_SUCCESS"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "a duplicate that completes while resuming returns a factual saved result", t do
+    ctx = t.ctx
+    id = Ecto.UUID.generate()
+
+    plan = %Plan{
+      operation: :answer,
+      references: [],
+      preference_target: :none,
+      search_complete: true
+    }
+
+    assert {:ok, _} =
+             EmailJanitor.Owner.workflow(fn ->
+               Ledger.reserve(ctx.scope, ctx.inbox.id, ctx.conversation_id, id, plan, [], fn ->
+                 :ok
+               end)
+             end)
+
+    counter = start_supervised!({Agent, fn -> 0 end}, id: :duplicate_guard_counter)
+
+    guard = fn ->
+      call = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+
+      if call == 2,
+        do:
+          TestRepo.update_all(from(r in Receipt, where: r.id == ^id), [set: [completed: true]],
+            prefix: ctx.scope.prefix
+          )
+
+      :ok
+    end
+
+    assert {:ok, reply} = Conversation.respond(%{ctx | guard: guard}, id, Content.new("Retry."))
+    assert Content.read(reply) == "No email or instruction changes were made."
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
+    assert Agent.get(t.state, & &1.calls) == []
   end
 end

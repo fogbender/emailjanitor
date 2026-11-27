@@ -6,6 +6,7 @@ defmodule EmailJanitor.Conversation.Context do
               [
                 request_evidence: nil,
                 previous_request_id: nil,
+                prior_receipt: nil,
                 execution_options: [],
                 planner: EmailJanitor.Conversation.Planner
               ]
