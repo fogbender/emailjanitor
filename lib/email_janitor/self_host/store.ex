@@ -3,11 +3,37 @@ defmodule EmailJanitor.SelfHost.Store do
   import Ecto.Query
   alias EmailJanitor.{Address, Content, Digest, Inbox, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.{Binding, Migration, Owner}
+  alias EmailJanitor.SelfHost.{Binding, HistoricalAddress, Migration, Owner}
   alias EmailJanitor.Store.Mailbox
 
-  def install(scope),
-    do: Ecto.Migrator.up(scope.repo, 100, Migration, prefix: scope.prefix, log: false)
+  def install(
+        %EmailJanitor.Store.Scope{repo: EmailJanitor.SelfHost.Repo, prefix: "ej_selfhost"} = scope
+      ),
+      do: Ecto.Migrator.up(scope.repo, 100, Migration, prefix: scope.prefix, log: false)
+
+  def install(_), do: {:error, :invalid_self_host_scope}
+
+  @doc false
+  def recipient?(inbox_id, recipient) do
+    scope = SelfHost.scope()
+
+    scope.repo.exists?(
+      from(a in HistoricalAddress, where: a.inbox_id == ^inbox_id and a.address == ^recipient),
+      prefix: scope.prefix,
+      log: false
+    )
+  end
+
+  @doc false
+  def self_delivery?(inbox_id, sender, headers) do
+    EmailJanitor.Mail.Outbox.self_delivery?(
+      SelfHost.scope(),
+      inbox_id,
+      sender,
+      headers,
+      &recipient?(inbox_id, &1)
+    )
+  end
 
   def owner?(subject) when is_binary(subject) do
     scope = SelfHost.scope()
@@ -111,6 +137,17 @@ defmodule EmailJanitor.SelfHost.Store do
           )
         end
 
+        # History belongs to this immutable Google subject, never a reused address.
+        for address <- Enum.uniq([mailbox.address, box.address]) do
+          scope.repo.insert_all(
+            HistoricalAddress,
+            [%{inbox_id: box.id, address: address}],
+            prefix: scope.prefix,
+            on_conflict: :nothing,
+            log: false
+          )
+        end
+
         changes = %{
           timezone: timezone,
           token_ciphertext: cipher,
@@ -190,6 +227,7 @@ defmodule EmailJanitor.SelfHost.Store do
                    Ecto.Changeset.change(binding,
                      state: :disconnected,
                      reset_baseline: true,
+                     reset_generation: checkpoint_generation(scope, id),
                      token_ciphertext: nil,
                      epoch: binding.epoch + 1,
                      token_version: binding.token_version + 1
@@ -263,13 +301,26 @@ defmodule EmailJanitor.SelfHost.Store do
 
   @doc false
   def activate({id, _} = ref) do
+    # A deliberate reconnect must publish its new checkpoint and clear this
+    # marker in the caller's SAME transaction, via Ingestion.on_baseline.
+    outer_transaction? = SelfHost.scope().repo.in_transaction?()
+
     case transaction(fn scope ->
            lock_mailbox(scope, id)
 
            case fetch_binding(ref) do
              {:ok, binding, _} ->
+               if binding.reset_baseline and
+                    (not outer_transaction? or
+                       checkpoint_generation(scope, id) in [nil, binding.reset_generation]),
+                  do: scope.repo.rollback(:baseline_activation_required)
+
                scope.repo.update!(
-                 Ecto.Changeset.change(binding, state: :active, reset_baseline: false),
+                 Ecto.Changeset.change(binding,
+                   state: :active,
+                   reset_baseline: false,
+                   reset_generation: nil
+                 ),
                  prefix: scope.prefix
                )
 
@@ -330,6 +381,13 @@ defmodule EmailJanitor.SelfHost.Store do
     end
   end
 
+  defp checkpoint_generation(scope, id) do
+    case scope.repo.get(EmailJanitor.Gmail.Ingestion.Checkpoint, id, prefix: scope.prefix) do
+      nil -> nil
+      checkpoint -> checkpoint.generation
+    end
+  end
+
   defp retire_replaced_subjects(scope, subject, address) do
     bindings =
       scope.repo.all(
@@ -338,7 +396,7 @@ defmodule EmailJanitor.SelfHost.Store do
           on: m.id == b.id,
           where:
             m.address == ^address and b.google_subject != ^subject and
-              b.state in [:pending, :active],
+              b.state in [:pending, :active, :reauthorization_required],
           order_by: b.id,
           select: b
         ),
@@ -352,6 +410,7 @@ defmodule EmailJanitor.SelfHost.Store do
         Ecto.Changeset.change(binding,
           state: :disconnected,
           reset_baseline: true,
+          reset_generation: checkpoint_generation(scope, binding.id),
           token_ciphertext: nil,
           epoch: binding.epoch + 1,
           token_version: binding.token_version + 1

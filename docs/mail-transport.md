@@ -78,6 +78,14 @@ headers)` accepts the shared list of `{name, value}` headers and returns
 requires exactly one current From and Message-ID, the exact configured sender,
 and same scoped inbox/sender/recipient `:sent` evidence. It never searches
 References/In-Reply-To or treats the Janitor domain as a trusted relay.
+The optional fifth argument is a trusted, database-only recipient predicate for
+an inbox's recorded address history. It is consulted only after matching the
+successful scoped send, provider ID and sender; an arbitrary normalized address
+alone supplies no evidence. Hosts must keep the Google subject immutable for the
+lifetime of an inbox ID. The single-user host uses
+`SelfHost.Store.self_delivery?/3`, which supplies its subject-bound address history
+so a rename preserves old digest and assistant evidence. The four-argument API
+continues to require the current recipient address.
 `Mail.MessageID.provider_id/1` projects a strict single RFC822 ID under
 `amazonses.com` to its exact, case-sensitive provider local part; malformed,
 duplicate, unknown or unsupported IDs receive no exemption. SES replaces the
