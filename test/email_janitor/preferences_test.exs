@@ -309,8 +309,8 @@ defmodule EmailJanitor.PreferencesTest do
     second = prepare.(ctx.second)
     first_id = ctx.first.id
     second_id = ctx.second.id
-    assert_receive {:prepared_local, ^first_id, a}
-    assert_receive {:prepared_local, ^second_id, b}
+    assert_receive {:prepared_local, ^first_id, a}, 1_000
+    assert_receive {:prepared_local, ^second_id, b}, 1_000
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, first_id)
 
     {:ok, _} =
