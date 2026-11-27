@@ -275,6 +275,94 @@ defmodule EmailJanitor.WorkerTest do
     assert read(ctx.state).model_inputs == [["message-1"]]
   end
 
+  for scenario <- [:sent, :draft, :own_domain, :contacted] do
+    sender = if scenario == :own_domain, do: "janitor@acme.com", else: "janitor@emailjanitor.net"
+
+    labels =
+      if scenario in [:sent, :draft],
+        do: ["INBOX", String.upcase(Atom.to_string(scenario))],
+        else: ["INBOX"]
+
+    contacts = if scenario == :contacted, do: ["emailjanitor.net"], else: []
+
+    test "verified #{scenario} self-mail never shields ordinary siblings, unverified mail retains safeguards",
+         ctx do
+      sender = unquote(sender)
+      labels = unquote(labels)
+
+      delivery =
+        Fixtures.message(
+          id: "digest",
+          from: sender,
+          labels: labels,
+          headers: [{"From", sender}, {"Message-ID", "<recorded@ses.example>"}]
+        )
+
+      Agent.update(ctx.state, fn state ->
+        state
+        |> Map.put(:messages, [delivery, Fixtures.message()])
+        |> Map.put(:arrivals, %{"100" => %{through: "101", ids: ["digest", "message-1"]}})
+        |> Map.put(
+          :contacts,
+          MapSet.new(unquote(contacts))
+        )
+      end)
+
+      # Sender alone, including a Janitor-looking sender, never grants exemption.
+      assert {:ok, %{status: :kept}} = Worker.step(ctx.config)
+      assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+
+      # Newly observed sibling IDs exercise fresh admission, rather than reviving
+      # manually/previously processed arrivals after changing proof.
+      sibling = Fixtures.message(id: "new-pitch")
+
+      Agent.update(
+        ctx.state,
+        &%{
+          &1
+          | messages: [delivery, sibling],
+            arrivals: %{"101" => %{through: "102", ids: ["new-pitch"]}}
+        }
+      )
+
+      config = %{
+        ctx.config
+        | self_mail: fn headers -> {:ok, {"Message-ID", "<recorded@ses.example>"} in headers} end
+      }
+
+      assert {:ok, %{status: :done}} = Worker.step(config)
+      assert read(ctx.state).model_inputs == [["new-pitch"]]
+      assert read(ctx.state).mutations == [["new-pitch"]]
+      assert "INBOX" in hd(read(ctx.state).messages).labels
+    end
+  end
+
+  test "filtering verified SENT self-mail still checks the ordinary sibling's sent history",
+       ctx do
+    delivery =
+      Fixtures.message(
+        id: "digest",
+        labels: ["SENT"],
+        headers: [{"From", "janitor@emailjanitor.net"}, {"Message-ID", "<recorded@ses.example>"}]
+      )
+
+    Agent.update(
+      ctx.state,
+      &Map.merge(&1, %{
+        messages: [delivery, Fixtures.message()],
+        contacts: MapSet.new(["vendor.com"])
+      })
+    )
+
+    config = %{
+      ctx.config
+      | self_mail: fn headers -> {:ok, {"Message-ID", "<recorded@ses.example>"} in headers} end
+    }
+
+    assert {:ok, %{status: :kept}} = Worker.step(config)
+    assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+  end
+
   test "unavailable self-mail evidence fails closed without retiring or changing mail", ctx do
     import ExUnit.CaptureLog
     config = %{ctx.config | self_mail: fn _ -> raise "PRIVATE_RECEIPT_FAILURE" end}
@@ -334,6 +422,38 @@ defmodule EmailJanitor.WorkerTest do
     assert current.cursor == "100" and current.baseline_id == "100"
     assert current.generation == original.generation
     assert :renew in read(ctx.state).calls
+  end
+
+  test "failed watch renewal backs off independently while periodic history cleanup continues",
+       ctx do
+    Agent.update(ctx.state, &%{&1 | arrivals: %{}})
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    {:ok, original} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+    advance(ctx.clock, 43_201)
+    Agent.update(ctx.state, &%{&1 | arrivals: %{"100" => %{through: "101", ids: ["message-1"]}}})
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, renew_error: :forbidden]}}
+
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert read(ctx.state).mutations == [["message-1"]]
+
+    assert [%EmailJanitor.Worker.Watch{attempts: 1, next_attempt_at: %DateTime{}}] =
+             Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
+
+    assert {:ok, %{status: :idle}} = Worker.step(config)
+    assert Enum.count(read(ctx.state).calls, &(&1 == :renew)) == 1
+
+    advance(ctx.clock, 3_601)
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+
+    assert [%EmailJanitor.Worker.Watch{attempts: 0, next_attempt_at: nil}] =
+             Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
+
+    {:ok, current} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+
+    assert current.generation == original.generation and
+             current.baseline_id == original.baseline_id
+
+    assert current.cursor == "101"
   end
 
   test "at most five targets are admitted per step and remaining arrivals continue", ctx do

@@ -145,10 +145,19 @@ defmodule EmailJanitor.Worker do
 
   defp renew(config, checkpoint, now) do
     if Ledger.watch_due?(config.scope, config.inbox, checkpoint, now) do
-      with :ok <- authorized(config),
-           {:ok, _} <-
-             Ingestion.renew_watch(config.scope, config.inbox, config.topic, config.gmail) do
-        Ledger.watched(config.scope, config.inbox, checkpoint.generation, now)
+      with :ok <- authorized(config) do
+        case protect(fn ->
+               Ingestion.renew_watch(config.scope, config.inbox, config.topic, config.gmail)
+             end) do
+          {:ok, _} ->
+            Ledger.watched(config.scope, config.inbox, checkpoint.generation, now)
+
+          _ ->
+            :ok = Ledger.watch_failed(config.scope, config.inbox, checkpoint.generation, now)
+            report(config, :watch_renewal_failed)
+            # An active durable cursor still supports periodic history catch-up.
+            :ok
+        end
       end
     else
       :ok
@@ -396,7 +405,11 @@ defmodule EmailJanitor.Worker do
     result =
       with :ok <- authorized(config),
            :ok <- Ingestion.authorize_proposal(config.scope, config.inbox, eligible, proposal),
-           do: Executor.execute(config.scope, config.inbox, proposal, config.gmail, policy: gate)
+           do:
+             Executor.execute(config.scope, config.inbox, proposal, config.gmail,
+               policy: gate,
+               self_mail: config.self_mail
+             )
 
     case result do
       {:done, _} ->
@@ -669,7 +682,8 @@ defmodule EmailJanitor.Worker do
              ),
            do:
              Executor.execute(config.scope, config.inbox, proposal, config.gmail,
-               policy: %Policy{adapter: Gate, context: context}
+               policy: %Policy{adapter: Gate, context: context},
+               self_mail: config.self_mail
              )
 
     case result do

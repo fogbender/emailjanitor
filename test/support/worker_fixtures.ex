@@ -11,8 +11,12 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   defp watch_result(options, kind) do
     Agent.get_and_update(options[:state], fn state ->
       result =
-        {:ok,
-         %{history_id: state.watch_id, expires_at: DateTime.add(DateTime.utc_now(), 604_800)}}
+        if kind == :renew and options[:renew_error] do
+          {:error, options[:renew_error]}
+        else
+          {:ok,
+           %{history_id: state.watch_id, expires_at: DateTime.add(DateTime.utc_now(), 604_800)}}
+        end
 
       {result, %{state | calls: state.calls ++ [kind]}}
     end)

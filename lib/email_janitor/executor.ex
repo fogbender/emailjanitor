@@ -181,6 +181,12 @@ defmodule EmailJanitor.Executor do
   end
 
   defp current_contacts(context, current, gmail, options) do
+    with {:ok, current} <- Reviewer.filter_self_mail(current, context.opts) do
+      contact_filtered(context, current, gmail, options)
+    end
+  end
+
+  defp contact_filtered(context, current, gmail, options) do
     if exact_inbox_ids(current) == [] do
       {:ok, MapSet.new()}
     else
@@ -229,12 +235,18 @@ defmodule EmailJanitor.Executor do
              proposal.instruction_version,
              opts
            ),
-         {:ok, contacted} <- current_contacts(context, current, gmail, options) do
+         {:ok, contacted} <- current_contacts(context, current, gmail, options),
+         {:ok, safeguard_messages} <- Reviewer.filter_self_mail(current, context.opts) do
       reason =
         if exact_inbox_ids(current) == [],
           do: {:keep, :no_matching_inbox_messages},
           else:
-            Safeguards.evaluate(current, inbox, contacted, Store.restored_ids(scope, inbox.id))
+            Safeguards.evaluate(
+              safeguard_messages,
+              inbox,
+              contacted,
+              Store.restored_ids(scope, inbox.id)
+            )
 
       case reason do
         {:keep, reason} ->

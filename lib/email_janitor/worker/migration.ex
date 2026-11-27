@@ -88,6 +88,8 @@ defmodule EmailJanitor.Worker.Migration do
       add(:inbox_id, references(:inboxes, type: :text), primary_key: true)
       add(:generation, :uuid, null: false)
       add(:renewed_at, :utc_datetime_usec, null: false)
+      add(:attempts, :integer, null: false, default: 0)
+      add(:next_attempt_at, :utc_datetime_usec)
     end
   end
 end
@@ -132,6 +134,8 @@ defmodule EmailJanitor.Worker.Watch do
   schema "janitor_worker_watches" do
     field(:generation, Ecto.UUID)
     field(:renewed_at, :utc_datetime_usec)
+    field(:attempts, :integer, default: 0)
+    field(:next_attempt_at, :utc_datetime_usec)
   end
 end
 
