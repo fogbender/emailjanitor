@@ -1,8 +1,14 @@
 defmodule EmailJanitor.Executor do
   @moduledoc "Recheck a proposal, persist an intent, and mutate exact IDs once. Ambiguity never causes a retry."
-  alias EmailJanitor.{Identity, Inbox, Message, Policy, Proposal, Safeguards, Store}
+  alias EmailJanitor.{Identity, Inbox, Message, Owner, Policy, Proposal, Safeguards, Store}
 
   def execute(scope, %Inbox{} = inbox, %Proposal{} = proposal, {gmail, options}, opts \\ []) do
+    if scope.repo.in_transaction?(),
+      do: {:error, :outer_transaction},
+      else: Owner.run(fn -> do_execute(scope, inbox, proposal, gmail, options, opts) end)
+  end
+
+  defp do_execute(scope, inbox, proposal, gmail, options, opts) do
     with {:ok, version} <- Store.instruction_version(scope, inbox.id),
          true <- version == proposal.instruction_version,
          {:ok, current} <- safe(fn -> gmail.thread(inbox.id, proposal.thread_id, options) end),
@@ -30,17 +36,25 @@ defmodule EmailJanitor.Executor do
   defp apply_intent(scope, inbox, action, gmail, options, opts) do
     # Any error after sending is ambiguous: retain the intent for history-based
     # reconciliation. Repeating execute cannot issue the mutation a second time.
+    Owner.bounded(fn ->
+      case Store.begin_dispatch(scope, inbox.id, action.id, action.owner_token) do
+        :ok ->
+          dispatch(scope, inbox, action, gmail, options, opts)
+
+        {:error, _} = error ->
+          case Store.cancel_prepared(scope, inbox.id, action.id, action.owner_token) do
+            :ok -> settle(scope, inbox, action.id, error, opts)
+            _ -> error
+          end
+      end
+    end)
+  end
+
+  defp dispatch(scope, inbox, action, gmail, options, opts) do
     case safe(fn -> gmail.remove_inbox(inbox.id, action.message_ids, options) end) do
       :ok ->
         :ok = Store.transition(scope, inbox.id, action.id, :intent, :done)
-
-        settle(
-          scope,
-          inbox,
-          action.id,
-          {:done, action.id},
-          opts
-        )
+        settle(scope, inbox, action.id, {:done, action.id}, opts)
 
       _ ->
         :ok = Store.transition(scope, inbox.id, action.id, :intent, :unresolved)
@@ -67,6 +81,19 @@ defmodule EmailJanitor.Executor do
   @doc "Retry host settlement from durable outcomes without issuing any Gmail request."
   def settle_action(scope, inbox, action_id, opts \\ []) do
     settle(scope, inbox, action_id, nil, opts)
+  end
+
+  @doc "Recover an orphan and settle its durable result without issuing any Gmail request."
+  def recover(scope, inbox, action_id, opts \\ []) do
+    case Store.recover(scope, inbox.id, action_id) do
+      {:ok, _} = recovered -> settle(scope, inbox, action_id, recovered, opts)
+      error -> error
+    end
+  end
+
+  defp existing(scope, inbox, %{state: :intent} = action, opts) do
+    Store.recover(scope, inbox.id, action.id)
+    settle_action(scope, inbox, action.id, opts)
   end
 
   defp existing(scope, inbox, action, opts), do: settle_action(scope, inbox, action.id, opts)

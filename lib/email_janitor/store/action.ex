@@ -11,6 +11,16 @@ defmodule EmailJanitor.Store.Action do
     field(:fingerprint, :string)
     field(:history_id, :string)
     field(:instruction_version, :integer)
+    field(:owner_token, Ecto.UUID)
+    field(:owner_runtime, :string)
+    field(:owner_host, :string)
+    field(:owner_boot, :string)
+    field(:owner_os_pid, :string)
+    field(:owner_os_start, :string)
+    field(:owner_beam_pid, :binary)
+    field(:lease_expires_at, :utc_datetime_usec)
+    field(:dispatch_started_at, :utc_datetime_usec)
+    field(:recovered_at, :utc_datetime_usec)
 
     field(:category, Ecto.Enum,
       values: [:cold_outreach, :legitimate, :uncertain, :user_instruction]

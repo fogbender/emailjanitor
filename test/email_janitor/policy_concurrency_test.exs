@@ -61,6 +61,89 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     %{scope: scope, inbox: box, proposal: proposal, state: state, policy: policy}
   end
 
+  for dispatched <- [false, true] do
+    test "recovery settles #{if dispatched, do: "sent ambiguity without releasing slots", else: "prepared non-application"}",
+         ctx do
+      parent = self()
+
+      assert {:error, :executor_unavailable} =
+               EmailJanitor.Owner.run(fn ->
+                 database(fn ->
+                   {:ok, {:created, action}} =
+                     Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100",
+                       policy: ctx.policy
+                     )
+
+                   if unquote(dispatched),
+                     do:
+                       :ok =
+                         Store.begin_dispatch(
+                           ctx.scope,
+                           ctx.inbox.id,
+                           action.id,
+                           action.owner_token
+                         )
+
+                   send(parent, {:prepared_recovery, action.id})
+                   raise "SYNTHETIC_EXECUTOR_FAILURE"
+                 end)
+               end)
+
+      assert_receive {:prepared_recovery, id}
+      state = if unquote(dispatched), do: :unresolved, else: :cancelled
+
+      assert {:ok, {^state, _}} =
+               database(fn -> Executor.recover(ctx.scope, ctx.inbox, id, policy: ctx.policy) end)
+
+      not_applied = if unquote(dispatched), do: [], else: ["message-1"]
+
+      assert %{rows: [[[], ^not_applied]]} =
+               database(fn ->
+                 Ecto.Adapters.SQL.query!(
+                   TestRepo,
+                   "SELECT message_ids,not_applied_ids FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 AND kind='settle'",
+                   [id],
+                   log: false
+                 )
+               end)
+
+      assert [] = Agent.get(ctx.state, & &1.calls)
+    end
+  end
+
+  test "concurrent blocked notifications create one durable candidate identity", ctx do
+    blocked = %{ctx.policy | context: %{ctx.policy.context | mode: :block}}
+
+    results =
+      1..6
+      |> Task.async_stream(
+        fn _ ->
+          database(fn ->
+            Executor.execute(ctx.scope, ctx.inbox, ctx.proposal, {TestGmail, [state: ctx.state]},
+              policy: blocked
+            )
+          end)
+        end,
+        max_concurrency: 6,
+        timeout: 5_000
+      )
+      |> Enum.to_list()
+
+    assert Enum.all?(results, &(&1 == {:ok, {:blocked, :upgrade_required}}))
+
+    assert %{rows: [[1, 1]]} =
+             database(fn ->
+               Ecto.Adapters.SQL.query!(
+                 TestRepo,
+                 "SELECT (SELECT count(*) FROM #{ctx.scope.prefix}.action_candidates WHERE inbox_id=$1), (SELECT count(*) FROM #{ctx.scope.prefix}.policy_events WHERE action_id IN (SELECT id::text FROM #{ctx.scope.prefix}.action_candidates WHERE inbox_id=$1))",
+                 [ctx.inbox.id],
+                 log: false
+               )
+             end)
+
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
   for entry <- [:settle_action, :execute] do
     test "#{entry} cannot overwrite terminal reconciliation with stale unresolved settlement",
          ctx do

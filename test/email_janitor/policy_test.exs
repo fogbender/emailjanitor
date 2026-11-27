@@ -14,9 +14,16 @@ defmodule EmailJanitor.TestPolicy do
   end
 
   def settle(context, _inbox, action_id, result) do
-    send(self(), {:policy_settlement, action_id, result})
+    if observer = Map.get(context, :observer),
+      do: send(observer, {:policy_settlement, action_id, result})
 
-    if Process.get(:fail_settlement, false) do
+    failed =
+      case Map.get(context, :control) do
+        nil -> false
+        control -> Agent.get(control, & &1.fail)
+      end
+
+    if failed do
       {:error, :unavailable}
     else
       {ids, rest} =
@@ -77,7 +84,8 @@ defmodule EmailJanitor.PolicyTest do
     state =
       start_supervised!({Agent, fn -> %{messages: [message()], contacted: [], calls: []} end})
 
-    %{scope: scope, inbox: box, proposal: proposal, state: state}
+    control = start_supervised!({Agent, fn -> %{fail: false} end}, id: :policy_control)
+    %{scope: scope, inbox: box, proposal: proposal, state: state, control: control}
   end
 
   defp execute(ctx, mode, gmail_opts \\ []) do
@@ -91,7 +99,10 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   defp policy(ctx, mode),
-    do: %Policy{adapter: TestPolicy, context: %{scope: ctx.scope, mode: mode}}
+    do: %Policy{
+      adapter: TestPolicy,
+      context: %{scope: ctx.scope, mode: mode, control: ctx.control, observer: self()}
+    }
 
   defp events do
     Ecto.Adapters.SQL.query!(
@@ -143,6 +154,26 @@ defmodule EmailJanitor.PolicyTest do
     refute next == id
   end
 
+  test "large blocked message sets retain a stable identity without an oversized database index",
+       ctx do
+    messages = for _ <- 1..512, do: message(id: Ecto.UUID.generate() |> String.replace("-", ""))
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    ctx = %{ctx | proposal: proposal}
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+
+    assert [%Candidate{id: id, message_ids: ids}] =
+             TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(ids) == 512
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
   for mode <- [:error, :raise] do
     test "#{mode} admission rolls back metadata and never changes Gmail", ctx do
       assert {:error, :policy_unavailable} = execute(ctx, unquote(mode))
@@ -167,10 +198,10 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   test "failed settlement retries from durable outcomes without another Gmail call", ctx do
-    Process.put(:fail_settlement, true)
+    Agent.update(ctx.control, &%{&1 | fail: true})
     assert {:settlement_pending, id, :done} = execute(ctx, :allow)
     assert %Action{state: :done} = Store.get(ctx.scope, ctx.inbox.id, id)
-    Process.put(:fail_settlement, false)
+    Agent.update(ctx.control, &%{&1 | fail: false})
 
     assert {:existing, ^id, :done} =
              Executor.settle_action(ctx.scope, ctx.inbox, id, policy: policy(ctx, :allow))
@@ -199,7 +230,8 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   for fail_settlement <- [false, true] do
-    test "mixed history settlement preserves both ID lists (failure=#{fail_settlement})", ctx do
+    test "mixed history stays blocked until all IDs are observed (failure=#{fail_settlement})",
+         ctx do
       messages = [message(id: "message-1"), message(id: "message-2")]
       Agent.update(ctx.state, &%{&1 | messages: messages})
 
@@ -209,32 +241,45 @@ defmodule EmailJanitor.PolicyTest do
       ctx = %{ctx | proposal: proposal}
       assert {:unresolved, id} = execute(ctx, :allow, mode: :timeout_after_apply)
       assert_received {:policy_settlement, ^id, :unresolved}
-      Process.put(:fail_settlement, unquote(fail_settlement))
+      Agent.update(ctx.control, &%{&1 | fail: unquote(fail_settlement)})
 
       history = %{
         complete?: true,
+        started_at: DateTime.utc_now(),
         events: [
           %{history_id: "101", message_id: "message-1", event: :inbox_removed},
           %{history_id: "102", message_id: "message-1", event: :inbox_added}
         ]
       }
 
+      assert {:error, :dispatch_outcome_unknown} =
+               Executor.reconcile(ctx.scope, ctx.inbox, id, history, policy: policy(ctx, :allow))
+
+      refute_received {:policy_settlement, ^id, {:reconciled, _, _}}
+
+      history = %{
+        history
+        | events:
+            history.events ++
+              [%{history_id: "103", message_id: "message-2", event: :inbox_removed}]
+      }
+
       result = Executor.reconcile(ctx.scope, ctx.inbox, id, history, policy: policy(ctx, :allow))
-      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1"], ["message-2"]}}
+      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1", "message-2"], []}}
 
       if unquote(fail_settlement),
         do: assert(result == {:settlement_pending, id, :restored}),
         else: assert(match?({:ok, {:restored, _}}, result))
 
-      Process.put(:fail_settlement, false)
+      Agent.update(ctx.control, &%{&1 | fail: false})
 
       assert {:existing, ^id, :restored} =
                Executor.settle_action(ctx.scope, ctx.inbox, id, policy: policy(ctx, :allow))
 
-      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1"], ["message-2"]}}
+      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1", "message-2"], []}}
       assert [["message-1", "message-2"]] = Agent.get(ctx.state, & &1.calls)
 
-      assert %{rows: [[["message-1"], ["message-2"]]]} =
+      assert %{rows: [[["message-1", "message-2"], []]]} =
                Ecto.Adapters.SQL.query!(
                  TestRepo,
                  "SELECT message_ids,not_applied_ids FROM ej_test_a.policy_events WHERE kind='settle'",

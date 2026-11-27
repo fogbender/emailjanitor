@@ -87,4 +87,34 @@ defmodule EmailJanitor.ContentTest do
       assert match?({:ok, %Decision{}}, result) or result == {:error, :invalid_decision}
     end
   end
+
+  test "hidden body blocks are excluded before truncation, including nested links" do
+    for attrs <- [
+          "hidden",
+          "hidden='false'",
+          "aria-hidden='true'",
+          "style='display:none'",
+          "style='DISPLAY : NONE !important; color:red'",
+          "style='color:red; visibility: hidden'"
+        ] do
+      source =
+        "<div #{attrs}><a href='https://hidden.example.com'>" <>
+          String.duplicate("HIDDEN_SENTINEL", 5000) <>
+          "</a></div><p>Visible development pitch</p>"
+
+      assert {:ok, result} = HTML.readable(Content.new(source), 100)
+      assert Content.read(result) =~ "Visible development pitch"
+      refute Content.read(result) =~ "HIDDEN_SENTINEL"
+      refute Content.read(result) =~ "hidden.example.com"
+    end
+  end
+
+  test "template contents do not crowd out the visible message" do
+    source =
+      "<template>" <>
+        String.duplicate("HIDDEN_SENTINEL", 5000) <> "</template><p>Visible pitch</p>"
+
+    assert {:ok, result} = HTML.readable(Content.new(source), 100)
+    assert Content.read(result) == "Visible pitch"
+  end
 end

@@ -119,13 +119,11 @@ defmodule EmailJanitor.ExecutorTest do
   end
 
   test "a cancelled intent can be retried only after fresh safeguards", ctx do
-    assert {:unresolved, id} = execute(ctx, mode: :error_without_apply)
-
-    assert {:ok, {:cancelled, _}} =
-             Store.reconcile(ctx.scope, ctx.inbox.id, id, %{complete?: true, events: []})
+    assert {:ok, {:created, action}} = Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100")
+    :ok = Store.cancel_prepared(ctx.scope, ctx.inbox.id, action.id, action.owner_token)
 
     assert {:done, new_id} = execute(ctx)
-    refute id == new_id
+    refute action.id == new_id
   end
 
   test "mixed recovery never cancels restored IDs to retry an unseen batch member", ctx do
@@ -140,20 +138,21 @@ defmodule EmailJanitor.ExecutorTest do
 
     history = %{
       complete?: true,
+      started_at: DateTime.utc_now(),
       events: [
         %{history_id: "101", message_id: "message-1", event: :inbox_removed},
         %{history_id: "102", message_id: "message-1", event: :inbox_added}
       ]
     }
 
-    assert {:ok, {:restored, %{retry_ids: ["message-2"]}}} =
+    assert {:error, :dispatch_outcome_unknown} =
              Store.reconcile(ctx.scope, ctx.inbox.id, id, history)
 
-    assert %Action{applied_message_ids: ["message-1"], restored_message_ids: ["message-1"]} =
+    assert %Action{state: :unresolved} =
              Store.get(ctx.scope, ctx.inbox.id, id)
 
     Agent.update(ctx.state, &%{&1 | messages: messages})
-    assert {:skip, :manually_restored} = execute(ctx)
+    assert {:existing, ^id, :unresolved} = execute(ctx)
     assert [["message-1", "message-2"]] == Agent.get(ctx.state, & &1.calls)
   end
 
@@ -161,10 +160,55 @@ defmodule EmailJanitor.ExecutorTest do
     assert {:unresolved, id} = execute(ctx, mode: :error_without_apply)
 
     assert {:error, :incomplete_history} =
-             Store.reconcile(ctx.scope, ctx.inbox.id, id, %{complete?: false, events: []})
+             Store.reconcile(ctx.scope, ctx.inbox.id, id, %{
+               complete?: false,
+               started_at: DateTime.utc_now(),
+               events: []
+             })
 
     assert %Action{state: :unresolved} = Store.get(ctx.scope, ctx.inbox.id, id)
     assert {:existing, _, :unresolved} = execute(ctx)
+  end
+
+  test "ordinary transport timeout cannot use stale or empty history to replay", ctx do
+    assert {:unresolved, id} = execute(ctx, mode: :timeout_after_apply)
+    history = %{complete?: true, started_at: DateTime.add(DateTime.utc_now(), -3600), events: []}
+
+    assert {:error, :fresh_history_required} =
+             Store.reconcile(ctx.scope, ctx.inbox.id, id, history)
+
+    assert {:error, :dispatch_outcome_unknown} =
+             Store.reconcile(ctx.scope, ctx.inbox.id, id, %{
+               history
+               | started_at: DateTime.utc_now()
+             })
+
+    Agent.update(ctx.state, &%{&1 | messages: [message()]})
+    assert {:existing, ^id, :unresolved} = execute(ctx)
+    assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "caller transactions cannot hide a dispatched intent from crash recovery", ctx do
+    assert {:ok, :checked} =
+             TestRepo.transaction(fn ->
+               assert {:error, :outer_transaction} = execute(ctx)
+
+               assert {:error, :outer_transaction} =
+                        Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100")
+
+               :checked
+             end)
+
+    assert [] == Agent.get(ctx.state, & &1.calls)
+
+    {:ok, {:created, action}} = Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100")
+
+    assert {:ok, {:error, :outer_transaction}} =
+             TestRepo.transaction(fn ->
+               Store.begin_dispatch(ctx.scope, ctx.inbox.id, action.id, action.owner_token)
+             end)
+
+    assert %Action{dispatch_started_at: nil} = Store.get(ctx.scope, ctx.inbox.id, action.id)
   end
 
   test "reconciliation cannot cancel a mutation still in flight", ctx do
