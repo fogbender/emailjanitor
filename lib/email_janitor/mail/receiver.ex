@@ -8,7 +8,7 @@ defmodule EmailJanitor.Mail.Receiver do
     [
       job(:receipt_intake, fn _ -> receive_once(config) end, 45_000),
       job(:incoming_processing, fn _ -> process_once(config) end, 40_000),
-      job(:authenticated_feedback, fn _ -> feedback_once(config) end, 950_000),
+      job(:authenticated_feedback, fn _ -> feedback_once(config) end, 1_100_000),
       job(:spool_cleanup, fn marker -> sweep(config, marker) end, 1_100_000),
       job(:orphan_cleanup, fn marker -> sweep_orphans(config, marker) end, 1_100_000)
     ]
