@@ -185,13 +185,15 @@ defmodule EmailJanitor.Store do
         now = clock(scope)
 
         next = if is_nil(action.dispatch_started_at), do: :cancelled, else: :unresolved
+        dispatched = next == :unresolved
 
         {count, _} =
           scope.repo.update_all(
             from(a in Action,
               where:
                 a.id == ^id and a.inbox_id == ^inbox_id and a.state == :intent and
-                  a.owner_token == ^action.owner_token
+                  a.owner_token == ^action.owner_token and
+                  (^dispatched or is_nil(a.dispatch_started_at))
             ),
             [set: [state: next, recovered_at: now, updated_at: now]],
             prefix: scope.prefix

@@ -267,6 +267,72 @@ defmodule EmailJanitor.RecoveryTest do
     end
   end
 
+  test "recover itself waits for a real dispatch fence row lock", ctx do
+    {pid, monitor, action} =
+      owner(ctx, fn action, parent ->
+        receive do
+          :dispatch ->
+            :ok = Store.begin_dispatch(ctx.scope, ctx.box.id, action.id, action.owner_token)
+            send(parent, {:dispatched, self()})
+            Process.exit(self(), :kill)
+        end
+      end)
+
+    handler = {__MODULE__, Ecto.UUID.generate()}
+    prefix = TestRepo.config()[:telemetry_prefix] || [:email_janitor, :test_repo]
+
+    :ok =
+      :telemetry.attach(handler, prefix ++ [:query], &__MODULE__.pause_fence_read/4, %{
+        pid: pid,
+        parent: self()
+      })
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+      Process.exit(pid, :kill)
+    end)
+
+    send(pid, :dispatch)
+    assert_receive {:fence_row_held, ^pid}, 5_000
+
+    parent = self()
+
+    {recovery, recovery_monitor} =
+      spawn_monitor(fn ->
+        result = database(fn -> Store.recover(ctx.scope, ctx.box.id, action.id) end)
+        send(parent, {:recovery_result, result})
+      end)
+
+    on_exit(fn -> Process.exit(recovery, :kill) end)
+    assert wait_for_dispatch_lock(ctx)
+    refute_received {:recovery_result, _}
+    send(pid, :release_fence)
+    assert_receive {:dispatched, ^pid}, 5_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, 5_000
+    assert_receive {:recovery_result, result}, 5_000
+    assert_receive {:DOWN, ^recovery_monitor, :process, ^recovery, :normal}, 5_000
+
+    result =
+      if result == {:error, :owner_not_proven_dead},
+        do: database(fn -> Store.recover(ctx.scope, ctx.box.id, action.id) end),
+        else: result
+
+    assert {:ok, {:unresolved, %Action{dispatch_started_at: %DateTime{}}}} = result
+  end
+
+  def pause_fence_read(_, _, metadata, context) do
+    if self() == context.pid and String.contains?(metadata.query, "FOR UPDATE") and
+         String.contains?(metadata.query, "actions") do
+      send(context.parent, {:fence_row_held, self()})
+
+      receive do
+        :release_fence -> :ok
+      after
+        5_000 -> :ok
+      end
+    end
+  end
+
   test "application and restoration after an executor crash settle without another Gmail mutation",
        ctx do
     {pid, monitor, action} =
