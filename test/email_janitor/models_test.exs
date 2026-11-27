@@ -315,16 +315,25 @@ defmodule EmailJanitor.ModelsTest do
   end
 
   test "model dispatch fails closed when a raw HTTP exporter or SDK debug mode is enabled" do
-    Req.Test.stub(__MODULE__, fn _ -> flunk("Unsafe observer setup must not dispatch") end)
+    requester = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(requester, :unsafe_dispatch)
+      Req.Test.transport_error(conn, :econnrefused)
+    end)
+
     id = "janitor-test-finch-exporter"
+    on_exit(fn -> :telemetry.detach(id) end)
     :ok = :telemetry.attach(id, [:finch, :queue, :start], fn _, _, _, _ -> :ok end, nil)
     assert {:error, :model_unavailable} = run(:azure)
+    refute_receive :unsafe_dispatch, 0
     :ok = :telemetry.detach(id)
 
     previous = Application.get_env(:req_llm, :debug)
     Application.put_env(:req_llm, :debug, true)
     on_exit(fn -> Application.put_env(:req_llm, :debug, previous) end)
     assert {:error, :model_unavailable} = run(:azure)
+    refute_receive :unsafe_dispatch, 0
   end
 
   test "an out-of-enum model response is rejected" do
