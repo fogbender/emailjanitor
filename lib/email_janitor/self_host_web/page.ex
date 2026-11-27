@@ -74,9 +74,10 @@ defmodule EmailJanitor.SelfHostWeb.Page do
       "<p>Correct a cleanup, make an exception, or ask what happened.</p>",
       if(a.reply, do: ["<div class=\"reply\" role=\"status\">", h(a.reply), "</div>"], else: []),
       retry(a),
-      if(Enum.any?(a.inboxes, &(&1.state != :disconnected)),
+      if(Enum.any?(a.inboxes, &(&1.state in [:pending, :active])),
         do: chat_form(a),
-        else: "<p><a href=\"/accounts\">Connect a Google account</a> to get started.</p>"
+        else:
+          "<p><a href=\"/accounts\">Connect or reconnect a Google account</a> to get started.</p>"
       )
     ]
 
@@ -100,7 +101,7 @@ defmodule EmailJanitor.SelfHostWeb.Page do
       "<label for=\"inbox\">Inbox</label><select id=\"inbox\" name=\"inbox_id\" required>",
       "<option value=\"\">Choose an inbox</option>",
       a.inboxes
-      |> Enum.reject(&(&1.state == :disconnected))
+      |> Enum.filter(&(&1.state in [:pending, :active]))
       |> Enum.map(fn row ->
         [
           "<option value=\"",
@@ -113,7 +114,9 @@ defmodule EmailJanitor.SelfHostWeb.Page do
         ]
       end),
       "</select><label for=\"message\">Your message</label>",
-      "<textarea id=\"message\" name=\"message\" maxlength=\"16000\" rows=\"4\" required placeholder=\"Bob’s email should have stayed in my inbox.\"></textarea>",
+      "<textarea id=\"message\" name=\"message\" maxlength=\"16000\" rows=\"4\" required placeholder=\"Bob’s email should have stayed in my inbox.\">",
+      h(a.message),
+      "</textarea>",
       "<button type=\"submit\">Send to Janitor</button></form>"
     ]
 

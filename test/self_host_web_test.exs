@@ -14,6 +14,7 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
 
     keys = [
       :self_host_adapter,
+      :self_host_oauth,
       :browser_test_scope,
       :browser_test_observer,
       :browser_test_inboxes,
@@ -23,6 +24,18 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
 
     old = Map.new(keys, &{&1, Application.fetch_env(:email_janitor, &1)})
     Application.put_env(:email_janitor, :self_host_adapter, TestHost)
+
+    Application.put_env(
+      :email_janitor,
+      :self_host_oauth,
+      {EmailJanitor.SelfHostWeb.TestOAuth,
+       %EmailJanitor.Google.OAuth.Result{
+         subject: "owner-subject",
+         email: "owner@acme.com",
+         token: Content.new("synthetic")
+       }}
+    )
+
     Application.put_env(:email_janitor, :browser_test_scope, scope)
     Application.put_env(:email_janitor, :browser_test_observer, self())
     {:ok, box} = Inbox.new("browser-inbox", "owner@acme.com")
@@ -134,7 +147,7 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
           message: "Done."
         })
 
-      assert html_response(conn, 400) =~ "Choose an inbox"
+      assert html_response(conn, 400) =~ "Choose a connected inbox"
     end
 
     refute_receive {:respond, _, _, _, _, _}
@@ -221,5 +234,132 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
 
     assert redirected_to(conn) == "/"
     assert redirected_to(conn |> recycle() |> get("/accounts")) == "/"
+  end
+
+  test "reauthorization accounts are excluded and a remaining usable account is selected", t do
+    {:ok, other} = Inbox.new("reauth-inbox", "other@example.org")
+
+    Application.put_env(:email_janitor, :browser_test_inboxes, [
+      %{inbox: other, state: :reauthorization_required, timezone: "Etc/UTC"},
+      %{inbox: t.box, state: :active, timezone: "Etc/UTC"}
+    ])
+
+    page = get(signed_in(), "/chat")
+    assert html_response(page, 200) =~ "value=\"#{t.box.id}\" selected"
+    refute page.resp_body =~ "value=\"reauth-inbox\""
+
+    conn =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> post("/chat", %{
+        _csrf_token: csrf(page),
+        inbox_id: other.id,
+        request_id: Ecto.UUID.generate(),
+        message: "Keep invoices."
+      })
+
+    assert html_response(conn, 400) =~ "Keep invoices."
+    refute_receive {:respond, _, _, _, _, _}
+
+    Application.put_env(:email_janitor, :browser_test_inboxes, [
+      %{inbox: other, state: :reauthorization_required, timezone: "Etc/UTC"}
+    ])
+
+    page = get(signed_in(), "/chat")
+    assert html_response(page, 200) =~ "Connect or reconnect"
+    refute page.resp_body =~ "<textarea"
+  end
+
+  test "oversized Unicode messages get a clear error and stay in the composer", t do
+    page = get(signed_in(), "/chat")
+    text = "PRIVATE_UNICODE_SENTINEL " <> String.duplicate("漢", 6_000)
+
+    conn =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> post("/chat", %{
+        _csrf_token: csrf(page),
+        inbox_id: t.box.id,
+        request_id: Ecto.UUID.generate(),
+        message: text
+      })
+
+    body = html_response(conn, 400)
+    assert body =~ "at most 16,000 UTF-8 bytes"
+    assert body =~ text
+    assert get_resp_header(conn, "cache-control") == ["no-store"]
+    refute_receive {:respond, _, _, _, _, _}
+  end
+
+  test "form line breaks are normalized before enforcing the UTF-8 byte limit", t do
+    page = get(signed_in(), "/chat")
+    text = String.duplicate("漢", 5_000) <> String.duplicate("\r\n", 1_000)
+
+    conn =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> post("/chat", %{
+        _csrf_token: csrf(page),
+        inbox_id: t.box.id,
+        request_id: Ecto.UUID.generate(),
+        message: text
+      })
+
+    assert html_response(conn, 200) =~ "Instruction updated"
+    assert_receive {:respond, _, _, _, _, content}
+    assert byte_size(Content.read(content)) == 16_000
+    refute Content.read(content) =~ "\r"
+  end
+
+  test "a blocked client cannot consume another visitor's sign-in allowance", _ do
+    page = get(browser(), "/")
+
+    for _ <- 1..3 do
+      conn =
+        page
+        |> recycle()
+        |> put_private(:plug_skip_csrf_protection, false)
+        |> put_req_header("x-real-ip", "203.0.113.10")
+        |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+      assert response(conn, 302)
+    end
+
+    blocked =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> put_req_header("x-real-ip", "203.0.113.10")
+      |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+    assert html_response(blocked, 429) =~ "Too many sign-in attempts"
+
+    allowed =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> put_req_header("x-real-ip", "203.0.113.11")
+      |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+    assert response(allowed, 302)
+  end
+
+  test "non-loopback peers cannot bypass their cap with forged proxy headers", _ do
+    page = get(browser(), "/")
+
+    for n <- 1..4 do
+      conn =
+        page
+        |> recycle()
+        |> Map.put(:remote_ip, {198, 51, 100, 12})
+        |> put_private(:plug_skip_csrf_protection, false)
+        |> put_req_header("x-real-ip", "203.0.113.#{n}")
+        |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+      assert conn.status == if(n <= 3, do: 302, else: 429)
+    end
   end
 end

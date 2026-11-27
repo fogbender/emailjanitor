@@ -19,6 +19,8 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     @derive {Inspect, only: [:id, :mode, :expires_at]}
     schema "selfhost_web_attempts" do
       field(:browser_hash, :binary)
+      field(:client_hash, :binary)
+      field(:network_hash, :binary)
       field(:session_hash, :binary)
       field(:subject, :string)
       field(:mode, Ecto.Enum, values: [:sign_in, :connect])
@@ -100,11 +102,12 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     _ -> {:error, :session_unavailable}
   end
 
-  def begin(mode, session_token, timezone, now \\ DateTime.utc_now())
+  def begin(mode, session_token, timezone, now \\ DateTime.utc_now(), client \\ "unspecified")
       when mode in [:sign_in, :connect] do
     with {:ok, subject, session_hash} <- initiator(session_token, now),
          true <- mode == :sign_in or is_binary(subject),
          true <- is_binary(timezone) and byte_size(timezone) <= 128,
+         true <- is_binary(client) and byte_size(client) in 1..128,
          {:ok, _} <- DateTime.shift_zone(now, timezone, Tzdata.TimeZoneDatabase),
          {adapter, config} = gateway(),
          {:ok, %{url: url, session_params: session}} <- adapter.authorize_url(config, mode),
@@ -114,22 +117,29 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
       browser_token = random()
 
       with {:ok, ciphertext} <- host().seal("browser-oauth", id, serialized) do
-        scope.repo.insert!(
-          %Attempt{
-            id: id,
-            browser_hash: hash(browser_token),
-            subject: subject,
-            session_hash: session_hash,
-            mode: mode,
-            timezone: timezone,
-            ciphertext: ciphertext,
-            expires_at: DateTime.add(now, 600)
-          },
-          options(scope)
-        )
+        result =
+          insert_attempt(
+            scope,
+            %Attempt{
+              id: id,
+              browser_hash: hash(browser_token),
+              client_hash: rate_hash("client", client),
+              network_hash: rate_hash("network", network(client)),
+              subject: subject,
+              session_hash: session_hash,
+              mode: mode,
+              timezone: timezone,
+              ciphertext: ciphertext,
+              expires_at: DateTime.add(now, 600)
+            },
+            now
+          )
 
-        purge(now)
-        {:ok, %{url: url, browser_token: browser_token}}
+        case result do
+          {:ok, _} -> {:ok, %{url: url, browser_token: browser_token}}
+          {:error, :too_many_attempts} = error -> error
+          _ -> {:error, :google_unavailable}
+        end
       end
     else
       _ -> {:error, :google_unavailable}
@@ -165,6 +175,56 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     scope.repo.delete_all(from(a in Attempt, where: a.expires_at <= ^now), options(scope))
     scope.repo.delete_all(from(s in Session, where: s.expires_at <= ^now), options(scope))
     :ok
+  end
+
+  defp insert_attempt(scope, attempt, now) do
+    scope.repo.transaction(
+      fn ->
+        # Bound unauthenticated state across HTTP requests and process restarts.
+        # SDK URL creation and encryption happened before this short DB section.
+        Ecto.Adapters.SQL.query!(
+          scope.repo,
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          ["selfhost-oauth-attempts:" <> scope.prefix],
+          log: false,
+          telemetry_event: nil
+        )
+
+        purge(now)
+
+        if is_nil(attempt.subject) do
+          anonymous = from(a in Attempt, where: is_nil(a.subject) and a.expires_at > ^now)
+          client = from(a in anonymous, where: a.client_hash == ^attempt.client_hash)
+          network = from(a in anonymous, where: a.network_hash == ^attempt.network_hash)
+
+          if scope.repo.aggregate(client, :count, options(scope)) >= 3 or
+               scope.repo.aggregate(network, :count, options(scope)) >= 20,
+             do: scope.repo.rollback(:too_many_attempts)
+
+          # Bound shared state without making a full pool reject every new
+          # visitor. Completed/verified owner flows are never evicted here.
+          if scope.repo.aggregate(anonymous, :count, options(scope)) >= 1_000 do
+            oldest =
+              scope.repo.one(
+                from(a in anonymous,
+                  order_by: [asc: a.expires_at, asc: a.id],
+                  limit: 1,
+                  select: a.id
+                ),
+                options(scope)
+              )
+
+            scope.repo.delete_all(
+              from(a in Attempt, where: a.id == ^oldest and is_nil(a.subject)),
+              options(scope)
+            )
+          end
+        end
+
+        scope.repo.insert!(attempt, options(scope))
+      end,
+      options(scope)
+    )
   end
 
   defp finish(%{mode: :sign_in}, result), do: host().authorize_owner(result)
@@ -210,6 +270,23 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
 
   defp random, do: :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
   defp hash(token), do: :crypto.hash(:sha256, token)
+
+  defp rate_hash(kind, value),
+    do:
+      :crypto.mac(
+        :hmac,
+        :sha256,
+        Content.read(host().config().web_secret),
+        "selfhost-oauth-" <> kind <> ":" <> value
+      )
+
+  defp network(client) do
+    case :inet.parse_address(String.to_charlist(client)) do
+      {:ok, {a, b, c, _}} -> to_string(:inet.ntoa({a, b, c, 0})) <> "/24"
+      {:ok, {a, b, c, _, _, _, _, _}} -> to_string(:inet.ntoa({a, b, c, 0, 0, 0, 0, 0})) <> "/48"
+      _ -> client
+    end
+  end
 
   defp digest(token) when is_binary(token) and byte_size(token) == 43 do
     if Regex.match?(~r/\A[A-Za-z0-9_-]{43}\z/, token),

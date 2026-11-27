@@ -35,6 +35,15 @@ try {
   assert.ok(cookie.secure&&cookie.httpOnly);
   await page.getByRole('link',{name:'Chat',exact:true}).click();
   assert.equal(await page.getByLabel('Inbox').inputValue(),'browser-inbox');
+  const unicode='漢'.repeat(6000);
+  await page.getByLabel('Your message').fill(unicode);
+  assert.equal(await page.getByLabel('Your message').evaluate(field=>field.checkValidity()),false);
+  await page.getByRole('button',{name:'Send to Janitor',exact:true}).click();
+  assert.equal(await page.getByLabel('Your message').inputValue(),unicode);
+  await page.getByLabel('Your message').fill('漢'.repeat(5000)+'\n'.repeat(1000));
+  assert.equal(await page.getByLabel('Your message').evaluate(field=>field.checkValidity()),true);
+  await page.getByRole('button',{name:'Send to Janitor',exact:true}).click();
+  await page.getByRole('status').waitFor();
   await page.getByLabel('Your message').fill('BROWSER_EMAIL_BODY_SENTINEL: Keep invoices.');
   await page.getByRole('button',{name:'Send to Janitor',exact:true}).click();
   await page.getByRole('status').waitFor();

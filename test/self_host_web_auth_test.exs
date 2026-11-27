@@ -155,4 +155,65 @@ defmodule EmailJanitor.SelfHostWeb.AuthTest do
     assert TestRepo.all(Attempt, prefix: t.scope.prefix) == []
     assert TestRepo.all(Session, prefix: t.scope.prefix) == []
   end
+
+  test "anonymous attempts have a durable bounded cap while the owner can still connect", t do
+    for _ <- 1..3, do: assert({:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now))
+    assert {:error, :too_many_attempts} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now)
+    assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 3
+    assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now, "different-client")
+    {:ok, owner} = Auth.issue("owner-subject", nil, t.now)
+    assert {:ok, _} = Auth.begin(:connect, Content.read(owner), "Etc/UTC", t.now)
+    assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", DateTime.add(t.now, 601))
+    assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 1
+  end
+
+  test "coarse network caps stop client rotation without publicly reversible IP hashes", t do
+    for n <- 1..20 do
+      assert {:ok, _} =
+               Auth.begin(
+                 :sign_in,
+                 nil,
+                 "Etc/UTC",
+                 t.now,
+                 "2001:db8:1234:#{Integer.to_string(n, 16)}::"
+               )
+    end
+
+    assert {:error, :too_many_attempts} =
+             Auth.begin(:sign_in, nil, "Etc/UTC", t.now, "2001:db8:1234:ffff::")
+
+    assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now, "2001:db8:5678::")
+    [first | _] = TestRepo.all(Attempt, prefix: t.scope.prefix)
+    refute first.client_hash == :crypto.hash(:sha256, "2001:db8:1234:1::")
+  end
+
+  test "a full anonymous pool admits a new client by expiring one oldest attempt", t do
+    rows =
+      for _ <- 1..1_000 do
+        %{
+          id: Ecto.UUID.generate(),
+          browser_hash: :crypto.strong_rand_bytes(32),
+          client_hash: :crypto.strong_rand_bytes(32),
+          network_hash: :crypto.strong_rand_bytes(32),
+          mode: :sign_in,
+          timezone: "Etc/UTC",
+          ciphertext: <<1>>,
+          expires_at: DateTime.add(t.now, 300)
+        }
+      end
+
+    TestRepo.insert_all(Attempt, rows, prefix: t.scope.prefix)
+    assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now, "203.0.113.12")
+    assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 1_000
+  end
+
+  test "supervised maintenance expires attempts without any subsequent sign-in", t do
+    assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", DateTime.add(t.now, -601))
+    {:ok, session} = Auth.issue("owner-subject", nil, t.now)
+    pid = start_supervised!(EmailJanitor.SelfHostWeb.Maintenance)
+    send(pid, :purge)
+    :sys.get_state(pid)
+    assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 0
+    assert {:ok, "owner-subject"} = Auth.fetch(Content.read(session), t.now)
+  end
 end
