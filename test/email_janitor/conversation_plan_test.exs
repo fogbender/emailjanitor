@@ -264,4 +264,47 @@ defmodule EmailJanitor.ConversationPlanTest do
                [{:subject, Content.new("Re: Please archive invoices. Thanks")}]
              )
   end
+
+  test "common longer identities remain usable and the explicit verbatim header limit stays conservative" do
+    for {instruction, source} <- [
+          {"Keep mail from United States Postal Service Informed Delivery in the inbox.",
+           {:sender,
+            Content.new(
+              "United States Postal Service Informed Delivery <USPSInformeddelivery@email.informeddelivery.usps.com>"
+            )}},
+          {"Always keep Acme Corporation Billing Department mail.",
+           {:sender, Content.new("Acme Corporation Billing Department <billing@acme.example>")}},
+          {"Archive anything titled Your monthly statement is now available.",
+           {:subject, Content.new("Your monthly statement is now available")}}
+        ] do
+      assert {:ok, _} =
+               Plan.parse(
+                 object(%{"preference_target" => "inbox", "instruction" => instruction}),
+                 [],
+                 [source]
+               )
+    end
+
+    long_name = String.duplicate("Extremely long synthetic sender name ", 3)
+
+    assert {:error, :invalid_conversation_plan} =
+             Plan.parse(
+               object(%{
+                 "preference_target" => "inbox",
+                 "instruction" => "Keep mail from " <> long_name
+               }),
+               [],
+               [{:sender, Content.new(long_name <> " <bob@example.org>")}]
+             )
+
+    assert {:ok, _} =
+             Plan.parse(
+               object(%{
+                 "preference_target" => "inbox",
+                 "instruction" => "Keep mail from bob@example.org."
+               }),
+               [],
+               [{:sender, Content.new(long_name <> " <bob@example.org>")}]
+             )
+  end
 end

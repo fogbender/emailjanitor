@@ -46,6 +46,11 @@ without generating a full 15,000-byte scope replacement. Grouped context is
 read-only, so a grouped reference cannot discard independent neighboring rules.
 Sender/subject text and decoded header names also participate in the copied-text
 guard; canonical sender addresses remain usable in preferences.
+Verbatim header phrases of 48 characters or more are conservatively rejected
+inside a new instruction. Use a canonical sender address or a concise semantic
+description for unusually long names/subjects. This copy guard supplements the
+prompt and execution controls; it does not claim to detect every paraphrased or
+split prompt injection.
 These checks supplement the prompt; execution still
 requires the immutable executor safeguards and the host's policy.
 

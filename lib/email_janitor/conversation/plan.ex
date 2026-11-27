@@ -168,25 +168,31 @@ defmodule EmailJanitor.Conversation.Plan do
   end
 
   defp copied_header?(instruction, raw, kind) do
-    # Sender addresses are literal identifiers, including long aliases. Subject
-    # addresses are ordinary subject text and must remain in the comparison.
-    strip_address = fn text ->
-      if kind == :sender,
-        do: String.replace(text, ~r/[^\s<>(),:;"@]+@[a-zA-Z0-9.-]+/u, " "),
-        else: text
-    end
+    addresses =
+      if kind == :sender do
+        case EmailJanitor.Address.parse(raw) do
+          {:ok, values} -> values
+          _ -> []
+        end
+      else
+        []
+      end
 
     clean = fn text ->
-      text |> strip_address.() |> String.replace(~r/[<>(),:;"]/u, " ") |> normalize()
+      Enum.reduce(addresses, text, fn address, value -> String.replace(value, address, " ") end)
+      |> String.replace(~r/[<>(),:;"]/u, " ")
+      |> normalize()
     end
 
     identifier = clean.(raw)
     command = clean.(instruction)
-
+    # Preserve ordinary names and subject identifiers. Longer verbatim header
+    # phrases stay out of instructions; the teacher uses a canonical address or
+    # a concise semantic description instead.
     (identifier != "" and identifier == command) or
       identifier
       |> String.graphemes()
-      |> Enum.chunk_every(32, 1, :discard)
+      |> Enum.chunk_every(48, 1, :discard)
       |> Enum.any?(fn chunk -> String.contains?(command, Enum.join(chunk)) end)
   end
 
