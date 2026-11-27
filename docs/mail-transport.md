@@ -98,6 +98,9 @@ metadata and an immediate purge, returning `{:error, :mail_too_large}` to the
 host instead of retrying it as an outage. The host can use the stable receipt ID
 to issue one authenticated, connected-inbox response explaining the cap. Read
 the typed result with `Spool.get/2`; never cache the oversized body as a workaround.
+Repeated processing retains the typed `:mail_too_large` result while the metadata
+row exists, so a host crash before its cap response can recover that decision.
+Deduplicate that response independently by the stable receipt ID.
 
 Every accepted receipt expires one hour after SES received it; failure/retries
 never extend the deadline. Run `Spool.sweep/2` at least minutely to purge expired

@@ -113,7 +113,12 @@ defmodule EmailJanitor.Mail.Spool do
         end
 
       _ ->
-        purge(scope, id, config)
+        result = purge(scope, id, config)
+
+        case get(scope, id) do
+          %Incoming{outcome: :too_large} -> {:error, :mail_too_large}
+          _ -> result
+        end
     end
   end
 

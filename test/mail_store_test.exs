@@ -453,7 +453,10 @@ defmodule EmailJanitor.MailStoreTest do
     assert_received {:method, "DELETE"}
     refute_received {:method, "GET"}
     assert %{state: :deleted, outcome: :too_large} = Spool.get(ctx.scope, row.id)
-    assert :ok = Spool.process(ctx.scope, row.id, config, fn _, _ -> flunk("terminal retry") end)
+
+    assert {:error, :mail_too_large} =
+             Spool.process(ctx.scope, row.id, config, fn _, _ -> flunk("terminal retry") end)
+
     refute_received {:method, _}
   end
 
