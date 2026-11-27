@@ -113,8 +113,9 @@ defmodule EmailJanitor.Google.OAuth do
              |> Keyword.put(:session_params, Map.from_struct(session))
              |> OIDC.callback(Map.take(params, ~w(state code error)), __MODULE__),
            {:ok, token} <- sanitize_token(raw),
-           true <- session.mode == :sign_in or @gmail in String.split(token["scope"]),
            true <- session.mode == :sign_in or valid_credential?(token["refresh_token"]) do
+        # A verified offline grant still needs host custody if Gmail was declined.
+        # Hosts capture it before validating scopes and deciding activation.
         {:ok, %Result{subject: subject, email: email, token: Content.new(Jason.encode!(token))}}
       else
         _ -> {:error, :authorization_failed}

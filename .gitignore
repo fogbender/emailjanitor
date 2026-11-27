@@ -4,6 +4,7 @@
 /.direnv/
 /result
 /cover/
+/tmp/
 /erl_crash.dump
 /.env
 /.env.*

@@ -172,7 +172,8 @@ defmodule EmailJanitor.SelfHost.Store do
                   {:refused, :revocation_pending}
 
                 not valid ->
-                  if binding.state not in [:pending, :active] or is_nil(binding.token_ciphertext) do
+                  if binding.state in [:disconnected, :revoking, :revocation_required] or
+                       (binding.state == :pending and is_nil(binding.token_ciphertext)) do
                     state = Revocations.stage!(scope, binding)
 
                     scope.repo.insert_or_update!(

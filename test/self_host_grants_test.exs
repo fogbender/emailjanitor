@@ -532,25 +532,109 @@ defmodule EmailJanitor.SelfHostGrantsTest do
 
   test "valid SDK credentials with declined Gmail scope are retained for retirement, never activated",
        ctx do
-    basic = %{
-      result("B")
-      | token:
-          Content.new(
-            Jason.encode!(
-              Map.put(
-                Jason.decode!(Content.read(result("B").token)),
-                "scope",
-                "openid email"
-              )
-            )
-          )
+    {:ok, %{session_params: session}} = OAuth.authorize_url(ctx.config.google_oauth, :connect)
+    key = :public_key.generate_key({:rsa, 2048, 65_537})
+    private = :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, key)])
+
+    public = %{
+      "kty" => "RSA",
+      "kid" => "declined-key",
+      "alg" => "RS256",
+      "use" => "sig",
+      "n" => Base.url_encode64(:binary.encode_unsigned(elem(key, 2)), padding: false),
+      "e" => Base.url_encode64(:binary.encode_unsigned(elem(key, 3)), padding: false)
     }
+
+    {:ok, id_token} =
+      Assent.JWTAdapter.sign(
+        %{
+          "iss" => "https://accounts.google.com",
+          "aud" => "synthetic-client",
+          "sub" => ctx.first.subject,
+          "email" => ctx.first.email,
+          "email_verified" => true,
+          "exp" => System.system_time(:second) + 300,
+          "iat" => System.system_time(:second),
+          "nonce" => session.nonce
+        },
+        "RS256",
+        private,
+        json_library: Jason,
+        private_key_id: "declined-key"
+      )
+
+    Req.Test.stub(:grant_refresh, fn conn ->
+      case {conn.method, conn.host, conn.request_path} do
+        {"POST", "oauth2.googleapis.com", "/token"} ->
+          Req.Test.json(conn, %{
+            "id_token" => id_token,
+            "access_token" => "PRIVATE_ACCESS_B",
+            "refresh_token" => "PRIVATE_REFRESH_B",
+            "expires_in" => 3600,
+            "token_type" => "Bearer",
+            "scope" => "openid email"
+          })
+
+        {"GET", "www.googleapis.com", "/oauth2/v3/certs"} ->
+          Req.Test.json(conn, %{"keys" => [public]})
+
+        _ ->
+          flunk("Unexpected OAuth endpoint")
+      end
+    end)
+
+    assert {:ok, basic} =
+             OAuth.callback(ctx.config.google_oauth, session, %{
+               "state" => session.state,
+               "code" => "synthetic-code"
+             })
 
     assert {:error, :invalid_connection} = SelfHost.connect(ctx.owner, basic, "Etc/UTC")
     assert tokens(ctx) == ~w(PRIVATE_REFRESH_A PRIVATE_REFRESH_B)
     assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
     assert retire(ctx, "A") == :retirement_continues
     assert retire(ctx, "B") == :revoked
+  end
+
+  test "a refused reconnect preserves reauthorization intent and dormant grants until explicit disconnect",
+       ctx do
+    {:ok, _} = SelfHost.connect(ctx.owner, result("B", 30), "Etc/UTC")
+    before = host_binding(ctx)
+
+    Req.Test.stub(:grant_refresh, fn conn ->
+      conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{error: "invalid_grant"})
+    end)
+
+    assert {:error, :reauthorization_required} = Credentials.token({ctx.box.id, before.epoch})
+    assert tokens(ctx) == ["PRIVATE_REFRESH_A"]
+
+    assert {:error, :invalid_connection} =
+             SelfHost.connect(ctx.owner, result("C"), "Invalid/Timezone")
+
+    declined = %{
+      result("D")
+      | token:
+          Content.new(
+            Jason.encode!(
+              Map.put(Jason.decode!(Content.read(result("D").token)), "scope", "openid email")
+            )
+          )
+    }
+
+    assert {:error, :invalid_connection} = SelfHost.connect(ctx.owner, declined, "Etc/UTC")
+    assert host_binding(ctx).state == :reauthorization_required
+    assert tokens(ctx) == ~w(PRIVATE_REFRESH_A PRIVATE_REFRESH_C PRIVATE_REFRESH_D)
+    assert Repo.get(Revocation, ctx.box.id, prefix: ctx.scope.prefix) == nil
+
+    assert {:ok, :idle} =
+             Revocations.tick(ctx.config.google_oauth,
+               revoke: fn _, _ -> flunk("refused reconnect is not explicit retirement") end
+             )
+
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert retire(ctx, "A") == :retirement_continues
+    assert retire(ctx, "C") == :retirement_continues
+    assert retire(ctx, "D") == :revoked
   end
 
   test "a rejected legacy mailbox association retires the captured grant without adopting historical authority",

@@ -267,19 +267,22 @@ defmodule EmailJanitor.GoogleOAuthTest do
     end
   end
 
-  test "connect requires Gmail scope and durable refresh consent while sign-in only needs identity",
+  test "connect returns declined-scope refresh grants for host custody and sign-in only needs identity",
        context do
     connect = session(context.config, :connect)
 
-    for raw <- [
-          Map.put(token(context, connect), "scope", "openid email"),
-          Map.delete(token(context, connect), "refresh_token")
-        ] do
-      fixture(context, raw)
+    fixture(context, Map.put(token(context, connect), "scope", "openid email"))
 
-      assert {:error, :authorization_failed} =
-               OAuth.callback(context.config, connect, callback_params(connect))
-    end
+    assert {:ok, %Result{token: declined}} =
+             OAuth.callback(context.config, connect, callback_params(connect))
+
+    assert Jason.decode!(Content.read(declined))["refresh_token"] == "REFRESH_TOKEN_SENTINEL"
+    assert Jason.decode!(Content.read(declined))["scope"] == "openid email"
+
+    fixture(context, Map.delete(token(context, connect), "refresh_token"))
+
+    assert {:error, :authorization_failed} =
+             OAuth.callback(context.config, connect, callback_params(connect))
 
     signin = session(context.config)
 
