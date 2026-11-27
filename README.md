@@ -651,5 +651,10 @@ Hosts that persist worker candidates must also retire the same exact IDs from
 arrival provenance. Repeated exact retirement is idempotent.
 Explicit rechecks and changed manual selections atomically fence older reviews;
 ordinary scheduler discovery does not refresh that authority.
+Every accepted explicit `queue_manual` call fences its exact IDs and advances
+the request version, including new rows and unchanged selections. Trusted host
+discovery or replay must pass `refresh_authority: false`; structural selection
+repair then preserves the original authority age. Explicit repair still uses
+`queue_recheck` to reset paused or capped work.
 The 30s mutation watchdog ends after the provider call; positive proof and
 reporting use the remaining overall 60s owner budget, including database waits.
