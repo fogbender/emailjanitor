@@ -49,8 +49,10 @@ Connection lifecycle changes serialize without holding provider calls under SQL.
 Explicit disconnect clears encrypted credentials and increments the epoch and
 instruction guard. Ordinary refresh/reconsent preserves the epoch/cursor;
 reauthorization after a revoked grant keeps the newly fenced epoch. A durable `reset_baseline`
-marker distinguishes deliberate reconnect from reauthorization and remains set
-until the worker's baseline activation transaction commits.
+marker distinguishes deliberate reconnect from reauthorization and records the
+old checkpoint generation. Activation requires a different, nonnil checkpoint
+generation in the same transaction; a mistaken resume of the old generation is
+rejected. The marker clears only when the worker's baseline transaction commits.
 Provider refresh uses the shared maintained OAuth SDK outside SQL and publishes with an exact
 credential-version check: a late response cannot revive a disconnected grant or
 overwrite newer consent. Revoked grants clear credentials, require reauthorization

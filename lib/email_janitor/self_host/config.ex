@@ -66,11 +66,21 @@ defmodule EmailJanitor.SelfHost.Config do
   defp public_url(value) when is_binary(value) do
     case URI.new(value) do
       {:ok,
-       %URI{scheme: scheme, host: host, path: path, userinfo: nil, query: nil, fragment: nil}}
-      when is_binary(host) and host != "" and path in [nil, "/"] ->
-        if scheme == "https" or (scheme == "http" and host in ["localhost", "127.0.0.1", "::1"]),
-          do: {:ok, String.trim_trailing(value, "/")},
-          else: :error
+       %URI{
+         scheme: scheme,
+         host: host,
+         port: port,
+         path: path,
+         userinfo: nil,
+         query: nil,
+         fragment: nil
+       }}
+      when is_binary(host) and host != "" and path in [nil, "/"] and port in 1..65_535 ->
+        if not Regex.match?(~r/:(?:0[0-9]*|)\/?\z/, value) and
+             (scheme == "https" or
+                (scheme == "http" and host in ["localhost", "127.0.0.1", "::1"])),
+           do: {:ok, String.trim_trailing(value, "/")},
+           else: :error
 
       _ ->
         :error

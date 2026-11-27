@@ -229,9 +229,80 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert reconnected.epoch > before.epoch
     assert {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
     assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
-    assert :ok = Store.activate({box.id, reconnected.epoch})
-    refute Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
-    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).state == :active
+    assert {:error, :baseline_activation_required} = Store.activate({box.id, reconnected.epoch})
+    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
+  end
+
+  test "reconnect checkpoint and binding activation recover atomically after a failed callback",
+       ctx do
+    alias EmailJanitor.Gmail.Ingestion
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    first = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    watch = %{history_id: "100", expires_at: DateTime.add(DateTime.utc_now(), 3600)}
+
+    assert {:ok, original} =
+             Ingestion.baseline(ctx.scope, box, watch,
+               on_baseline: fn _ -> Store.activate({box.id, first.epoch}) end
+             )
+
+    :ok = SelfHost.disconnect(owner, box.id)
+    {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    fresh = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    ref = {box.id, fresh.epoch}
+    {:ok, version} = EmailJanitor.Store.instruction_version(ctx.scope, box.id)
+
+    assert {:error, :activation_failed} =
+             Ingestion.activate(ctx.scope, box, original.generation,
+               expected_instruction_version: version,
+               on_baseline: fn _ -> Store.activate(ref) end
+             )
+
+    assert %{state: :pending, reset_baseline: true, reset_generation: generation} =
+             Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+
+    assert generation == original.generation
+    new_watch = %{watch | history_id: "200"}
+
+    assert {:error, :activation_failed} =
+             Ingestion.reconnect(ctx.scope, box, original.generation, new_watch,
+               expected_instruction_version: version,
+               on_baseline: fn _ ->
+                 :ok = Store.activate(ref)
+                 raise "simulated process failure before commit"
+               end
+             )
+
+    assert {:ok, checkpoint} = Ingestion.checkpoint(ctx.scope, box.id)
+    assert checkpoint.generation == original.generation
+    assert checkpoint.cursor == "100"
+
+    assert %{state: :pending, reset_baseline: true} =
+             Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+
+    assert {:ok, next} =
+             Ingestion.reconnect(ctx.scope, box, original.generation, new_watch,
+               expected_instruction_version: version,
+               on_baseline: fn _ -> Store.activate(ref) end
+             )
+
+    refute next.generation == original.generation
+    assert next.cursor == "200"
+
+    assert %{state: :active, reset_baseline: false} =
+             Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+
+    assert {:ok, :ok} = Ingestion.record_signal(ctx.scope, box, "201")
+
+    assert {:ok, resumed} =
+             Ingestion.activate(ctx.scope, box, next.generation,
+               expected_instruction_version: version,
+               on_baseline: fn _ -> Store.activate(ref) end
+             )
+
+    assert resumed.generation == next.generation
+    assert resumed.cursor == "200"
+    assert resumed.requested_id == "201"
   end
 
   test "late refresh cannot overwrite newer consent even when the connection epoch is preserved",
@@ -480,6 +551,114 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert kept.baseline_id == checkpoint.baseline_id
     assert kept.generation == checkpoint.generation
     assert {:ok, :ok} = EmailJanitor.Gmail.Ingestion.record_signal(ctx.scope, renamed, "124")
+  end
+
+  test "replacing a revoked subject also fences its recorded old generation", ctx do
+    alias EmailJanitor.Gmail.Ingestion
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    first_result = result("work-one", "work@example.com")
+    expiring = with_token(first_result, %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, first} = SelfHost.connect(owner, expiring, "Etc/UTC")
+    binding = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+
+    assert {:ok, original} =
+             Ingestion.baseline(
+               ctx.scope,
+               first,
+               %{history_id: "100", expires_at: DateTime.add(DateTime.utc_now(), 3600)},
+               on_baseline: fn _ -> Store.activate({first.id, binding.epoch}) end
+             )
+
+    refresh_fixture(ctx, fn conn ->
+      conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    assert {:error, :reauthorization_required} = Credentials.token({first.id, binding.epoch})
+    {:ok, _other} = SelfHost.connect(owner, result("work-two", "work@example.com"), "Etc/UTC")
+
+    assert %{state: :disconnected, reset_baseline: true, reset_generation: generation} =
+             Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+
+    assert generation == original.generation
+    {:ok, ^first} = SelfHost.connect(owner, first_result, "Etc/UTC")
+    rebound = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+
+    assert {:error, :activation_failed} =
+             Ingestion.activate(ctx.scope, first, original.generation,
+               on_baseline: fn _ -> Store.activate({first.id, rebound.epoch}) end
+             )
+
+    assert %{state: :pending, reset_baseline: true} =
+             Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+  end
+
+  test "self delivery retains verified historical address evidence only for the same subject",
+       ctx do
+    alias EmailJanitor.Mail.{Outbox, Outgoing}
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, first} = SelfHost.connect(owner, result("work-one", "old-work@example.com"), "Etc/UTC")
+
+    {:ok, outgoing} =
+      Outbox.enqueue(
+        ctx.scope,
+        first.id,
+        :assistant,
+        [Ecto.UUID.generate()],
+        Ecto.UUID.generate()
+      )
+
+    Repo.update!(
+      Ecto.Changeset.change(outgoing,
+        state: :sent,
+        provider_id: "historical-proof",
+        sender: "janitor@janitor.example.com",
+        recipient: first.address
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    headers = [
+      {"From", "janitor@janitor.example.com"},
+      {"Message-ID", "<historical-proof@email.amazonses.com>"}
+    ]
+
+    assert {:ok, true} = Store.self_delivery?(first.id, "janitor@janitor.example.com", headers)
+
+    {:ok, renamed} =
+      SelfHost.connect(owner, result("work-one", "new-work@example.com"), "Etc/UTC")
+
+    assert renamed.id == first.id
+
+    assert {:ok, false} =
+             Outbox.self_delivery?(ctx.scope, first.id, "janitor@janitor.example.com", headers)
+
+    assert {:ok, true} = Store.self_delivery?(first.id, "janitor@janitor.example.com", headers)
+
+    {:ok, replacement} =
+      SelfHost.connect(owner, result("work-two", "old-work@example.com"), "Etc/UTC")
+
+    refute replacement.id == first.id
+
+    assert {:ok, false} =
+             Store.self_delivery?(replacement.id, "janitor@janitor.example.com", headers)
+
+    Repo.update_all(
+      from(o in Outgoing, where: o.id == ^outgoing.id),
+      [set: [recipient: "unrecorded@example.net"]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:ok, false} = Store.self_delivery?(first.id, "janitor@janitor.example.com", headers)
+  end
+
+  test "selfhost installer cannot modify a different repository or schema", ctx do
+    assert {:error, :invalid_self_host_scope} =
+             Store.install(%{ctx.scope | prefix: "ej_unrelated"})
+
+    assert {:error, :invalid_self_host_scope} =
+             Store.install(%{ctx.scope | repo: EmailJanitor.TestRepo})
+
+    assert {:error, :invalid_self_host_scope} = Store.install(nil)
   end
 
   test "AEAD binds each ciphertext to its purpose and opaque row ID", ctx do
