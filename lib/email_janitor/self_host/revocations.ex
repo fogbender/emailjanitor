@@ -190,7 +190,7 @@ defmodule EmailJanitor.SelfHost.Revocations do
              _ -> {:next, nil, 60_000}
            end
          end,
-         timeout_ms: 40_000},
+         timeout_ms: 70_000},
         id: __MODULE__
       )
 
@@ -215,7 +215,7 @@ defmodule EmailJanitor.SelfHost.Revocations do
             {:error, :revocation_unavailable}
         end
       end,
-      30_000
+      60_000
     )
   rescue
     _ -> {:error, :revocation_unavailable}
@@ -241,34 +241,67 @@ defmodule EmailJanitor.SelfHost.Revocations do
       )
 
     Enum.reduce_while(ids, {:ok, :idle}, fn id, _ ->
-      case Store.transaction(fn scoped ->
-             Store.lock_mailbox(scoped, id)
-             row = scoped.repo.get!(Revocation, id, prefix: scoped.prefix, log: false)
-
-             if row.state in [:pending, :processing] and
-                  (is_nil(row.next_attempt_at) or
-                     DateTime.compare(row.next_attempt_at, now) != :gt) and
-                  (row.state == :pending or Owner.proof(row) == :dead) do
-               scoped.repo.update!(
-                 Ecto.Changeset.change(
-                   row,
-                   Map.merge(Owner.capture(), %{
-                     state: :processing,
-                     next_attempt_at: DateTime.add(now, 60)
-                   })
-                 ),
-                 prefix: scoped.prefix,
-                 log: false
-               )
-             else
-               :idle
-             end
-           end) do
+      case claim_one(id, now) do
         {:ok, %Revocation{} = row} -> {:halt, {:ok, row}}
         {:ok, :idle} -> {:cont, {:ok, :idle}}
         _ -> {:halt, {:error, :revocation_unavailable}}
       end
     end)
+  end
+
+  defp claim_one(id, now) do
+    result =
+      Store.transaction(fn scoped ->
+        Store.lock_mailbox(scoped, id)
+        row = scoped.repo.get!(Revocation, id, prefix: scoped.prefix, log: false)
+        due? = is_nil(row.next_attempt_at) or DateTime.compare(row.next_attempt_at, now) != :gt
+
+        cond do
+          row.state == :pending and due? ->
+            take_claim(scoped, row)
+
+          row.state == :processing and due? and Owner.proof(row) == :dead ->
+            {:quarantine, row.request_id, row.owner_token}
+
+          true ->
+            :idle
+        end
+      end)
+
+    case result do
+      {:ok, {:quarantine, request, token}} ->
+        # A wall-clock jump can make a persisted due timestamp look old. Only a
+        # physical wait AFTER proving the old BEAM owner dead bounds its final
+        # possible 13-second external helper. Never hold database locks here.
+        Process.sleep(20_000)
+
+        Store.transaction(fn scoped ->
+          Store.lock_mailbox(scoped, id)
+          current = scoped.repo.get!(Revocation, id, prefix: scoped.prefix, log: false)
+
+          if current.state == :processing and current.request_id == request and
+               current.owner_token == token and Owner.proof(current) == :dead,
+             do: take_claim(scoped, current),
+             else: :idle
+        end)
+
+      other ->
+        other
+    end
+  end
+
+  defp take_claim(scope, row) do
+    scope.repo.update!(
+      Ecto.Changeset.change(
+        row,
+        Map.merge(Owner.capture(), %{
+          state: :processing,
+          next_attempt_at: DateTime.add(DateTime.utc_now(), 120)
+        })
+      ),
+      prefix: scope.prefix,
+      log: false
+    )
   end
 
   defp finish(row, result) do

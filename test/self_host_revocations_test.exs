@@ -126,7 +126,8 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
 
     assert {:ok, :idle} =
              Revocations.tick(ctx.config.google_oauth,
-               revoke: fn _, _ -> flunk("duplicate revoker") end
+               now: DateTime.add(DateTime.utc_now(), 3600),
+               revoke: fn _, _ -> flunk("live owner cannot be bypassed by a clock jump") end
              )
 
     send(owner, :complete)
@@ -172,7 +173,7 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
     assert {:ok, _} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
   end
 
-  test "post-wire owner death preserves a quarantine longer than the owner plus SDK process budget",
+  test "post-wire owner death requires physical quarantine even after a forward wall-clock jump",
        ctx do
     :ok = SelfHost.disconnect(ctx.owner, ctx.inbox.id)
     observer = self()
@@ -192,7 +193,7 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
     refute Process.alive?(dead_owner)
     row = saved(ctx)
     assert row.state == :processing and EmailJanitor.Owner.proof(row) == :dead
-    assert DateTime.diff(row.next_attempt_at, row.updated_at, :second) >= 59
+    assert DateTime.diff(row.next_attempt_at, row.updated_at, :second) >= 119
 
     assert {:ok, :idle} =
              Revocations.tick(ctx.config.google_oauth,
@@ -202,11 +203,24 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
 
     assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
 
-    assert {:ok, :revoked} =
-             Revocations.tick(ctx.config.google_oauth,
-               now: DateTime.add(DateTime.utc_now(), 61),
-               revoke: fn _, _ -> :ok end
-             )
+    started = System.monotonic_time(:millisecond)
+
+    recovery =
+      Task.async(fn ->
+        Revocations.tick(ctx.config.google_oauth,
+          now: DateTime.add(DateTime.utc_now(), 3600),
+          revoke: fn _, _ ->
+            send(observer, :recovery_provider_call)
+            :ok
+          end
+        )
+      end)
+
+    refute_receive :recovery_provider_call, 100
+    assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
+    assert {:ok, :revoked} = Task.await(recovery, 25_000)
+    assert_receive :recovery_provider_call
+    assert System.monotonic_time(:millisecond) - started >= 20_000
 
     assert saved(ctx).token_ciphertext == nil
     assert {:ok, _} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
