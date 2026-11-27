@@ -135,7 +135,13 @@ defmodule EmailJanitor.Store do
             existing,
             policy,
             review_started_at,
-            proposal
+            proposal,
+            # An overlapping action may cover only a subset of fresh Done IDs.
+            # Retire covered work and fresh Keeps, retaining uncovered Done work.
+            Enum.filter(
+              evaluated_ids,
+              &(&1 in existing.message_ids or &1 not in proposal.message_ids)
+            )
           )
 
           record_review(scope, inbox_id, review_ids(evaluated_ids, opts))
@@ -223,9 +229,17 @@ defmodule EmailJanitor.Store do
     end)
   end
 
-  defp retire_overlapping_candidates(scope, inbox_id, current, policy, started_at, proposal) do
+  defp retire_overlapping_candidates(
+         scope,
+         inbox_id,
+         current,
+         policy,
+         started_at,
+         proposal,
+         evaluated_ids \\ nil
+       ) do
     opts = [
-      evaluated_message_ids: Proposal.evaluated_ids(proposal),
+      evaluated_message_ids: evaluated_ids || Proposal.evaluated_ids(proposal),
       inbox_message_ids: Proposal.inbox_ids(proposal)
     ]
 

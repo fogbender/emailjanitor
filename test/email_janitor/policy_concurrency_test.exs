@@ -482,6 +482,90 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     end
   end
 
+  test "reusing a partial action retires fresh Keeps but preserves uncovered Done candidates",
+       ctx do
+    messages = [message(), message(id: "message-2"), message(id: "message-3")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+    policy = %Policy{adapter: EmailJanitor.TargetPolicy, context: ctx.policy.context}
+    blocked = %{policy | context: %{ctx.policy.context | mode: :block}}
+
+    review = fn targets, keep ->
+      database(fn ->
+        Executor.review(
+          ctx.scope,
+          ctx.inbox,
+          "thread-1",
+          {TestGmail, [state: ctx.state]},
+          {EmailJanitor.TargetClassifier, [keep_ids: keep]},
+          "",
+          1,
+          cleanup_target_ids: targets
+        )
+      end)
+    end
+
+    assert {:ok, first} = review.(["message-1"], [])
+
+    assert {:unresolved, action_id} =
+             database(fn ->
+               Executor.execute(
+                 ctx.scope,
+                 ctx.inbox,
+                 first,
+                 {TestGmail, [state: ctx.state, mode: :error_without_apply]},
+                 policy: policy
+               )
+             end)
+
+    for id <- ["message-2", "message-3"] do
+      assert {:ok, pending} = review.([id], [])
+
+      assert {:blocked, :upgrade_required} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, pending, {TestGmail, [state: ctx.state]},
+                   policy: blocked
+                 )
+               end)
+    end
+
+    pending_ids =
+      database(fn ->
+        TestRepo.all(
+          Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id, select: c.id),
+          prefix: ctx.scope.prefix
+        )
+      end)
+
+    assert {:ok, fresh} = review.(["message-1", "message-2", "message-3"], ["message-3"])
+
+    assert {:existing, ^action_id, :unresolved} =
+             database(fn ->
+               Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]},
+                 policy: policy
+               )
+             end)
+
+    database(fn ->
+      assert [%{message_ids: ["message-2"]}] =
+               TestRepo.all(
+                 Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                 prefix: ctx.scope.prefix
+               )
+
+      events =
+        Ecto.Adapters.SQL.query!(
+          TestRepo,
+          "SELECT message_ids FROM #{ctx.scope.prefix}.policy_events WHERE kind='retire' AND action_id=ANY($1::text[]) AND message_ids <> '{}'",
+          [pending_ids],
+          log: false
+        )
+
+      assert [[["message-3"]]] == events.rows
+    end)
+
+    assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+  end
+
   for entry <- [:settle_action, :execute] do
     test "#{entry} cannot overwrite terminal reconciliation with stale unresolved settlement",
          ctx do
