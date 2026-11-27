@@ -91,6 +91,15 @@ defmodule EmailJanitor.SelfHost.Config do
 
   defp valid_host?(host) do
     case :inet.parse_strict_address(String.to_charlist(host)) do
+      {:ok, {0, 0, 0, 0}} ->
+        false
+
+      {:ok, {0, 0, 0, 0, 0, 0, 0, 0}} ->
+        false
+
+      {:ok, {0, 0, 0, 0, 0, 65_535, 0, 0}} ->
+        false
+
       {:ok, _} ->
         true
 
