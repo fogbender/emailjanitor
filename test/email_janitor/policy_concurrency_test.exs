@@ -20,6 +20,7 @@ end
 
 defmodule EmailJanitor.PolicyConcurrencyTest do
   use ExUnit.Case, async: false
+  require Ecto.Query
   import EmailJanitor.Fixtures
 
   alias EmailJanitor.{
@@ -134,7 +135,13 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
       )
       |> Enum.to_list()
 
-    assert Enum.all?(results, &(&1 == {:ok, {:blocked, :upgrade_required}}))
+    assert Enum.all?(results, fn
+             {:ok, {:blocked, :upgrade_required}} -> true
+             {:ok, {:error, :proposal_changed}} -> true
+             _ -> false
+           end)
+
+    assert {:ok, {:blocked, :upgrade_required}} in results
 
     assert %{rows: [[1, 1]]} =
              database(fn ->
@@ -147,6 +154,93 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
              end)
 
     assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  for newer_ids <- [["message-1"], ["message-1", "message-2"]] do
+    test "an older admission cannot bypass newer overlapping #{inspect(newer_ids)}", ctx do
+      parent = self()
+
+      hook = fn ->
+        send(parent, {:old_review_paused, self()})
+
+        receive do
+          :resume_old_review -> :ok
+        after
+          5_000 -> raise "Synthetic admission barrier timed out"
+        end
+      end
+
+      {old, monitor} =
+        spawn_monitor(fn ->
+          result =
+            database(fn ->
+              Executor.execute(
+                ctx.scope,
+                ctx.inbox,
+                ctx.proposal,
+                {TestGmail, [state: ctx.state, history_hook: hook]},
+                policy: ctx.policy
+              )
+            end)
+
+          send(parent, {:old_admission, result})
+        end)
+
+      on_exit(fn -> Process.exit(old, :kill) end)
+      assert_receive {:old_review_paused, owner}, 5_000
+      on_exit(fn -> Process.exit(owner, :kill) end)
+
+      messages = Enum.map(unquote(newer_ids), &message(id: &1))
+      Agent.update(ctx.state, &%{&1 | messages: messages})
+
+      {:ok, newer} =
+        Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+      mode = if length(messages) > 1, do: :block_batch, else: :block
+      blocked = %{ctx.policy | context: %{ctx.policy.context | mode: mode}}
+
+      assert {:blocked, :upgrade_required} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]},
+                   policy: blocked
+                 )
+               end)
+
+      [candidate] =
+        database(fn ->
+          TestRepo.all(
+            Ecto.Query.from(c in EmailJanitor.Store.Candidate,
+              where: c.inbox_id == ^ctx.inbox.id
+            ),
+            prefix: ctx.scope.prefix
+          )
+        end)
+
+      send(owner, :resume_old_review)
+      assert_receive {:old_admission, {:error, :proposal_changed}}, 5_000
+      assert_receive {:DOWN, ^monitor, :process, ^old, :normal}, 5_000
+      assert [] = Agent.get(ctx.state, & &1.calls)
+
+      assert %{rows: [[1, 0]]} =
+               database(fn ->
+                 Ecto.Adapters.SQL.query!(
+                   TestRepo,
+                   "SELECT (SELECT count(*) FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 AND kind='reserve'), (SELECT count(*) FROM #{ctx.scope.prefix}.actions WHERE inbox_id=$2)",
+                   [candidate.id, ctx.inbox.id],
+                   log: false
+                 )
+               end)
+
+      assert {:done, id} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]},
+                   policy: ctx.policy
+                 )
+               end)
+
+      assert id == candidate.id
+      assert [unquote(newer_ids)] == Agent.get(ctx.state, & &1.calls)
+    end
   end
 
   for entry <- [:settle_action, :execute] do

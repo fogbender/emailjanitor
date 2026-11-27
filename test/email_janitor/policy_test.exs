@@ -7,6 +7,7 @@ defmodule EmailJanitor.TestPolicy do
 
     case context.mode do
       :block -> {:blocked, :upgrade_required}
+      :block_batch when length(ids) > 1 -> {:blocked, :upgrade_required}
       :error -> {:error, :unavailable}
       :raise -> raise "PRIVATE_POLICY_SENTINEL"
       _ -> :ok
