@@ -59,4 +59,19 @@ defmodule EmailJanitor.ConversationInstructionsTest do
     assert {:ok, same} = Instructions.edit(current, [], Content.new(""))
     assert Content.read(same) == Content.read(current)
   end
+
+  test "grouped context cannot be replaced in a way that discards neighboring independent rules" do
+    rules = for n <- 1..65, do: "Independent rule #{n}."
+    current = Content.new(Enum.join(rules, "\n\n"))
+    [group | _] = Instructions.entries(current)
+    refute group.editable
+
+    assert {:error, :invalid_instruction_edit} =
+             Instructions.edit(current, [group.id], Content.new("Replacement for rule 1."))
+
+    assert {:ok, appended} =
+             Instructions.edit(current, [], Content.new("Keep Bob's invitations."))
+
+    for rule <- rules, do: assert(Content.read(appended) =~ rule)
+  end
 end

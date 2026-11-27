@@ -51,10 +51,8 @@ defmodule EmailJanitor.Conversation.Plan do
          true <- text?(value["query"], 512),
          true <- text?(value["reply"], 1024),
          true <-
-           is_list(source_bodies) and length(source_bodies) <= 5 and
-             Enum.all?(source_bodies, fn source ->
-               match?(%Content{}, source) and byte_size(Content.read(source)) <= 8_000
-             end),
+           is_list(source_bodies) and length(source_bodies) <= 35 and
+             Enum.all?(source_bodies, &valid_source?/1),
          true <- instruction_references?(value, instruction_refs),
          true <- compatible?(value),
          true <- distilled?(value["instruction"], source_bodies) do
@@ -127,15 +125,57 @@ defmodule EmailJanitor.Conversation.Plan do
   defp distilled?(instruction, sources) do
     normalized = normalize(instruction)
 
-    Enum.all?(sources, fn %Content{} = source ->
-      body = normalize(Content.read(source))
+    sources
+    |> Enum.flat_map(&source_values/1)
+    |> Enum.all?(fn {kind, raw} ->
+      body = normalize(raw)
 
       cond do
+        body == "" -> true
+        normalized == body -> false
+        kind == :sender and canonical_address?(raw) -> true
         byte_size(body) < 12 -> true
         String.contains?(normalized, body) -> false
         true -> not copied_passage?(normalized, body)
       end
     end)
+  end
+
+  defp valid_source?(%Content{} = source), do: byte_size(Content.read(source)) <= 8_000
+
+  defp valid_source?({kind, %Content{} = source}) when kind in [:sender, :subject],
+    do: byte_size(Content.read(source)) <= 1_024
+
+  defp valid_source?(_), do: false
+
+  defp source_values(%Content{} = source), do: [{:body, Content.read(source)}]
+
+  defp source_values({:subject, source}) do
+    raw = Content.read(source)
+    {"subject", decoded} = Mail.Parsers.RFC2822.parse_header("Subject: " <> raw, [])
+    [{:header, raw}, {:header, decoded}] |> Enum.uniq()
+  end
+
+  defp source_values({:sender, source}) do
+    raw = Content.read(source)
+    {"from", decoded} = Mail.Parsers.RFC2822.parse_header("From: " <> raw, [])
+
+    names =
+      decoded
+      |> List.wrap()
+      |> Enum.flat_map(fn
+        {name, _address} when is_binary(name) and name != "" -> [{:header, name}]
+        _ -> []
+      end)
+
+    [{:sender, raw} | names]
+  end
+
+  defp canonical_address?(raw) do
+    case EmailJanitor.Address.normalize(raw) do
+      {:ok, address} -> address == String.downcase(String.trim(raw))
+      _ -> false
+    end
   end
 
   defp copied_passage?(instruction, body) do
