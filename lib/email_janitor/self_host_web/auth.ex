@@ -114,22 +114,27 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
       browser_token = random()
 
       with {:ok, ciphertext} <- host().seal("browser-oauth", id, serialized) do
-        scope.repo.insert!(
-          %Attempt{
-            id: id,
-            browser_hash: hash(browser_token),
-            subject: subject,
-            session_hash: session_hash,
-            mode: mode,
-            timezone: timezone,
-            ciphertext: ciphertext,
-            expires_at: DateTime.add(now, 600)
-          },
-          options(scope)
-        )
+        result =
+          insert_attempt(
+            scope,
+            %Attempt{
+              id: id,
+              browser_hash: hash(browser_token),
+              subject: subject,
+              session_hash: session_hash,
+              mode: mode,
+              timezone: timezone,
+              ciphertext: ciphertext,
+              expires_at: DateTime.add(now, 600)
+            },
+            now
+          )
 
-        purge(now)
-        {:ok, %{url: url, browser_token: browser_token}}
+        case result do
+          {:ok, _} -> {:ok, %{url: url, browser_token: browser_token}}
+          {:error, :too_many_attempts} = error -> error
+          _ -> {:error, :google_unavailable}
+        end
       end
     else
       _ -> {:error, :google_unavailable}
@@ -165,6 +170,35 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     scope.repo.delete_all(from(a in Attempt, where: a.expires_at <= ^now), options(scope))
     scope.repo.delete_all(from(s in Session, where: s.expires_at <= ^now), options(scope))
     :ok
+  end
+
+  defp insert_attempt(scope, attempt, now) do
+    scope.repo.transaction(
+      fn ->
+        # Bound unauthenticated state across HTTP requests and process restarts.
+        # SDK URL creation and encryption happened before this short DB section.
+        Ecto.Adapters.SQL.query!(
+          scope.repo,
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          ["selfhost-oauth-attempts:" <> scope.prefix],
+          log: false,
+          telemetry_event: nil
+        )
+
+        purge(now)
+
+        if is_nil(attempt.subject) and
+             scope.repo.aggregate(
+               from(a in Attempt, where: is_nil(a.subject) and a.expires_at > ^now),
+               :count,
+               options(scope)
+             ) >= 20,
+           do: scope.repo.rollback(:too_many_attempts)
+
+        scope.repo.insert!(attempt, options(scope))
+      end,
+      options(scope)
+    )
   end
 
   defp finish(%{mode: :sign_in}, result), do: host().authorize_owner(result)

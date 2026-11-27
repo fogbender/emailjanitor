@@ -27,7 +27,7 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
   def send_message(conn, params) do
     with {:ok, inboxes} <- Auth.host().inboxes(conn.assigns.owner),
          {:ok, inbox} <- selected(conn, inboxes, params["inbox_id"]),
-         text when is_binary(text) and byte_size(text) in 1..16_000 <- params["message"],
+         {:ok, text} <- message(params["message"]),
          {:ok, request_id} <- Ecto.UUID.cast(params["request_id"]) do
       result =
         ChatLimit.run(fn ->
@@ -51,8 +51,18 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
           })
       end
     else
+      {:error, :invalid_message} ->
+        chat_page(put_status(conn, 400), params, %{
+          error:
+            "Enter a message of at most 16,000 UTF-8 bytes. Your text is still here to edit.",
+          message: input_text(params)
+        })
+
       _ ->
-        chat_page(put_status(conn, 400), params, %{error: "Choose an inbox and enter a message."})
+        chat_page(put_status(conn, 400), params, %{
+          error: "Choose a connected inbox and enter a message.",
+          message: input_text(params)
+        })
     end
   rescue
     _ -> unavailable(conn)
@@ -69,7 +79,13 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
       |> put_session(:oauth_browser_token, flow.browser_token)
       |> redirect(external: flow.url)
     else
-      _ -> unavailable(conn)
+      {:error, :too_many_attempts} ->
+        page(put_status(conn, 429), :home, %{
+          error: "Too many sign-in attempts. Please try again in ten minutes."
+        })
+
+      _ ->
+        unavailable(conn)
     end
   end
 
@@ -114,13 +130,13 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
   end
 
   defp selected(conn, inboxes, id) when is_binary(id) and byte_size(id) in 1..256 do
-    with true <- Enum.any?(inboxes, &(&1.inbox.id == id and &1.state != :disconnected)),
+    with true <- Enum.any?(inboxes, &(&1.inbox.id == id and &1.state in [:pending, :active])),
          {:ok, inbox} <- Auth.host().inbox(conn.assigns.owner, id),
          do: {:ok, inbox}
   end
 
   defp selected(conn, inboxes, nil) do
-    active = Enum.reject(inboxes, &(&1.state == :disconnected))
+    active = Enum.filter(inboxes, &(&1.state in [:pending, :active]))
     matches = Enum.filter(active, &(&1.inbox.address == Auth.host().config().owner_email))
 
     case {active, matches} do
@@ -131,6 +147,19 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
   end
 
   defp selected(_, _, _), do: {:error, :choose_inbox}
+
+  defp message(text) when is_binary(text) do
+    if byte_size(text) in 1..16_000 and String.valid?(text),
+      do: {:ok, text},
+      else: {:error, :invalid_message}
+  end
+
+  defp message(_), do: {:error, :invalid_message}
+
+  defp input_text(%{"message" => text}) when is_binary(text) and byte_size(text) <= 65_536,
+    do: if(String.valid?(text), do: text, else: "")
+
+  defp input_text(_), do: ""
 
   defp conversation_id(owner, inbox_id) do
     <<a::48, _::4, b::12, _::2, c::62, _::binary>> =
@@ -165,6 +194,7 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
               csrf: get_csrf_token(),
               error: nil,
               reply: nil,
+              message: "",
               retry: nil,
               request_id: Ecto.UUID.generate()
             },

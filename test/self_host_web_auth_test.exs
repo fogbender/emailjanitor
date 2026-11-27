@@ -155,4 +155,14 @@ defmodule EmailJanitor.SelfHostWeb.AuthTest do
     assert TestRepo.all(Attempt, prefix: t.scope.prefix) == []
     assert TestRepo.all(Session, prefix: t.scope.prefix) == []
   end
+
+  test "anonymous attempts have a durable bounded cap while the owner can still connect", t do
+    for _ <- 1..20, do: assert({:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now))
+    assert {:error, :too_many_attempts} = Auth.begin(:sign_in, nil, "Etc/UTC", t.now)
+    assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 20
+    {:ok, owner} = Auth.issue("owner-subject", nil, t.now)
+    assert {:ok, _} = Auth.begin(:connect, Content.read(owner), "Etc/UTC", t.now)
+    assert {:ok, _} = Auth.begin(:sign_in, nil, "Etc/UTC", DateTime.add(t.now, 601))
+    assert TestRepo.aggregate(Attempt, :count, prefix: t.scope.prefix) == 1
+  end
 end

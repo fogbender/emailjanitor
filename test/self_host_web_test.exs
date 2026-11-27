@@ -134,7 +134,7 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
           message: "Done."
         })
 
-      assert html_response(conn, 400) =~ "Choose an inbox"
+      assert html_response(conn, 400) =~ "Choose a connected inbox"
     end
 
     refute_receive {:respond, _, _, _, _, _}
@@ -221,5 +221,62 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
 
     assert redirected_to(conn) == "/"
     assert redirected_to(conn |> recycle() |> get("/accounts")) == "/"
+  end
+
+  test "reauthorization accounts are excluded and a remaining usable account is selected", t do
+    {:ok, other} = Inbox.new("reauth-inbox", "other@example.org")
+
+    Application.put_env(:email_janitor, :browser_test_inboxes, [
+      %{inbox: other, state: :reauthorization_required, timezone: "Etc/UTC"},
+      %{inbox: t.box, state: :active, timezone: "Etc/UTC"}
+    ])
+
+    page = get(signed_in(), "/chat")
+    assert html_response(page, 200) =~ "value=\"#{t.box.id}\" selected"
+    refute page.resp_body =~ "value=\"reauth-inbox\""
+
+    conn =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> post("/chat", %{
+        _csrf_token: csrf(page),
+        inbox_id: other.id,
+        request_id: Ecto.UUID.generate(),
+        message: "Keep invoices."
+      })
+
+    assert html_response(conn, 400) =~ "Keep invoices."
+    refute_receive {:respond, _, _, _, _, _}
+
+    Application.put_env(:email_janitor, :browser_test_inboxes, [
+      %{inbox: other, state: :reauthorization_required, timezone: "Etc/UTC"}
+    ])
+
+    page = get(signed_in(), "/chat")
+    assert html_response(page, 200) =~ "Connect or reconnect"
+    refute page.resp_body =~ "<textarea"
+  end
+
+  test "oversized Unicode messages get a clear error and stay in the composer", t do
+    page = get(signed_in(), "/chat")
+    text = "PRIVATE_UNICODE_SENTINEL " <> String.duplicate("漢", 6_000)
+
+    conn =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> post("/chat", %{
+        _csrf_token: csrf(page),
+        inbox_id: t.box.id,
+        request_id: Ecto.UUID.generate(),
+        message: text
+      })
+
+    body = html_response(conn, 400)
+    assert body =~ "at most 16,000 UTF-8 bytes"
+    assert body =~ text
+    assert get_resp_header(conn, "cache-control") == ["no-store"]
+    refute_receive {:respond, _, _, _, _, _}
   end
 end

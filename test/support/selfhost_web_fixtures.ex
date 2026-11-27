@@ -14,7 +14,8 @@ defmodule EmailJanitor.SelfHostWeb.TestHost do
   def inbox(owner, id) do
     with true <- owner?(owner),
          {:ok, rows} <- inboxes(owner),
-         %{inbox: inbox} <- Enum.find(rows, &(&1.inbox.id == id and &1.state != :disconnected)),
+         %{inbox: inbox} <-
+           Enum.find(rows, &(&1.inbox.id == id and &1.state in [:pending, :active])),
          do: {:ok, inbox},
          else: (_ -> {:error, :not_connected})
   end
