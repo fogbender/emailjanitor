@@ -266,51 +266,76 @@ defmodule EmailJanitor.Worker.Ledger do
       candidate ->
         remaining = candidate.message_ids -- ids
 
-        scope.repo.update!(
-          Ecto.Changeset.change(candidate,
-            message_ids: remaining,
-            status: if(remaining == [], do: :retired, else: :pending),
-            requested: remaining != [] and candidate.requested
-          ),
-          prefix: scope.prefix,
-          log: false
-        )
+        if remaining != candidate.message_ids do
+          scope.repo.update!(
+            Ecto.Changeset.change(candidate,
+              message_ids: remaining,
+              status: if(remaining == [], do: :retired, else: :pending),
+              requested: remaining != [] and candidate.requested,
+              request_version: candidate.request_version + 1
+            ),
+            prefix: scope.prefix,
+            log: false
+          )
+        end
 
         :ok
     end
   end
 
   def queue_candidate(scope, inbox, id) do
-    with {:ok, uuid} <- Ecto.UUID.cast(id),
-         %Candidate{status: :pending} = candidate <-
-           scope.repo.get_by(
-             Candidate,
-             [inbox_id: inbox.id, candidate_id: uuid],
-             prefix: scope.prefix,
-             log: false
-           ),
-         true <- pending_source?(scope, inbox, candidate) do
-      {count, _} =
-        scope.repo.update_all(
-          from(c in Candidate,
-            where: c.inbox_id == ^inbox.id and c.candidate_id == ^uuid and c.status == :pending
-          ),
-          [
-            set: [
-              requested: true,
-              attempts: 0,
-              invalid_attempts: 0,
-              rejected_attempts: 0,
-              contract_blocked: false,
-              next_attempt_at: nil
-            ],
-            inc: [request_version: 1]
-          ],
-          prefix: scope.prefix,
-          log: false
-        )
+    with {:ok, uuid} <- Ecto.UUID.cast(id) do
+      case scope.repo.transaction(fn ->
+             mailbox =
+               scope.repo.one(from(m in Mailbox, where: m.id == ^inbox.id, lock: "FOR UPDATE"),
+                 prefix: scope.prefix,
+                 log: false
+               )
 
-      if count == 1, do: :ok, else: {:error, :ineligible_recheck}
+             unless mailbox && mailbox.address == inbox.address,
+               do: scope.repo.rollback(:ineligible_recheck)
+
+             candidate =
+               scope.repo.one(
+                 from(c in Candidate,
+                   where:
+                     c.inbox_id == ^inbox.id and c.candidate_id == ^uuid and c.status == :pending,
+                   lock: "FOR UPDATE"
+                 ),
+                 prefix: scope.prefix,
+                 log: false
+               )
+
+             unless candidate && pending_source?(scope, inbox, candidate),
+               do: scope.repo.rollback(:ineligible_recheck)
+
+             :ok = EmailJanitor.Store.fence_recheck(scope, inbox.id, candidate.message_ids)
+
+             scope.repo.update_all(
+               from(c in Candidate,
+                 where:
+                   c.inbox_id == ^inbox.id and c.candidate_id == ^uuid and c.status == :pending
+               ),
+               [
+                 set: [
+                   requested: true,
+                   attempts: 0,
+                   invalid_attempts: 0,
+                   rejected_attempts: 0,
+                   contract_blocked: false,
+                   next_attempt_at: nil
+                 ],
+                 inc: [request_version: 1]
+               ],
+               prefix: scope.prefix,
+               log: false
+             )
+
+             :ok
+           end) do
+        {:ok, :ok} -> :ok
+        _ -> {:error, :ineligible_recheck}
+      end
     else
       _ -> {:error, :ineligible_recheck}
     end
@@ -384,6 +409,8 @@ defmodule EmailJanitor.Worker.Ledger do
                    do: scope.repo.rollback(:ineligible_recheck)
 
                  if Enum.sort(existing.message_ids) != Enum.sort(ids) do
+                   :ok = EmailJanitor.Store.fence_recheck(scope, inbox.id, ids)
+
                    scope.repo.update!(
                      Ecto.Changeset.change(existing,
                        message_ids: Enum.sort(ids),

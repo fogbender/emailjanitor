@@ -74,6 +74,117 @@ defmodule EmailJanitor.GmailSDKTest do
     refute inspect(message) =~ "PRIVATE_BODY_SENTINEL"
   end
 
+  test "metadata-only search preserves quoted API syntax and bounds result count" do
+    query = ~s(from:"sales@vendor.com" subject:"quick question")
+
+    mock(fn env ->
+      assert env.method == :get
+      assert String.ends_with?(env.url, "/messages")
+      assert env.query[:q] == query
+      assert env.query[:maxResults] == 11
+      assert env.query[:fields] == "messages(id,threadId),nextPageToken"
+      Tesla.Mock.json(%{"messages" => [%{"id" => "message-1", "threadId" => "thread-1"}]})
+    end)
+
+    assert {:ok,
+            %{messages: [%{message_id: "message-1", thread_id: "thread-1"}], truncated: false}} =
+             SDK.search("inbox-1", query, options())
+  end
+
+  test "search never silently calls a partial result complete or fetches a body" do
+    for response <- [
+          %{"messages" => Enum.map(1..11, &%{"id" => "message-#{&1}", "threadId" => "thread-1"})},
+          %{
+            "messages" => [%{"id" => "message-1", "threadId" => "thread-1"}],
+            "nextPageToken" => "more"
+          }
+        ] do
+      mock(fn env ->
+        assert String.ends_with?(env.url, "/messages")
+        refute String.contains?(env.url, "/threads/")
+        Tesla.Mock.json(response)
+      end)
+
+      assert {:ok, %{messages: refs, truncated: true}} =
+               SDK.search("inbox-1", "synthetic", options())
+
+      assert length(refs) <= 10
+    end
+
+    mock(fn _ -> Tesla.Mock.json(%{}) end)
+
+    assert {:ok, %{messages: [], truncated: false}} =
+             SDK.search("inbox-1", "synthetic", options())
+  end
+
+  test "search rejects malformed references and unsafe queries with fixed errors" do
+    for response <- [
+          %{"messages" => [%{"id" => "message-1"}]},
+          %{
+            "messages" => [
+              %{"id" => "message-1", "threadId" => "thread-1"},
+              %{"id" => "message-1", "threadId" => "thread-1"}
+            ]
+          },
+          %{"messages" => [%{"id" => "bad/id", "threadId" => "thread-1"}]}
+        ] do
+      mock(fn _ -> Tesla.Mock.json(response) end)
+      assert {:error, :invalid_search} = SDK.search("inbox-1", "synthetic", options())
+    end
+
+    Tesla.Mock.mock(fn _ -> flunk("invalid query must not reach Google") end)
+
+    for query <- ["", "bad\nquery", String.duplicate("a", 1025), <<255>>] do
+      assert {:error, :invalid_search} = SDK.search("inbox-1", query, options())
+    end
+  end
+
+  test "search and prepared restoration verify the configured Google account" do
+    mock(
+      fn _ -> flunk("wrong account must stop after profile") end,
+      %{"emailAddress" => "another@acme.com", "historyId" => "100"}
+    )
+
+    assert {:error, :wrong_inbox} = SDK.search("inbox-1", "synthetic", options())
+    assert {:error, :wrong_inbox} = SDK.prepare_add_inbox("inbox-1", ["message-1"], options())
+  end
+
+  test "prepared restoration freezes account credentials and adds only INBOX on exact IDs" do
+    owner = self()
+
+    mock(fn env ->
+      assert env.method == :post
+      assert String.ends_with?(env.url, "/messages/batchModify")
+      assert Jason.decode!(env.body) == %{"ids" => ["message-1"], "addLabelIds" => ["INBOX"]}
+      send(owner, :restored_exactly)
+      Tesla.Mock.json(%{})
+    end)
+
+    assert {:ok, closure} = SDK.prepare_add_inbox("inbox-1", ["message-1"], options())
+    refute_received :restored_exactly
+    assert :ok = closure.()
+    assert_received :restored_exactly
+
+    assert {:error, :invalid_message_ids} =
+             SDK.prepare_add_inbox("inbox-1", ["message-1", "message-1"], options())
+  end
+
+  test "only authoritative SDK HTTP rejections prove restoration unapplied" do
+    for {status, reason} <- [
+          {401, :authorization_required},
+          {403, :forbidden},
+          {429, :rate_limited}
+        ] do
+      mock(fn env ->
+        assert String.ends_with?(env.url, "/messages/batchModify")
+        Tesla.Mock.json(%{"error" => %{"message" => "PRIVATE_REJECTION_BODY"}}, status: status)
+      end)
+
+      assert {:ok, dispatch} = SDK.prepare_add_inbox("inbox-1", ["message-1"], options())
+      assert {:rejected, ^reason} = dispatch.()
+    end
+  end
+
   test "configured inbox ID mismatch never resolves tokens or contacts Google" do
     resolver = fn -> flunk("wrong inbox must not resolve credentials") end
     {:ok, config} = Config.new(inbox(), resolver, adapter: Tesla.Mock)

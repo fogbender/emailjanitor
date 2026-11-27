@@ -19,6 +19,7 @@ defmodule EmailJanitor.Store do
     Ecto.Migrator.up(repo, 1, Migration, prefix: prefix, log: false)
     Ecto.Migrator.up(repo, 2, CandidateMigration, prefix: prefix, log: false)
     Ecto.Migrator.up(repo, 6, TargetMigration, prefix: prefix, log: false)
+    Ecto.Migrator.up(repo, 7, EmailJanitor.Restore.Migration, prefix: prefix, log: false)
   end
 
   def add_inbox(%Scope{} = scope, %Inbox{} = inbox) do
@@ -67,6 +68,8 @@ defmodule EmailJanitor.Store do
       inbox_id: inbox_id,
       thread_id: proposal.thread_id,
       message_ids: proposal.message_ids,
+      observed_message_ids:
+        Keyword.get(opts, :observed_message_ids, Proposal.inbox_ids(proposal)),
       message_categories:
         Map.new(Proposal.categories(proposal), fn {id, category} ->
           {id, Atom.to_string(category)}
@@ -102,6 +105,13 @@ defmodule EmailJanitor.Store do
 
       existing = List.first(covering_actions)
       covered_ids = Enum.flat_map(covering_actions, & &1.message_ids)
+
+      # Covered actions may still settle/reconcile idempotently; they never
+      # dispatch this prepared closure. A protected thread cannot admit any new
+      # uncovered Done IDs after the earlier unlocked safeguard read.
+      if (is_nil(existing) or proposal.message_ids -- covered_ids != []) and
+           restoration_overlap?(scope, inbox_id, record.observed_message_ids),
+         do: scope.repo.rollback(:proposal_changed)
 
       review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
       evaluated_ids = Proposal.evaluated_ids(proposal)
@@ -342,6 +352,12 @@ defmodule EmailJanitor.Store do
   defp retire_cancelled_metadata!(scope, policy, inbox_id, action, opts) do
     outstanding = action.remaining_metadata_ids || action.message_ids
     ids = retirement_ids(outstanding, opts)
+    retire_cancelled_exact!(scope, policy, inbox_id, action, ids)
+  end
+
+  defp retire_cancelled_exact!(scope, policy, inbox_id, action, selected) do
+    outstanding = action.remaining_metadata_ids || action.message_ids
+    ids = Enum.filter(outstanding, &(&1 in selected))
     remaining = outstanding -- ids
     retire_metadata!(scope, policy, inbox_id, action.id, ids, remaining)
 
@@ -359,6 +375,12 @@ defmodule EmailJanitor.Store do
   defp retire_candidate!(scope, policy, inbox_id, candidate, opts) do
     outstanding = candidate.remaining_message_ids || candidate.message_ids
     ids = retirement_ids(outstanding, opts)
+    retire_candidate_exact!(scope, policy, inbox_id, candidate, ids)
+  end
+
+  defp retire_candidate_exact!(scope, policy, inbox_id, candidate, selected) do
+    outstanding = candidate.remaining_message_ids || candidate.message_ids
+    ids = Enum.filter(outstanding, &(&1 in selected))
     remaining = outstanding -- ids
     retire_metadata!(scope, policy, inbox_id, candidate.id, ids, remaining)
 
@@ -390,6 +412,10 @@ defmodule EmailJanitor.Store do
 
   defp record_review(scope, inbox_id, ids) do
     now = clock(scope)
+    write_review_fence(scope, inbox_id, ids, now)
+  end
+
+  defp write_review_fence(scope, inbox_id, ids, now) do
     rows = Enum.map(Enum.uniq(ids), &%{inbox_id: inbox_id, message_id: &1, reviewed_at: now})
 
     scope.repo.insert_all(ReviewFence, rows,
@@ -399,6 +425,101 @@ defmodule EmailJanitor.Store do
     )
 
     :ok
+  end
+
+  @doc "Trusted explicit recheck boundary; caller must hold its mailbox transaction."
+  def fence_recheck(scope, inbox_id, ids) do
+    if scope.repo.in_transaction?() do
+      scope.repo.one!(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+        prefix: scope.prefix,
+        log: false
+      )
+
+      record_review(scope, inbox_id, ids)
+    else
+      {:error, :outer_transaction_required}
+    end
+  end
+
+  @doc false
+  def fence_restoration(scope, inbox_id, ids, %DateTime{} = applied_at) do
+    if scope.repo.in_transaction?(),
+      do: write_review_fence(scope, inbox_id, ids, applied_at),
+      else: {:error, :outer_transaction_required}
+  end
+
+  @doc "Retire only old exact metadata justified by this persisted positive restore effect."
+  def retire_restored(scope, inbox_id, effect_id, policy) do
+    if scope.repo.in_transaction?() do
+      effect =
+        scope.repo.get_by(
+          EmailJanitor.Restore.Effect,
+          [id: effect_id, inbox_id: inbox_id],
+          prefix: scope.prefix,
+          log: false
+        )
+
+      unless match?(%{applied_at: %DateTime{}}, effect),
+        do: scope.repo.rollback(:unconfirmed_restoration)
+
+      newer =
+        scope.repo.all(
+          from(f in ReviewFence,
+            where:
+              f.inbox_id == ^inbox_id and f.message_id in ^effect.message_ids and
+                f.reviewed_at > ^effect.applied_at,
+            select: f.message_id
+          ),
+          prefix: scope.prefix,
+          log: false
+        )
+
+      ids = effect.message_ids -- newer
+
+      if ids != [] do
+        candidates =
+          scope.repo.all(
+            from(c in Candidate,
+              where:
+                c.inbox_id == ^inbox_id and c.updated_at <= ^effect.applied_at and
+                  fragment(
+                    "COALESCE(?, ?) && ?::text[]",
+                    c.remaining_message_ids,
+                    c.message_ids,
+                    ^ids
+                  )
+            ),
+            prefix: scope.prefix,
+            log: false
+          )
+
+        for candidate <- candidates,
+            do: retire_candidate_exact!(scope, policy, inbox_id, candidate, ids)
+
+        cancelled =
+          scope.repo.all(
+            from(a in Action,
+              where:
+                a.inbox_id == ^inbox_id and a.state == :cancelled and
+                  a.inserted_at <= ^effect.applied_at and
+                  fragment(
+                    "COALESCE(?, ?) && ?::text[]",
+                    a.remaining_metadata_ids,
+                    a.message_ids,
+                    ^ids
+                  )
+            ),
+            prefix: scope.prefix,
+            log: false
+          )
+
+        for action <- cancelled, do: retire_cancelled_exact!(scope, policy, inbox_id, action, ids)
+      end
+
+      :ok
+    else
+      {:error, :outer_transaction_required}
+    end
   end
 
   defp review_ids(evaluated, opts) do
@@ -479,6 +600,9 @@ defmodule EmailJanitor.Store do
 
            with %Action{} <- action, true <- Owner.owns?(action) do
              if is_nil(mailbox) or mailbox.instruction_version != action.instruction_version,
+               do: scope.repo.rollback(:proposal_changed)
+
+             if restoration_overlap?(scope, inbox_id, action.observed_message_ids),
                do: scope.repo.rollback(:proposal_changed)
 
              {count, _} =
@@ -673,16 +797,52 @@ defmodule EmailJanitor.Store do
   end
 
   def restored_ids(%Scope{} = scope, inbox_id) do
-    scope.repo.all(
-      from(a in Action,
-        where: a.inbox_id == ^inbox_id and a.state == :restored,
-        select: a.restored_message_ids
-      ),
-      prefix: scope.prefix
-    )
-    |> List.flatten()
-    |> MapSet.new()
+    confirmed =
+      scope.repo.all(
+        from(a in Action,
+          where: a.inbox_id == ^inbox_id and a.state == :restored,
+          select: a.restored_message_ids
+        ),
+        prefix: scope.prefix,
+        log: false
+      )
+      |> List.flatten()
+
+    requested =
+      scope.repo.all(
+        from(p in EmailJanitor.Restore.Protection,
+          where: p.inbox_id == ^inbox_id,
+          select: p.message_id
+        ),
+        prefix: scope.prefix,
+        log: false
+      )
+
+    MapSet.new(confirmed ++ requested)
   end
+
+  defp restoration_overlap?(scope, inbox_id, ids) when is_list(ids) and ids != [] do
+    scope.repo.exists?(
+      from(p in EmailJanitor.Restore.Protection,
+        where: p.inbox_id == ^inbox_id and p.message_id in ^ids
+      ),
+      prefix: scope.prefix,
+      log: false
+    ) or
+      scope.repo.exists?(
+        from(a in Action,
+          where:
+            a.inbox_id == ^inbox_id and a.state == :restored and
+              fragment("? && ?::text[]", a.restored_message_ids, ^ids)
+        ),
+        prefix: scope.prefix,
+        log: false
+      )
+  end
+
+  # Pre-migration prepared intents lack a trustworthy observed context. They
+  # must cancel/review again, never dispatch an unobserved old selection.
+  defp restoration_overlap?(_, _, _), do: true
 
   defp fresh_recovery_history(%Action{dispatch_started_at: nil}, _), do: :ok
 
