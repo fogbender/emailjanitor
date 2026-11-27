@@ -57,34 +57,55 @@ defmodule EmailJanitor.SelfHost.Credentials do
            end) do
       {:ok, Content.new(token["access_token"])}
     else
+      {:error, :credentials_changed} -> cached_token(ref)
       _ -> {:error, :google_credentials_unavailable}
     end
   end
 
   defp retire(ref, before) do
-    Store.transaction(fn scope ->
-      Store.lock_mailbox(scope, before.id)
+    result =
+      Store.transaction(fn scope ->
+        Store.lock_mailbox(scope, before.id)
 
-      with {:ok, current, _} <- Store.fetch_binding(ref),
-           true <- current.token_version == before.token_version do
-        scope.repo.update!(
-          Ecto.Changeset.change(current,
-            state: :reauthorization_required,
-            token_ciphertext: nil,
-            token_version: current.token_version + 1,
-            epoch: current.epoch + 1
-          ),
-          prefix: scope.prefix
-        )
+        with {:ok, current, _} <- Store.fetch_binding(ref),
+             true <- current.token_version == before.token_version do
+          scope.repo.update!(
+            Ecto.Changeset.change(current,
+              state: :reauthorization_required,
+              token_ciphertext: nil,
+              token_version: current.token_version + 1,
+              epoch: current.epoch + 1
+            ),
+            prefix: scope.prefix
+          )
 
-        scope.repo.update_all(
-          from(m in Mailbox, where: m.id == ^before.id),
-          [inc: [instruction_version: 1], set: [updated_at: DateTime.utc_now()]],
-          prefix: scope.prefix
-        )
-      end
-    end)
+          scope.repo.update_all(
+            from(m in Mailbox, where: m.id == ^before.id),
+            [inc: [instruction_version: 1], set: [updated_at: DateTime.utc_now()]],
+            prefix: scope.prefix
+          )
 
-    {:error, :reauthorization_required}
+          :retired
+        else
+          _ -> :changed
+        end
+      end)
+
+    case result do
+      {:ok, :retired} -> {:error, :reauthorization_required}
+      {:ok, :changed} -> cached_token(ref)
+      _ -> {:error, :google_credentials_unavailable}
+    end
+  end
+
+  defp cached_token(ref) do
+    with {:ok, binding, _} <- Store.fetch_binding(ref),
+         {:ok, content} <- SelfHost.open("gmail-token", binding.id, binding.token_ciphertext),
+         {:ok, token} <- Store.token_data(content),
+         true <- token["expires_at"] >= System.system_time(:second) + 120 do
+      {:ok, Content.new(token["access_token"])}
+    else
+      _ -> {:error, :google_credentials_unavailable}
+    end
   end
 end

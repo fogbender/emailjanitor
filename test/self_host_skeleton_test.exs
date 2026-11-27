@@ -24,6 +24,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
       EmailJanitor.Preferences.install(scope)
       EmailJanitor.Mail.Store.install(scope)
       EmailJanitor.Digest.install(scope)
+      EmailJanitor.Gmail.Ingestion.install(scope)
       Store.install(scope)
     end)
 
@@ -237,12 +238,85 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     consent = with_token(result(), %{"access_token" => "PRIVATE_NEW_CONSENT_TOKEN"})
     assert {:ok, ^box} = SelfHost.connect(owner, consent, "Etc/UTC")
     send(callback, :continue)
-    assert {:error, :google_credentials_unavailable} = Task.await(task, 5000)
+    assert {:ok, current} = Task.await(task, 5000)
+    assert Content.read(current) == "PRIVATE_NEW_CONSENT_TOKEN"
     saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
     assert saved.epoch == before.epoch
     assert saved.token_version == before.token_version + 1
     assert {:ok, content} = SelfHost.open("gmail-token", box.id, saved.token_ciphertext)
     assert Jason.decode!(Content.read(content))["access_token"] == "PRIVATE_NEW_CONSENT_TOKEN"
+  end
+
+  test "concurrent refresh callers both receive the winning valid token", ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    old = with_token(result(), %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, box} = SelfHost.connect(owner, old, "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    parent = self()
+
+    refresh_fixture(ctx, fn conn ->
+      send(parent, {:refresh_waiting, self()})
+
+      receive do
+        :continue -> :ok
+      after
+        5000 -> flunk("refresh barrier expired")
+      end
+
+      Req.Test.json(conn, %{
+        "access_token" => "PRIVATE_WINNING_REFRESH_TOKEN",
+        "token_type" => "Bearer",
+        "expires_in" => 3600
+      })
+    end)
+
+    tasks = for _ <- 1..2, do: Task.async(fn -> Credentials.token({box.id, before.epoch}) end)
+    assert_receive {:refresh_waiting, first}, 5000
+    assert_receive {:refresh_waiting, second}, 5000
+    send(first, :continue)
+    send(second, :continue)
+
+    for task <- tasks do
+      assert {:ok, token} = Task.await(task, 5000)
+      assert Content.read(token) == "PRIVATE_WINNING_REFRESH_TOKEN"
+    end
+
+    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).token_version ==
+             before.token_version + 1
+
+    refute_receive {:refresh_waiting, _}
+  end
+
+  test "a stale invalid-grant response uses newer consent without asking for reconnect", ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    old = with_token(result(), %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, box} = SelfHost.connect(owner, old, "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    parent = self()
+
+    refresh_fixture(ctx, fn conn ->
+      send(parent, {:refresh_waiting, self()})
+
+      receive do
+        :continue -> :ok
+      after
+        5000 -> flunk("refresh barrier expired")
+      end
+
+      conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    task = Task.async(fn -> Credentials.token({box.id, before.epoch}) end)
+    assert_receive {:refresh_waiting, callback}, 5000
+    consent = with_token(result(), %{"access_token" => "PRIVATE_NEW_CONSENT_TOKEN"})
+    assert {:ok, ^box} = SelfHost.connect(owner, consent, "Etc/UTC")
+    send(callback, :continue)
+    assert {:ok, token} = Task.await(task, 5000)
+    assert Content.read(token) == "PRIVATE_NEW_CONSENT_TOKEN"
+    saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert saved.state == before.state
+    assert saved.epoch == before.epoch
+    assert saved.token_version == before.token_version + 1
   end
 
   test "initial verified owner email pins an immutable Google subject" do
@@ -317,6 +391,11 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
              )
 
     assert Repo.aggregate(from(b in Binding), :count, prefix: ctx.scope.prefix) == 0
+    expired = with_token(result(), %{"expires_at" => System.system_time(:second) - 1})
+    assert {:error, :invalid_connection} = SelfHost.connect(owner, expired, "Etc/UTC")
+
+    assert {:error, :invalid_connection} =
+             SelfHost.connect(owner, %{result() | subject: "bad subject"}, "Etc/UTC")
   end
 
   test "same verified address with a different Google subject gets a different immutable inbox",
@@ -339,6 +418,24 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     {:ok, owner} = SelfHost.authorize_owner(result())
     {:ok, first} = SelfHost.connect(owner, result("work-one", "work@example.com"), "Etc/UTC")
     old = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+    alias EmailJanitor.Gmail.Ingestion.Checkpoint
+
+    checkpoint =
+      Repo.insert!(
+        %Checkpoint{
+          inbox_id: first.id,
+          address: first.address,
+          generation: Ecto.UUID.generate(),
+          generation_started_at: DateTime.utc_now(),
+          baseline_id: "100",
+          cursor: "123",
+          requested_id: "123",
+          watch_expires_at: DateTime.add(DateTime.utc_now(), 86400),
+          status: :active
+        },
+        prefix: ctx.scope.prefix
+      )
+
     {:ok, version} = EmailJanitor.Store.instruction_version(ctx.scope, first.id)
 
     {:ok, renamed} =
@@ -352,6 +449,12 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert fresh.epoch == old.epoch + 1
     assert {:ok, next} = EmailJanitor.Store.instruction_version(ctx.scope, first.id)
     assert next == version + 1
+    kept = Repo.get!(Checkpoint, first.id, prefix: ctx.scope.prefix)
+    assert kept.address == renamed.address
+    assert kept.cursor == checkpoint.cursor
+    assert kept.baseline_id == checkpoint.baseline_id
+    assert kept.generation == checkpoint.generation
+    assert {:ok, :ok} = EmailJanitor.Gmail.Ingestion.record_signal(ctx.scope, renamed, "124")
   end
 
   test "AEAD binds each ciphertext to its purpose and opaque row ID", ctx do

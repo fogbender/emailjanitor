@@ -44,9 +44,12 @@ defmodule EmailJanitor.SelfHost.Store do
 
   def authorize_owner(_), do: {:error, :unauthorized}
 
-  def connect(subject, %OAuth.Result{} = result, timezone) do
-    with true <- owner?(subject),
-         true <- subject?(result.subject),
+  def connect(subject, result, timezone) do
+    if owner?(subject), do: connect_verified(result, timezone), else: {:error, :unauthorized}
+  end
+
+  defp connect_verified(%OAuth.Result{} = result, timezone) do
+    with true <- subject?(result.subject),
          {:ok, box} <- Inbox.new(inbox_id(result.subject), result.email),
          {:ok, _} <- Digest.Clock.local(DateTime.utc_now(), timezone),
          {:ok, token} <- token_data(result.token),
@@ -99,6 +102,8 @@ defmodule EmailJanitor.SelfHost.Store do
         resumed = binding.state in [:pending, :active]
 
         if readdressed do
+          readdress_checkpoint!(scope, box.id, mailbox.address, box.address)
+
           scope.repo.update_all(
             from(m in Mailbox, where: m.id == ^box.id),
             [inc: [instruction_version: 1], set: [address: box.address, updated_at: now]],
@@ -122,14 +127,13 @@ defmodule EmailJanitor.SelfHost.Store do
         box
       end)
     else
-      false -> {:error, :unauthorized}
       _ -> {:error, :invalid_connection}
     end
   rescue
     _ -> {:error, :invalid_connection}
   end
 
-  def connect(_, _, _), do: {:error, :invalid_connection}
+  defp connect_verified(_, _), do: {:error, :invalid_connection}
 
   def inboxes(subject) do
     if owner?(subject) do
@@ -305,6 +309,23 @@ defmodule EmailJanitor.SelfHost.Store do
 
   defp inbox_id(subject),
     do: "google-" <> Base.encode16(:crypto.hash(:sha256, subject), case: :lower)
+
+  defp readdress_checkpoint!(scope, id, old_address, new_address) do
+    alias EmailJanitor.Gmail.Ingestion.Checkpoint
+
+    case scope.repo.get(Checkpoint, id, prefix: scope.prefix) do
+      nil ->
+        :ok
+
+      %Checkpoint{address: ^old_address} = checkpoint ->
+        scope.repo.update!(Ecto.Changeset.change(checkpoint, address: new_address),
+          prefix: scope.prefix
+        )
+
+      _ ->
+        scope.repo.rollback(:invalid_connection)
+    end
+  end
 
   defp retire_replaced_subjects(scope, subject, address) do
     bindings =

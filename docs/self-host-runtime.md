@@ -42,6 +42,8 @@ retains the historical old ID and disconnects its old grant atomically. Host
 migration 100 replaces the core unique-address index in this host scope only.
 Same-subject address changes preserve the account's ID/cursor but increment its
 connection epoch and core instruction version, fencing prepared old-address work.
+The checkpoint address changes in the same transaction after verifying the
+existing subject/address binding; its generation and cursor remain usable.
 Connection lifecycle changes serialize without holding provider calls under SQL.
 
 Explicit disconnect clears encrypted credentials and increments the epoch and
@@ -51,6 +53,8 @@ credential-version check: a late response cannot revive a disconnected grant or
 overwrite newer consent. Revoked grants clear credentials, require reauthorization
 and invalidate prepared work. Each SDK resolver captures its explicit inbox and
 epoch; there is no ambient Google account or machine credential fallback.
+Concurrent refresh losers re-read a valid winning grant. A stale invalid-grant
+response likewise uses newer consent instead of reporting a false reconnect need.
 
 Only account IDs, connection state, timezone, encrypted grants and typed outcomes
 persist here. Email bodies, raw replies, rendered digests and conversation
