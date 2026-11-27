@@ -7,11 +7,16 @@ defmodule EmailJanitor.Owner do
   """
   @request_ms 30_000
   @runtime_key {__MODULE__, :runtime}
+  @deadline_key {__MODULE__, :execution_deadline}
 
   @doc "Run one execution in an isolated owner, never the caller's reusable process."
-  def run(fun) do
+  def run(fun, timeout_ms \\ 60_000) when timeout_ms in 1..60_000 do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
     task =
       Task.Supervisor.async_nolink(EmailJanitor.ExecutorSupervisor, fn ->
+        Process.put(@deadline_key, deadline)
+
         try do
           fun.()
         rescue
@@ -21,7 +26,9 @@ defmodule EmailJanitor.Owner do
         end
       end)
 
-    case Task.yield(task, 60_000) || Task.shutdown(task, :brutal_kill) do
+    remaining = max(0, deadline - System.monotonic_time(:millisecond))
+
+    case Task.yield(task, remaining) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} -> result
       _ -> {:error, :executor_unavailable}
     end
@@ -91,6 +98,26 @@ defmodule EmailJanitor.Owner do
 
   @doc "Bound adapter dispatch by terminating its owner; stranded durable intents recover separately."
   def bounded(fun, timeout_ms \\ @request_ms) when timeout_ms in 1..@request_ms do
+    case dispatch_window(timeout_ms) do
+      :ok -> bounded_ready(fun, timeout_ms)
+      error -> error
+    end
+  end
+
+  @doc "Reserve a complete mutation watchdog window inside the overall execution deadline."
+  def dispatch_window(timeout_ms \\ @request_ms) do
+    case Process.get(@deadline_key) do
+      nil ->
+        :ok
+
+      deadline ->
+        if deadline - System.monotonic_time(:millisecond) >= timeout_ms + 1000,
+          do: :ok,
+          else: {:error, :dispatch_window_exhausted}
+    end
+  end
+
+  defp bounded_ready(fun, timeout_ms) do
     owner = self()
     ref = make_ref()
 

@@ -18,7 +18,7 @@ defmodule EmailJanitor.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger, :crypto], mod: {EmailJanitor.Application, []}]
+    [extra_applications: [:logger, :crypto, :inets, :ssl], mod: {EmailJanitor.Application, []}]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
@@ -33,6 +33,9 @@ defmodule EmailJanitor.MixProject do
       {:ecto_sql, "~> 3.14"},
       {:postgrex, "~> 0.23.0"},
       {:req, "~> 0.7.0"},
+      {:google_api_gmail, "~> 0.17.0"},
+      {:assent, "~> 0.4.0"},
+      {:plug, "~> 1.20", only: :test},
       {:stream_data, "~> 1.4", only: :test}
     ]
   end
