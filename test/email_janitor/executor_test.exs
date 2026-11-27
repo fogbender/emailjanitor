@@ -120,9 +120,51 @@ defmodule EmailJanitor.ExecutorTest do
 
   test "a cancelled intent can be retried only after fresh safeguards", ctx do
     assert {:unresolved, id} = execute(ctx, mode: :error_without_apply)
-    :ok = Store.transition(ctx.scope, ctx.inbox.id, id, :unresolved, :cancelled)
+
+    assert {:ok, {:cancelled, _}} =
+             Store.reconcile(ctx.scope, ctx.inbox.id, id, %{complete?: true, events: []})
+
     assert {:done, new_id} = execute(ctx)
     refute id == new_id
+  end
+
+  test "mixed recovery never cancels restored IDs to retry an unseen batch member", ctx do
+    messages = [message(id: "message-1"), message(id: "message-2")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    ctx = %{ctx | proposal: proposal}
+    assert {:unresolved, id} = execute(ctx, mode: :timeout_after_apply)
+
+    history = %{
+      complete?: true,
+      events: [
+        %{history_id: "101", message_id: "message-1", event: :inbox_removed},
+        %{history_id: "102", message_id: "message-1", event: :inbox_added}
+      ]
+    }
+
+    assert {:ok, {:restored, %{retry_ids: ["message-2"]}}} =
+             Store.reconcile(ctx.scope, ctx.inbox.id, id, history)
+
+    assert %Action{applied_message_ids: ["message-1"], restored_message_ids: ["message-1"]} =
+             Store.get(ctx.scope, ctx.inbox.id, id)
+
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+    assert {:skip, :manually_restored} = execute(ctx)
+    assert [["message-1", "message-2"]] == Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "incomplete history preserves the uncertain intent", ctx do
+    assert {:unresolved, id} = execute(ctx, mode: :error_without_apply)
+
+    assert {:error, :incomplete_history} =
+             Store.reconcile(ctx.scope, ctx.inbox.id, id, %{complete?: false, events: []})
+
+    assert %Action{state: :unresolved} = Store.get(ctx.scope, ctx.inbox.id, id)
+    assert {:existing, _, :unresolved} = execute(ctx)
   end
 
   test "record IDs are scoped by both schema and inbox", ctx do

@@ -1,7 +1,7 @@
 defmodule EmailJanitor.Store do
   @moduledoc "Scoped durable intents and restoration history. No raw email or provider output is accepted."
   import Ecto.Query
-  alias EmailJanitor.{Inbox, Proposal}
+  alias EmailJanitor.{Inbox, Proposal, Reconciliation}
   alias EmailJanitor.Store.{Action, Mailbox, Migration, Scope}
 
   def install(%Scope{repo: repo, prefix: prefix}) do
@@ -77,29 +77,78 @@ defmodule EmailJanitor.Store do
       when {from_state, to_state} in [
              intent: :done,
              intent: :unresolved,
-             intent: :cancelled,
-             unresolved: :done,
-             unresolved: :restored,
-             unresolved: :cancelled,
              done: :restored
            ] do
+    action = get(scope, inbox_id, id)
+
+    outcomes =
+      case {to_state, action} do
+        {:done, %Action{}} -> [applied_message_ids: action.message_ids]
+        {:restored, %Action{}} -> [restored_message_ids: action.applied_message_ids]
+        _ -> []
+      end
+
     {count, _} =
       scope.repo.update_all(
         from(a in Action,
           where: a.id == ^id and a.inbox_id == ^inbox_id and a.state == ^from_state
         ),
-        [set: [state: to_state, updated_at: DateTime.utc_now()]],
+        [set: [state: to_state, updated_at: DateTime.utc_now()] ++ outcomes],
         prefix: scope.prefix
       )
 
     if count == 1, do: :ok, else: {:error, :state_changed}
   end
 
+  @doc "Resolve an uncertain batch from complete Gmail history, never a raw cancellation."
+  def reconcile(%Scope{} = scope, inbox_id, id, history) do
+    scope.repo.transaction(fn ->
+      scope.repo.one!(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+        prefix: scope.prefix
+      )
+
+      action = get(scope, inbox_id, id)
+
+      with %Action{state: state} when state in [:intent, :unresolved] <- action,
+           {:ok, resolution} <- Reconciliation.resolve(action, history) do
+        # Mixed batches stay blocked as a whole. Do not unprotect removed/restored
+        # IDs merely to retry an unseen member; a later per-message recovery worker
+        # may split immutable outcomes. No such worker is claimed in this slice.
+        next =
+          cond do
+            resolution.removed_ids == [] -> :cancelled
+            resolution.restored_ids != [] -> :restored
+            true -> :done
+          end
+
+        {1, _} =
+          scope.repo.update_all(
+            from(a in Action, where: a.id == ^id and a.inbox_id == ^inbox_id),
+            [
+              set: [
+                state: next,
+                applied_message_ids: resolution.removed_ids,
+                restored_message_ids: resolution.restored_ids,
+                updated_at: DateTime.utc_now()
+              ]
+            ],
+            prefix: scope.prefix
+          )
+
+        {next, resolution}
+      else
+        nil -> scope.repo.rollback(:unknown_action)
+        %Action{} -> scope.repo.rollback(:state_changed)
+        {:error, reason} -> scope.repo.rollback(reason)
+      end
+    end)
+  end
+
   def restored_ids(%Scope{} = scope, inbox_id) do
     scope.repo.all(
       from(a in Action,
         where: a.inbox_id == ^inbox_id and a.state == :restored,
-        select: a.message_ids
+        select: a.restored_message_ids
       ),
       prefix: scope.prefix
     )
