@@ -44,7 +44,7 @@ defmodule EmailJanitor.Conversation.Lookup do
           nil ->
             {:halt, {:error, :reference_not_found}}
 
-          {:error, reason} when reason in [:not_found, :thread_not_found] ->
+          {:error, reason} when reason == :thread_not_found ->
             {:halt, {:error, :reference_not_found}}
 
           _ ->
@@ -88,6 +88,7 @@ defmodule EmailJanitor.Conversation.Lookup do
                  Enum.all?(messages, &match?(%Message{thread_id: ^thread_id}, &1)) do
           {:ok, messages, Map.put(cache, thread_id, messages)}
         else
+          {:error, :thread_not_found} -> {:error, :thread_not_found}
           _ -> {:error, :lookup_unavailable}
         end
     end

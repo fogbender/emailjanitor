@@ -139,8 +139,8 @@ defmodule EmailJanitor.Conversation do
 
     loaded =
       Enum.reduce_while(unfinished, {:ok, [], [], []}, fn ref, {:ok, fresh, missing, known} ->
-        case Ledger.action_result(ctx.scope, ctx.inbox.id, receipt.id, ref.message_id) do
-          {status, action_id} ->
+        case bound_result(ctx, receipt, ref) do
+          {status, action_id} when status in [:done, :unresolved] ->
             {:cont, {:ok, fresh, missing, known ++ [{ref, status, action_id}]}}
 
           :none ->
@@ -154,6 +154,9 @@ defmodule EmailJanitor.Conversation do
               _ ->
                 {:halt, {:error, :conversation_unavailable}}
             end
+
+          _ ->
+            {:halt, {:error, :conversation_unavailable}}
         end
       end)
 
@@ -184,7 +187,7 @@ defmodule EmailJanitor.Conversation do
                refs,
                ctx.guard
              ),
-           :ok <- record_results(ctx, claimed, missing, "unavailable", nil),
+           :ok <- record_results(ctx, claimed, missing, "missing", nil),
            :ok <- record_known(ctx, claimed, known) do
         excluded =
           Enum.map(missing, & &1.token) ++ Enum.map(known, fn {ref, _, _} -> ref.token end)
@@ -192,6 +195,23 @@ defmodule EmailJanitor.Conversation do
         available = Enum.reject(refs, &(&1.token in excluded))
         finish_effects(ctx, claimed, available, proposal)
       end
+    end
+  end
+
+  defp bound_result(ctx, receipt, ref) do
+    case Ledger.action_result(ctx.scope, ctx.inbox.id, receipt.id, ref.message_id) do
+      {:prepared, action_id} ->
+        # Durable recovery and host settlement never send a Gmail request.
+        # Recovery cannot cancel an owner whose death is not proven.
+        Executor.recover(ctx.scope, ctx.inbox, action_id, execution_options(ctx))
+
+        case Ledger.action_result(ctx.scope, ctx.inbox.id, receipt.id, ref.message_id) do
+          {:prepared, _} -> {:error, :request_in_flight}
+          result -> result
+        end
+
+      result ->
+        result
     end
   end
 
@@ -401,8 +421,11 @@ defmodule EmailJanitor.Conversation do
     Enum.reduce_while(refs, :ok, fn ref, :ok ->
       actual =
         case Ledger.action_result(ctx.scope, ctx.inbox.id, receipt.id, ref.message_id) do
-          {known, id} ->
+          {known, id} when known in [:done, :unresolved] ->
             {Atom.to_string(known), id}
+
+          {:prepared, _} ->
+            {"unavailable", nil}
 
           :none ->
             cond do
@@ -412,7 +435,7 @@ defmodule EmailJanitor.Conversation do
               status == "done" ->
                 {"unavailable", nil}
 
-              (status == "unresolved" and action) && ref.message_id not in action.message_ids ->
+              status == "unresolved" ->
                 {"unavailable", nil}
 
               true ->

@@ -16,9 +16,11 @@ defmodule EmailJanitor.ConversationFixtureGmail do
   end
 
   def thread(inbox, thread, opts) do
-    if opts[:thread_failure] && opts[:thread_failure].(),
-      do: {:error, :gmail_unavailable},
-      else: EmailJanitor.TestGmail.thread(inbox, thread, opts)
+    cond do
+      opts[:thread_error] -> {:error, opts[:thread_error]}
+      opts[:thread_failure] && opts[:thread_failure].() -> {:error, :gmail_unavailable}
+      true -> EmailJanitor.TestGmail.thread(inbox, thread, opts)
+    end
   end
 
   def contacted(inbox, keys, opts) do
@@ -318,12 +320,14 @@ defmodule EmailJanitor.ConversationTest do
     ctx = context(ctx, operation: :restore, target: :none)
     ctx = %{ctx | execution_options: [restore_adapter: EmailJanitor.MissingRestoreAdapter]}
 
-    assert {:ok, reply} =
-             Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Undo that."))
+    request_id = Ecto.UUID.generate()
 
-    assert Content.read(reply) =~ "could not finish processing"
-    refute Content.read(reply) =~ "uncertain"
-    refute Content.read(reply) =~ "returned"
+    assert {:error, :effects_pending} =
+             Conversation.respond(ctx, request_id, Content.new("Undo that."))
+
+    receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+    refute receipt.completed
+    assert Enum.map(receipt.results, & &1["status"]) == ["unavailable"]
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 
@@ -407,10 +411,9 @@ defmodule EmailJanitor.ConversationTest do
            Keyword.put(opts, :contacted_hook, fn -> Agent.update(connected, fn _ -> false end) end)}
     }
 
-    assert {:ok, reply} =
+    assert {:error, :effects_pending} =
              Conversation.respond(ctx, Ecto.UUID.generate(), Content.new("Mark it Done."))
 
-    assert Content.read(reply) =~ "could not finish processing"
     assert Agent.get(t.state, & &1.calls) == []
     assert TestRepo.aggregate(Action, :count, :id, prefix: ctx.scope.prefix) == 0
     Agent.stop(connected)
@@ -613,7 +616,7 @@ defmodule EmailJanitor.ConversationTest do
     request_id = reserve_pending(ctx)
     Agent.update(t.state, &%{&1 | messages: []})
     assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
-    assert Content.read(reply) =~ "could not finish processing"
+    assert Content.read(reply) =~ "could no longer be found"
     assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id).completed
     assert Agent.get(t.state, & &1.calls) == []
   end
@@ -672,5 +675,146 @@ defmodule EmailJanitor.ConversationTest do
         Process.sleep(5)
         assert_dispatched_intent(ctx, state, attempts - 1)
     end
+  end
+
+  test "an exact missing thread is terminal while a missing profile stays retryable", t do
+    ctx = context(t.ctx, target: :none)
+    request_id = reserve_pending(ctx)
+    {gmail, opts} = ctx.gmail
+    profile_error = %{ctx | gmail: {gmail, Keyword.put(opts, :thread_error, :not_found)}}
+
+    assert {:error, :conversation_unavailable} =
+             Conversation.respond(profile_error, request_id, Content.new("Retry."))
+
+    refute Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id).completed
+    deleted = %{ctx | gmail: {gmail, Keyword.put(opts, :thread_error, :thread_not_found)}}
+    assert {:ok, reply} = Conversation.respond(deleted, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "could no longer be found"
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id).completed
+  end
+
+  test "a dead prepared action is recovered without Gmail and a fresh bound action finishes the request",
+       t do
+    ctx = context(t.ctx, target: :none)
+    request_id = Ecto.UUID.generate()
+
+    {:ok, ref} =
+      EmailJanitor.Conversation.Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+
+    task =
+      Task.async(fn ->
+        plan = %Plan{
+          operation: :done,
+          references: [ref.token],
+          preference_target: :none,
+          instruction: Content.new(""),
+          query: Content.new(""),
+          reply: Content.new(""),
+          search_complete: true
+        }
+
+        {:ok, receipt} =
+          Ledger.reserve(
+            ctx.scope,
+            ctx.inbox.id,
+            ctx.conversation_id,
+            request_id,
+            plan,
+            [ref],
+            fn -> :ok end
+          )
+
+        {:ok, proposal} =
+          EmailJanitor.Executor.review(
+            ctx.scope,
+            ctx.inbox,
+            "thread-1",
+            ctx.gmail,
+            {EmailJanitor.TestClassifier, []},
+            "",
+            1
+          )
+
+        policy =
+          EmailJanitor.Conversation.ExecutionPolicy.new(
+            Policy.unlimited(),
+            ctx.scope,
+            ctx.inbox.id,
+            receipt
+          )
+
+        assert {:ok, {:created, action}} =
+                 Store.intent(ctx.scope, ctx.inbox.id, proposal, "100", policy: policy)
+
+        action.id
+      end)
+
+    old_id = Task.await(task)
+    assert Store.get(ctx.scope, ctx.inbox.id, old_id).dispatch_started_at == nil
+    assert Agent.get(t.state, & &1.calls) == []
+    ctx = %{ctx | model: [script: fn _, _, _ -> raise "no replanning" end]}
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "marked 1 email Done"
+    assert Store.get(ctx.scope, ctx.inbox.id, old_id).state == :cancelled
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+
+    assert {:done, new_id} =
+             Ledger.action_result(ctx.scope, ctx.inbox.id, request_id, "message-1")
+
+    refute new_id == old_id
+  end
+
+  test "a request's own historical Done remains attributable after that action was restored", t do
+    {:ok, control} = Agent.start_link(fn -> %{} end)
+    ctx = context(t.ctx, target: :none)
+    {gmail, opts} = ctx.gmail
+
+    ctx = %{
+      ctx
+      | execution_options: [
+          on_plan_admitted: fn _, _, _ ->
+            owner = self()
+            Agent.update(control, &Map.put(&1, :owner, owner))
+            :ok
+          end
+        ],
+        gmail:
+          {gmail,
+           Keyword.put(opts, :before, fn ->
+             Process.exit(Agent.get(control, & &1.owner), :kill)
+           end)}
+    }
+
+    request_id = Ecto.UUID.generate()
+
+    assert {:error, :conversation_unavailable} =
+             Conversation.respond(ctx, request_id, Content.new("Done."))
+
+    assert_confirmed_action(ctx, 200)
+    TestRepo.update_all(Action, [set: [state: :restored]], prefix: ctx.scope.prefix)
+    Agent.update(t.state, &%{&1 | messages: []})
+    ctx = %{ctx | execution_options: [], gmail: {gmail, opts}}
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "marked 1 email Done"
+    Agent.stop(control)
+  end
+
+  test "an existing unresolved action from another request isn't recorded as this request's effect",
+       t do
+    first = context(t.ctx, target: :none)
+    {gmail, opts} = first.gmail
+    first = %{first | gmail: {gmail, Keyword.put(opts, :mode, :error_without_apply)}}
+    assert {:ok, _} = Conversation.respond(first, Ecto.UUID.generate(), Content.new("Done."))
+    ctx = %{context(t.ctx, target: :none) | conversation_id: Ecto.UUID.generate()}
+    request_id = Ecto.UUID.generate()
+
+    assert {:error, :effects_pending} =
+             Conversation.respond(ctx, request_id, Content.new("Done."))
+
+    receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+    refute receipt.completed
+    assert Enum.map(receipt.results, & &1["effect_id"]) == [nil]
+    assert Enum.map(receipt.results, & &1["status"]) == ["unavailable"]
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
   end
 end

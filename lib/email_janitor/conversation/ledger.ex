@@ -193,7 +193,7 @@ defmodule EmailJanitor.Conversation.Ledger do
             b.request_id == ^request_id and b.inbox_id == ^inbox_id and
               a.inbox_id == ^inbox_id and ^message_id in b.message_ids and
               (a.state in [:intent, :unresolved] or
-                 (a.state == :done and ^message_id in a.applied_message_ids)),
+                 (a.state in [:done, :restored] and ^message_id in a.applied_message_ids)),
           order_by: [desc: a.inserted_at],
           limit: 1,
           select: a
@@ -204,8 +204,11 @@ defmodule EmailJanitor.Conversation.Ledger do
       )
 
     case action do
-      %{state: :done, applied_message_ids: ids, id: id} ->
+      %{state: state, applied_message_ids: ids, id: id} when state in [:done, :restored] ->
         if message_id in ids, do: {:done, id}, else: :none
+
+      %{state: :intent, dispatch_started_at: nil, id: id} ->
+        {:prepared, id}
 
       %{state: state, id: id} when state in [:intent, :unresolved] ->
         {:unresolved, id}
@@ -235,7 +238,7 @@ defmodule EmailJanitor.Conversation.Ledger do
     end)
   end
 
-  @result_statuses ~w(done restored protected blocked unresolved unavailable unchanged)
+  @result_statuses ~w(done restored protected blocked unresolved unavailable unchanged missing)
   def record_result(scope, inbox_id, conversation_id, request_id, reference, status, effect_id)
       when status in @result_statuses do
     with true <- is_nil(effect_id) or match?({:ok, _}, Ecto.UUID.cast(effect_id)) do
@@ -288,8 +291,9 @@ defmodule EmailJanitor.Conversation.Ledger do
           expected = Enum.map(receipt.references, & &1["token"]) |> Enum.sort()
           observed = Enum.map(receipt.results, & &1["reference"]) |> Enum.sort()
 
-          if expected != observed or receipt.preference_status == :pending,
-            do: scope.repo.rollback(:effects_pending)
+          if expected != observed or receipt.preference_status == :pending or
+               Enum.any?(receipt.results, &(&1["status"] == "unavailable")),
+             do: scope.repo.rollback(:effects_pending)
 
           Ecto.Changeset.change(receipt, completed: true)
         end
