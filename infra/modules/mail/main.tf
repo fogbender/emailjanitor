@@ -102,7 +102,6 @@ resource "aws_kms_key" "spool" {
       Condition = {
         ArnEquals = { "aws:SourceArn" = local.topic_arn }
         StringEquals = {
-          "aws:SourceAccount"                      = local.account_id
           "kms:EncryptionContext:aws:sns:topicArn" = local.topic_arn
         }
       }

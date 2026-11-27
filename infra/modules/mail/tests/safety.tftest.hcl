@@ -47,7 +47,6 @@ run "safe_transport_defaults" {
       jsondecode(aws_kms_key.spool.policy).Statement[1].Principal.Service == "sns.amazonaws.com" &&
       toset(jsondecode(aws_kms_key.spool.policy).Statement[1].Action) == toset(["kms:GenerateDataKey", "kms:Decrypt"]) &&
       jsondecode(aws_kms_key.spool.policy).Statement[1].Condition.ArnEquals["aws:SourceArn"] == aws_sns_topic.receipts.arn &&
-      jsondecode(aws_kms_key.spool.policy).Statement[1].Condition.StringEquals["aws:SourceAccount"] == "123456789012" &&
       jsondecode(aws_kms_key.spool.policy).Statement[1].Condition.StringEquals["kms:EncryptionContext:aws:sns:topicArn"] == aws_sns_topic.receipts.arn &&
       jsondecode(aws_kms_key.spool.policy).Statement[0].Principal.AWS == "arn:aws:iam::123456789012:root"
     )
