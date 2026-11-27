@@ -86,4 +86,23 @@ defmodule EmailJanitor.NotificationWorkerServerTest do
 
     refute logs =~ "PRIVATE_NOTIFICATION_TOKEN"
   end
+
+  test "acknowledged deliberate disconnections do not wake cleanup workers" do
+    owner = self()
+
+    server =
+      start_supervised!(
+        {Server,
+         poll: fn ->
+           send(owner, :polled_disconnected)
+           {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 0}}
+         end,
+         wake: fn -> send(owner, :incorrect_cleanup_wake) end,
+         interval_ms: 5_000}
+      )
+
+    assert_receive :polled_disconnected, 1_000
+    refute_receive :incorrect_cleanup_wake, 100
+    assert :sys.get_state(server).attempts == 0
+  end
 end

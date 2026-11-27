@@ -368,6 +368,55 @@ defmodule EmailJanitor.IngestionTest do
     assert Enum.map(pending, & &1.message_id) == ["message-1", "message-2"]
   end
 
+  test "trusted disconnected notifications acknowledge without checkpoint while unknown stays unacked",
+       %{scope: scope, box: box} do
+    observer = self()
+    known = delivery()
+    unknown = %{delivery() | email_address: "unknown@acme.com", ack_id: "unknown-ack"}
+
+    config = [
+      deliveries: [known, unknown],
+      ack: fn deliveries ->
+        send(observer, {:acked_routes, Enum.map(deliveries, & &1.ack_id)})
+        :ok
+      end
+    ]
+
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+
+    assert {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 1}} =
+             NotificationWorker.poll_once({PubSub, config}, fn
+               address when address == box.address -> {:ignore, :disconnected}
+               _ -> {:error, :unknown_inbox}
+             end)
+
+    assert_receive {:acked_routes, [id]}
+    assert id == known.ack_id
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+    assert TestRepo.all(Arrival, prefix: scope.prefix) == []
+  end
+
+  test "failed ignored acknowledgement can redeliver and unsupported ignore routes fail closed",
+       %{scope: scope, box: box} do
+    config = [deliveries: [delivery()], ack: fn _ -> {:error, :temporary} end]
+
+    assert {:ok, %{recorded: 0, ignored: 1, acknowledged: 0, failed: 1}} =
+             NotificationWorker.poll_once({PubSub, config}, fn _ -> {:ignore, :disconnected} end)
+
+    config = Keyword.put(config, :ack, fn _ -> :ok end)
+
+    assert {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 0}} =
+             NotificationWorker.poll_once({PubSub, config}, fn _ -> {:ignore, :disconnected} end)
+
+    assert {:error, :not_initialized} = Ingestion.checkpoint(scope, box.id)
+
+    config =
+      Keyword.put(config, :ack, fn _ -> flunk("unknown ignore reason must not acknowledge") end)
+
+    assert {:ok, %{recorded: 0, ignored: 0, acknowledged: 0, failed: 1}} =
+             NotificationWorker.poll_once({PubSub, config}, fn _ -> {:ignore, :unknown} end)
+  end
+
   test "ack happens after commit; crash after recording safely redelivers", %{
     scope: scope,
     box: box
