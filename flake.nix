@@ -84,6 +84,9 @@
               true = is_pid(Process.whereis(EmailJanitor.Supervisor))
               true = File.regular?(Application.app_dir(:email_janitor, "priv/prompts/classify.txt"))
               true = Code.ensure_loaded?(EmailJanitor.Mail.SDK)
+              true = Code.ensure_loaded?(EmailJanitor.SelfHost.Web)
+              true = Code.ensure_loaded?(EmailJanitor.SelfHostWeb.Endpoint)
+              true = File.regular?(Application.app_dir(:email_janitor, "priv/static/selfhost.js"))
             '
             python3 ${./scripts/check-release-cookie.py} \
               ${self.packages.${system}.emailjanitor} email_janitor ${pkgs.coreutils}/bin/base64
