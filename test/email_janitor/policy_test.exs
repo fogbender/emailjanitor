@@ -312,7 +312,7 @@ defmodule EmailJanitor.PolicyTest do
                Store.intent(ctx.scope, ctx.inbox.id, newer, "101", policy: scoped_policy)
     end
 
-    assert {:keep, :classifier_kept} =
+    assert {:error, :proposal_changed} =
              Executor.review(
                ctx.scope,
                ctx.inbox,

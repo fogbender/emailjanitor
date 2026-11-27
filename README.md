@@ -100,7 +100,15 @@ the private SaaS can enforce its free whole-thread rule while paid and default
 single-user deployments admit eligible subsets. Legacy five-argument policy
 adapters reject partial admission without reserving quota. Partial retirement
 withdraws evaluated or now-archived IDs only; unevaluated INBOX context keeps its
-pending metadata and stable marker. No new model metadata contains email bodies.
+pending metadata and stable marker. Remaining IDs shrink durably on each partial
+retirement, and the marker disappears when every member is accounted for.
+Per-message review fences survive marker removal, so newer Keep decisions fence
+older Done work, including a cached proposal whose execution starts later.
+Scoped reviews carry their original database timestamp; a blocked cached proposal
+must be reviewed afresh before another admission. Mixed Done categories retain
+their per-ID enums in `message_categories`; the batch category is `mixed`.
+These additions use [instance migration 6](docs/migrations.md); no body text is
+part of this metadata.
 
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.

@@ -26,7 +26,9 @@ defmodule EmailJanitor.Reviewer do
         |> Enum.sort_by(&elem(&1, 0))
 
       case {Enum.uniq(Enum.map(messages, & &1.thread_id)), done} do
-        {[thread_id], [{_, decision} | _]} ->
+        {[thread_id], [_ | _]} ->
+          categories = Map.new(done, fn {id, decision} -> {id, decision.category} end)
+
           {:ok,
            %Proposal{
              thread_id: thread_id,
@@ -35,7 +37,8 @@ defmodule EmailJanitor.Reviewer do
              evaluated_message_ids: targets |> Enum.map(& &1.id) |> Enum.sort(),
              fingerprint: Message.fingerprint(messages),
              instruction_version: version,
-             category: decision.category
+             category: Proposal.batch_category(categories),
+             message_categories: categories
            }}
 
         {[_], []} ->

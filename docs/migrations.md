@@ -12,11 +12,12 @@ inside an optional module.
 | 3 | Conversational preferences/receipts | `Preferences.install/1` |
 | 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` (in development) |
 | 5 | Daily digest metadata | Digest installer (in development) |
-| 6 | Per-message candidate evaluation/category metadata | Core target installer (in development) |
-| 7 | Reserved: per-message manual restoration protections/receipts | Restoration installer (planned) |
+| 6 | Target categories, remaining candidates and review fences | `Store.install/1` |
+| 7 | Restoration intent metadata | Restoration installer (in development) |
+| 8 | Conversation effect receipts and latest references | Conversation installer (in development) |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement/deferred provenance ledger | `Worker.install/1` |
 
-Versions 8–9 are unallocated. Changes to an already released schema require a new
+Version 9 is unallocated. Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's
 global `public` schema has its own independent registry and migration table.

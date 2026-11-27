@@ -106,6 +106,81 @@ defmodule EmailJanitor.TargetsTest do
   defp policy(ctx, adapter \\ EmailJanitor.TargetPolicy),
     do: %Policy{adapter: adapter, context: %{scope: ctx.scope, mode: :block, observer: self()}}
 
+  test "every Done target retains its category in a mixed action", ctx do
+    decisions =
+      for {id, category} <- [{"pitch", "cold_outreach"}, {"keep", "user_instruction"}],
+          do: %{
+            "message_id" => id,
+            "action" => "done",
+            "confidence" => "high",
+            "category" => category
+          }
+
+    assert {:ok, proposal} = review(ctx, ["pitch", "keep"], result: %{"decisions" => decisions})
+    assert proposal.category == :mixed
+
+    assert proposal.message_categories == %{
+             "pitch" => :cold_outreach,
+             "keep" => :user_instruction
+           }
+
+    assert {:done, id} = execute(ctx, proposal)
+
+    assert %Action{category: :mixed, message_categories: categories} =
+             Store.get(ctx.scope, ctx.inbox.id, id)
+
+    assert categories == %{"pitch" => "cold_outreach", "keep" => "user_instruction"}
+    assert [["keep", "pitch"]] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "disjoint partial keep reviews exhaust and delete a blocked candidate", ctx do
+    {:ok, whole} =
+      Reviewer.review(
+        ctx.messages,
+        ctx.inbox,
+        MapSet.new(),
+        {EmailJanitor.TestClassifier, []},
+        "",
+        1
+      )
+
+    assert {:blocked, :upgrade_required} = execute(ctx, whole, policy: policy(ctx))
+    assert [%Candidate{id: original}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    for {id, count} <- [{"pitch", 2}, {"keep", 1}, {"old-context", 0}] do
+      assert {:keep, :classifier_kept} =
+               Executor.review(
+                 ctx.scope,
+                 ctx.inbox,
+                 "thread-1",
+                 {TestGmail, [state: ctx.state]},
+                 {TargetClassifier, [keep_ids: [id]]},
+                 "",
+                 1,
+                 cleanup_target_ids: [id],
+                 policy: policy(ctx)
+               )
+
+      case TestRepo.all(Candidate, prefix: ctx.scope.prefix) do
+        [] ->
+          assert count == 0
+
+        [%Candidate{id: ^original, remaining_message_ids: remaining}] ->
+          assert length(remaining) == count
+      end
+    end
+
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    {:ok, fresh} = review(ctx, ["pitch", "keep", "old-context"])
+    assert {:blocked, :upgrade_required} = execute(ctx, fresh, policy: policy(ctx))
+
+    assert [%Candidate{id: replacement, remaining_message_ids: ["keep", "old-context", "pitch"]}] =
+             TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert replacement != original
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
   test "one model review selects Done targets while preserving older INBOX and legitimate context",
        ctx do
     assert {:ok, proposal} = review(ctx, ["pitch", "keep"], keep_ids: ["keep"], observer: self())
@@ -332,7 +407,7 @@ defmodule EmailJanitor.TargetsTest do
                policy: policy(ctx)
              )
 
-    assert %{rows: [[["old-context", "pitch"]]]} =
+    assert %{rows: [[["old-context"]]]} =
              Ecto.Adapters.SQL.query!(
                TestRepo,
                "SELECT message_ids FROM ej_test_a.policy_events WHERE action_id=$1 AND kind='retire'",
