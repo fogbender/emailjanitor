@@ -223,6 +223,15 @@ defmodule EmailJanitor.GoogleOAuthTest do
     end
   end
 
+  test "Google's documented legacy issuer is accepted with all signature and identity checks",
+       context do
+    session = session(context.config)
+    fixture(context, token(context, session, %{"iss" => "accounts.google.com"}))
+
+    assert {:ok, %Result{subject: "google-subject-123", email: "owner@acme.com"}} =
+             OAuth.callback(context.config, session, callback_params(session))
+  end
+
   test "unsigned, HS256, wrong signing key, unknown kid and missing required claims are rejected",
        context do
     session = session(context.config)

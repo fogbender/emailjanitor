@@ -98,7 +98,8 @@ defmodule EmailJanitor.Google.OAuth do
 
   def callback(%Config{} = config, %Session{} = session, params) when is_map(params) do
     protect(:authorization_failed, fn ->
-      with true <- valid_session?(session),
+      with :ok <- EmailJanitor.TransportPrivacy.check(),
+           true <- valid_session?(session),
            true <- valid_callback?(params),
            {:ok, %{user: %{subject: subject, email: email}, token: raw}} <-
              config
@@ -137,7 +138,8 @@ defmodule EmailJanitor.Google.OAuth do
 
   def refresh(%Config{} = config, %Content{} = content) do
     protect(:refresh_failed, fn ->
-      with true <- byte_size(Content.read(content)) <= 65_536,
+      with :ok <- EmailJanitor.TransportPrivacy.check(),
+           true <- byte_size(Content.read(content)) <= 65_536,
            {:ok, old} when is_map(old) <- Jason.decode(Content.read(content)),
            true <- valid_credential?(old["refresh_token"]),
            {:ok, raw} <-
@@ -220,6 +222,7 @@ defmodule EmailJanitor.Google.OAuth do
       client_secret: Content.read(config.client_secret),
       redirect_uri: config.redirect_uri,
       base_url: @openid["issuer"],
+      trusted_issuers: ["accounts.google.com"],
       openid_configuration: @openid,
       token_url: @openid["token_endpoint"],
       client_authentication_method: :client_secret_post,

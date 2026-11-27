@@ -64,6 +64,8 @@ accepts `:sign_in` (openid/email only) or `:connect` (also Gmail.modify and offl
 consent). Every attempt uses random state, nonce and S256 PKCE. `callback/3`
 accepts only a previously saved `OAuth.Session`; it verifies Google's RS256
 signature, issuer, audience, authorized party, expiry, nonce and verified email.
+Both documented Google issuer values (`https://accounts.google.com` and
+`accounts.google.com`) are accepted; unrelated issuers remain rejected.
 Connecting requires the granted Gmail scope and a refresh token. Token responses
 are reduced to access/refresh credentials, Bearer type, expiry epoch seconds and
 scope, inside redacted `Content`; ID tokens are discarded after verification.
@@ -79,6 +81,13 @@ credential stores. The internal Config HTTP options accept only a trusted test
 plug, never options from a browser request.
 An expired/revoked refresh grant returns `:reauthorization_required`; outages,
 rate limits and malformed responses return `:refresh_failed` for host backoff.
+
+Google/OAuth HTTP operations also fail closed when any Finch telemetry handler is
+registered: those events expose raw request headers and bodies independently of
+SDK logging. Hosts must keep these handlers absent and must not change observer
+configuration while calls run. `TransportPrivacy.check/0` exposes this preflight;
+the library never removes a host's observers. Metadata-only application events
+should be emitted separately from provider HTTP events.
 
 `EmailJanitor.Gmail.SDK` uses Google's generated `google_api_gmail` client. Supply
 an `EmailJanitor.Gmail.Config` with the connected `Inbox` and a zero-argument

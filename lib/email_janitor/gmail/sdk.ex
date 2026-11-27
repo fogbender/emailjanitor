@@ -172,6 +172,7 @@ defmodule EmailJanitor.Gmail.SDK do
     %Config{inbox: inbox, token_resolver: resolver} = config = Keyword.fetch!(opts, :config)
 
     with true <- inbox_id == inbox.id,
+         :ok <- EmailJanitor.TransportPrivacy.check(),
          {:ok, token} <- resolver.(),
          {:ok, token} <- token(token),
          connection = Connection.new(token),
