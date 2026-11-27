@@ -22,6 +22,12 @@ defmodule EmailJanitor.Models.SDK do
   defp perform(messages, instructions, opts) do
     %Inbox{} = inbox = Keyword.fetch!(opts, :inbox)
 
+    # SDK debug logging is process-global; fail closed if a host enables it.
+    false = ReqLLM.Debug.enabled?()
+    # Finch events include raw request bodies/headers. Observer configuration is
+    # a host trust boundary: fail closed if ANY Finch handlers are installed.
+    [] = :telemetry.list_handlers([:finch])
+
     if not is_binary(instructions) or byte_size(instructions) > 32_000,
       do: throw(:invalid_content)
 
@@ -49,7 +55,7 @@ defmodule EmailJanitor.Models.SDK do
              Content.new(user_text),
              schema,
              opts,
-             not is_nil(target_ids)
+             false
            ),
          {:ok, value} <- Jason.decode(Content.read(object)),
          {:ok, _} <- parse(value, target_ids) do

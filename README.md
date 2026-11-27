@@ -1,11 +1,18 @@
 # Email Janitor
 
+The [SES transport foundation](docs/mail-transport.md) documents the metadata-only
+outbox, trusted inbound receipts, short-lived spool and remaining host contracts.
+The [daily digest library](docs/daily-digests.md) adds local-21:00 scheduling,
+frozen sender/subject snapshots and a supervised metadata-only worker.
+
 Email Janitor marks unwanted outreach Done while you keep your existing email
 client. This is the MIT-licensed single-user engine and self-hosted service;
 one user can connect multiple Google inboxes. The hosted application's tenancy
 and billing live separately in `fogbender/emailjanitor-saas`.
 
-**Under development.** No production service or deployable release yet. The
+**Under development.** No integrated production service yet. A
+[locked Nix release](docs/release-packaging.md) now builds the reviewed library;
+host startup and live provider verification remain integration gates. The
 existing personal Janitor remains independent until a verified cutover.
 
 The [implementation plan](docs/implementation-plan.md) records the agreed product
@@ -387,7 +394,7 @@ separate work. No service account keys or email bodies are introduced here.
 
 The [AWS/OpenTofu and NixOS foundation](infra/README.md) includes isolated mail
 transport, Gmail notification wiring, provider-mocked checks and a service module
-that consumes a supplied release. It has not been applied and is not yet a complete
+whose flake export defaults to the locked release package. It has not been applied and is not yet a complete
 installer or deployable application. Run its local checks with:
 
 ```sh
@@ -439,3 +446,14 @@ redirection/retry, configuration, redaction and atomic-file tests plus dependenc
 audit. Only synthetic workload identities and mocked HTTP are used. Service
 unit wiring and deployment remain host integration work; no cloud resources
 have been changed by this helper slice.
+
+Targeted execution preserves uncovered Done work as a stable metadata-only
+candidate when an earlier overlapping action is still live. It returns
+`{:deferred, covering_action_id, recovery_result}` without another quota reservation
+or Gmail intent. The covering result retains settlement/reconciliation retry IDs;
+a fresh eligible subset can then pass normal admission. Candidate existence is
+not new-arrival or paid-backlog authorization by itself.
+Policy adapters must explicitly implement `retire_candidate_messages/4` to support
+partial metadata withdrawal. Legacy `retire_candidate/4` is used only when all
+remaining work is withdrawn; unsupported partial retirement rolls back before
+changing either host metadata or the core candidate.

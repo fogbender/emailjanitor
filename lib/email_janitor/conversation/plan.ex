@@ -194,7 +194,14 @@ defmodule EmailJanitor.Conversation.Plan do
     # The parser retains ordinary mailboxes, while the syntactic scan also
     # catches carriers folded into display names by malformed quoting/groups.
     # Neither path depends on the domain having a public suffix.
-    scanned = Regex.scan(~r/[^@\s<>(),:;"\x{0000}-\x{001F}]+@[a-zA-Z0-9.-]+/u, raw)
+    scanned = Regex.scan(~r/[^@\s<>(),:;"\x{0000}-\x{001F}]+@[^\s<>(),:;"]+/u, raw)
+
+    # Quoted local parts, comments, international domains and address literals
+    # are still carriers. Preserve their entire angle-delimited identifier.
+    enclosed =
+      Regex.scan(~r/<([^<>\r\n]{1,254})>/u, raw, capture: :all_but_first)
+      |> List.flatten()
+      |> Enum.filter(&String.contains?(&1, "@"))
 
     parsed =
       try do
@@ -206,9 +213,13 @@ defmodule EmailJanitor.Conversation.Plan do
         _, _ -> []
       end
 
-    (parsed ++ List.flatten(scanned))
+    (parsed ++ enclosed ++ List.flatten(scanned))
     |> Enum.filter(fn value ->
-      byte_size(value) <= 254 and Regex.match?(~r/\A[^@\s<>(),:;"]+@[a-zA-Z0-9.-]+\z/u, value)
+      byte_size(value) <= 254 and
+        Regex.match?(
+          ~r/\A(?:"[^"\s,;:()]{1,64}"|[^@\s<>(),:;"\[\]]+(?:\([^()\s,;:"]{1,32}\))?)@(?:[^@\s<>(),:;"\[\]]+|\[(?:IPv6:)?[0-9a-fA-F:.]+\])\z/u,
+          value
+        )
     end)
     |> Enum.map(&String.downcase/1)
     |> Enum.uniq()

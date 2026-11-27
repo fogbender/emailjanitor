@@ -1,13 +1,15 @@
 terraform {
   required_version = ">= 1.11, < 2.0"
   required_providers {
-    aws    = { source = "hashicorp/aws", version = "= 6.74.0" }
-    google = { source = "hashicorp/google", version = "= 8.12.0" }
+    aws         = { source = "hashicorp/aws", version = "= 6.74.0" }
+    google      = { source = "hashicorp/google", version = "= 8.12.0" }
+    google-beta = { source = "hashicorp/google-beta", version = "= 8.12.0" }
   }
 }
 
 provider "aws" { region = var.aws_region }
 provider "google" { project = var.google_project_id }
+provider "google-beta" { project = var.google_project_id }
 
 variable "name" { type = string }
 variable "aws_region" {
@@ -32,7 +34,7 @@ variable "mail_domain" { type = string }
 variable "google_project_id" { type = string }
 variable "nixos_ami" {
   type        = string
-  description = "Your prebuilt NixOS AMI containing the supplied release and nix/module.nix configuration."
+  description = "Your prebuilt NixOS AMI containing the configured release and service module."
   validation {
     condition     = can(regex("^ami-[0-9a-f]{8}([0-9a-f]{9})?$", var.nixos_ami))
     error_message = "Provide a NixOS AMI ID for the selected region. No disk conversion or image is built by apply."
@@ -173,8 +175,10 @@ output "mail_name_servers" { value = module.mail.name_servers }
 output "sender" { value = module.mail.sender }
 output "spool_bucket" { value = module.mail.spool_bucket }
 output "incoming_queue_url" { value = module.mail.queue_url }
+output "receipt_topic_arn" { value = module.mail.receipt_topic_arn }
 output "gmail_topic" { value = module.gmail_notifications.topic }
 output "gmail_subscription" { value = module.gmail_notifications.subscription }
+output "gmail_dead_letter_subscription" { value = module.gmail_notifications.dead_letter_subscription }
 output "google_consumer_service_account" { value = module.gmail_notifications.consumer_service_account }
 output "google_workload_identity_provider" { value = module.gmail_notifications.workload_identity_provider }
 output "bedrock_model_id" { value = var.bedrock_model_id }

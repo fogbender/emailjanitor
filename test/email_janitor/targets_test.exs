@@ -1,6 +1,8 @@
 defmodule EmailJanitor.TargetClassifier do
   @behaviour EmailJanitor.Classifier
   def classify(messages, _, opts) do
+    if hook = opts[:hook], do: hook.()
+
     if observer = opts[:observer],
       do: send(observer, {:target_review, Enum.map(messages, &{&1.id, &1.cleanup_target})})
 
@@ -43,6 +45,23 @@ defmodule EmailJanitor.TargetPolicy do
 
     reserve(ctx, inbox, action, ids, now)
   end
+
+  def settle(ctx, inbox, action, result),
+    do: EmailJanitor.TestPolicy.settle(ctx, inbox, action, result)
+
+  def retire_candidate_messages(ctx, inbox, action, ids),
+    do: EmailJanitor.TestPolicy.retire_candidate_messages(ctx, inbox, action, ids)
+
+  def retire_candidate(ctx, inbox, action, ids),
+    do: EmailJanitor.TestPolicy.retire_candidate(ctx, inbox, action, ids)
+end
+
+defmodule EmailJanitor.LegacyRetirementPolicy do
+  @behaviour EmailJanitor.Policy
+  def reserve(ctx, inbox, action, ids, now),
+    do: EmailJanitor.TestPolicy.reserve(ctx, inbox, action, ids, now)
+
+  def reserve(ctx, inbox, action, ids, now, _admission), do: reserve(ctx, inbox, action, ids, now)
 
   def settle(ctx, inbox, action, result),
     do: EmailJanitor.TestPolicy.settle(ctx, inbox, action, result)
@@ -512,5 +531,94 @@ defmodule EmailJanitor.TargetsTest do
 
     assert {:error, :invalid_decision} =
              TargetDecisions.parse(String.duplicate("x", 16_385), ["pitch"])
+  end
+
+  test "legacy whole-candidate retirement is never invoked for a partial withdrawal", ctx do
+    legacy = %Policy{
+      adapter: EmailJanitor.LegacyRetirementPolicy,
+      context: %{scope: ctx.scope, mode: :block}
+    }
+
+    assert {:ok, proposal} = review(ctx, ["pitch", "keep"])
+
+    assert {:blocked, :upgrade_required} =
+             Executor.execute(ctx.scope, ctx.inbox, proposal, {TestGmail, [state: ctx.state]},
+               policy: legacy
+             )
+
+    [candidate] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    keep_review = fn policy ->
+      Executor.review(
+        ctx.scope,
+        ctx.inbox,
+        "thread-1",
+        {TestGmail, [state: ctx.state]},
+        {TargetClassifier, [keep_ids: ["pitch"]]},
+        "",
+        1,
+        cleanup_target_ids: ["pitch"],
+        policy: policy
+      )
+    end
+
+    assert {:error, :partial_retirement_unsupported} = keep_review.(legacy)
+
+    assert TestRepo.get!(Candidate, candidate.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["keep", "pitch"]
+
+    events = fn ->
+      Ecto.Adapters.SQL.query!(
+        TestRepo,
+        "SELECT kind,message_ids FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 ORDER BY kind",
+        [candidate.id],
+        log: false
+      ).rows
+    end
+
+    assert [["reserve", ["keep", "pitch"]]] == events.()
+    exact = %Policy{adapter: EmailJanitor.TargetPolicy, context: legacy.context}
+    assert {:keep, :classifier_kept} = keep_review.(exact)
+
+    assert TestRepo.get!(Candidate, candidate.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["keep"]
+
+    assert [["reserve", ["keep"]], ["retire", ["pitch"]]] == events.()
+  end
+
+  test "whole retirement of a cancelled legacy action stays retired on later subset review",
+       ctx do
+    legacy = %Policy{
+      adapter: EmailJanitor.LegacyRetirementPolicy,
+      context: %{scope: ctx.scope, mode: :allow}
+    }
+
+    assert {:ok, proposal} = review(ctx, ["pitch", "keep"])
+
+    {:ok, {:created, action}} =
+      Store.intent(ctx.scope, ctx.inbox.id, proposal, "100", policy: legacy)
+
+    :ok = Store.cancel_prepared(ctx.scope, ctx.inbox.id, action.id, action.owner_token)
+
+    keep_review = fn targets ->
+      Executor.review(
+        ctx.scope,
+        ctx.inbox,
+        "thread-1",
+        {TestGmail, [state: ctx.state]},
+        {TargetClassifier, [keep_ids: targets]},
+        "",
+        1,
+        cleanup_target_ids: targets,
+        policy: legacy
+      )
+    end
+
+    assert {:error, :partial_retirement_unsupported} = keep_review.(["pitch"])
+    assert Store.get(ctx.scope, ctx.inbox.id, action.id).remaining_metadata_ids == nil
+    assert {:keep, :classifier_kept} = keep_review.(["pitch", "keep"])
+    assert Store.get(ctx.scope, ctx.inbox.id, action.id).remaining_metadata_ids == []
+    assert {:keep, :classifier_kept} = keep_review.(["pitch"])
+    assert Store.get(ctx.scope, ctx.inbox.id, action.id).remaining_metadata_ids == []
   end
 end

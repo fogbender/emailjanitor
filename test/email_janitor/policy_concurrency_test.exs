@@ -370,6 +370,396 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     end
   end
 
+  for keep_b <- [true, false], phase <- [:in_flight, :cached_review] do
+    test "an existing unresolved action preserves newer decisions Keep=#{keep_b} (#{phase})",
+         ctx do
+      messages = [message(), message(id: "message-2")]
+      Agent.update(ctx.state, &%{&1 | messages: messages})
+      parent = self()
+
+      review = fn targets, keep ->
+        database(fn ->
+          Executor.review(
+            ctx.scope,
+            ctx.inbox,
+            "thread-1",
+            {TestGmail, [state: ctx.state]},
+            {EmailJanitor.TargetClassifier, [keep_ids: keep]},
+            "",
+            1,
+            cleanup_target_ids: targets
+          )
+        end)
+      end
+
+      assert {:ok, action_proposal} = review.(["message-1"], [])
+
+      assert {:unresolved, action_id} =
+               database(fn ->
+                 Executor.execute(
+                   ctx.scope,
+                   ctx.inbox,
+                   action_proposal,
+                   {TestGmail, [state: ctx.state, mode: :error_without_apply]}
+                 )
+               end)
+
+      assert {:ok, old} = review.(["message-2"], [])
+
+      running =
+        if unquote(phase) == :in_flight do
+          {pid, monitor} =
+            spawn_monitor(fn ->
+              result =
+                database(fn ->
+                  Executor.execute(
+                    ctx.scope,
+                    ctx.inbox,
+                    old,
+                    {TestGmail,
+                     [
+                       state: ctx.state,
+                       history_hook: fn ->
+                         send(parent, {:existing_pause, self()})
+
+                         receive do
+                           :continue_existing -> :ok
+                         after
+                           5_000 -> raise "Synthetic existing-action barrier timed out"
+                         end
+                       end
+                     ]}
+                  )
+                end)
+
+              send(parent, {:existing_old_result, result})
+            end)
+
+          on_exit(fn -> Process.exit(pid, :kill) end)
+          assert_receive {:existing_pause, owner}, 5_000
+          on_exit(fn -> Process.exit(owner, :kill) end)
+          {pid, monitor, owner}
+        end
+
+      assert {:ok, newer} =
+               review.(
+                 ["message-1", "message-2"],
+                 if(unquote(keep_b), do: ["message-2"], else: [])
+               )
+
+      newer_result =
+        database(fn ->
+          Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+        end)
+
+      if unquote(keep_b),
+        do: assert(newer_result == {:existing, action_id, :unresolved}),
+        else: assert(newer_result == {:deferred, action_id, {:existing, action_id, :unresolved}})
+
+      if running do
+        {pid, monitor, owner} = running
+        send(owner, :continue_existing)
+        assert_receive {:existing_old_result, result}, 5_000
+
+        assert result == {:error, :proposal_changed}
+
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+      else
+        result =
+          database(fn ->
+            Executor.execute(ctx.scope, ctx.inbox, old, {TestGmail, [state: ctx.state]})
+          end)
+
+        assert result == {:error, :proposal_changed}
+      end
+
+      fence = fn ->
+        database(fn ->
+          TestRepo.get_by!(
+            Store.ReviewFence,
+            [inbox_id: ctx.inbox.id, message_id: "message-2"],
+            prefix: ctx.scope.prefix
+          )
+        end).reviewed_at
+      end
+
+      accepted_at = fence.()
+      # A cached retry can settle its original action without refreshing the
+      # accepted timestamp for any newer evaluation.
+      if unquote(keep_b) do
+        assert {:existing, ^action_id, :unresolved} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+                 end)
+
+        assert accepted_at == fence.()
+      end
+
+      unless unquote(keep_b) do
+        assert {:deferred, ^action_id, {:existing, ^action_id, :unresolved}} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+                 end)
+
+        database(fn ->
+          assert [%{message_ids: ["message-2"]}] =
+                   TestRepo.all(
+                     Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                     prefix: ctx.scope.prefix
+                   )
+        end)
+
+        assert {:ok, fresh} = review.(["message-2"], [])
+
+        assert {:done, _} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]})
+                 end)
+      end
+
+      expected_calls =
+        if unquote(keep_b), do: [["message-1"]], else: [["message-1"], ["message-2"]]
+
+      assert expected_calls == Agent.get(ctx.state, & &1.calls)
+    end
+  end
+
+  test "reusing a partial action retires fresh Keeps but preserves uncovered Done candidates",
+       ctx do
+    messages = [message(), message(id: "message-2"), message(id: "message-3")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+    policy = %Policy{adapter: EmailJanitor.TargetPolicy, context: ctx.policy.context}
+    blocked = %{policy | context: %{ctx.policy.context | mode: :block}}
+
+    review = fn targets, keep ->
+      database(fn ->
+        Executor.review(
+          ctx.scope,
+          ctx.inbox,
+          "thread-1",
+          {TestGmail, [state: ctx.state]},
+          {EmailJanitor.TargetClassifier, [keep_ids: keep]},
+          "",
+          1,
+          cleanup_target_ids: targets
+        )
+      end)
+    end
+
+    assert {:ok, first} = review.(["message-1"], [])
+
+    assert {:unresolved, action_id} =
+             database(fn ->
+               Executor.execute(
+                 ctx.scope,
+                 ctx.inbox,
+                 first,
+                 {TestGmail, [state: ctx.state, mode: :error_without_apply]},
+                 policy: policy
+               )
+             end)
+
+    for id <- ["message-2", "message-3"] do
+      assert {:ok, pending} = review.([id], [])
+
+      assert {:blocked, :upgrade_required} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, pending, {TestGmail, [state: ctx.state]},
+                   policy: blocked
+                 )
+               end)
+    end
+
+    pending_ids =
+      database(fn ->
+        TestRepo.all(
+          Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id, select: c.id),
+          prefix: ctx.scope.prefix
+        )
+      end)
+
+    prior_fence =
+      database(fn ->
+        TestRepo.get_by!(
+          Store.ReviewFence,
+          [inbox_id: ctx.inbox.id, message_id: "message-2"],
+          prefix: ctx.scope.prefix
+        ).reviewed_at
+      end)
+
+    parent = self()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          database(fn ->
+            Executor.review(
+              ctx.scope,
+              ctx.inbox,
+              "thread-1",
+              {TestGmail, [state: ctx.state]},
+              {EmailJanitor.TargetClassifier,
+               [
+                 keep_ids: ["message-2"],
+                 hook: fn ->
+                   send(parent, {:pending_keep_paused, self()})
+
+                   receive do
+                     :continue_pending_keep -> :ok
+                   after
+                     5_000 -> raise "Synthetic pending Keep barrier timed out"
+                   end
+                 end
+               ]},
+              "",
+              1,
+              cleanup_target_ids: ["message-2"],
+              policy: policy
+            )
+          end)
+
+        send(parent, {:pending_keep_result, result})
+      end)
+
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    assert_receive {:pending_keep_paused, owner}, 5_000
+    on_exit(fn -> Process.exit(owner, :kill) end)
+
+    assert {:ok, fresh} = review.(["message-1", "message-2", "message-3"], ["message-3"])
+
+    assert {:deferred, ^action_id, {:existing, ^action_id, :unresolved}} =
+             database(fn ->
+               Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]},
+                 policy: policy
+               )
+             end)
+
+    assert database(fn -> Store.get(ctx.scope, ctx.inbox.id, action_id).state end) == :unresolved
+    send(owner, :continue_pending_keep)
+    assert_receive {:pending_keep_result, {:error, :proposal_changed}}, 5_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+
+    database(fn ->
+      fresh_fence =
+        TestRepo.get_by(
+          Store.ReviewFence,
+          [inbox_id: ctx.inbox.id, message_id: "message-2"],
+          prefix: ctx.scope.prefix
+        )
+
+      assert DateTime.compare(fresh_fence.reviewed_at, prior_fence) == :gt
+
+      assert [%{message_ids: ["message-2"]}] =
+               TestRepo.all(
+                 Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                 prefix: ctx.scope.prefix
+               )
+
+      events =
+        Ecto.Adapters.SQL.query!(
+          TestRepo,
+          "SELECT message_ids FROM #{ctx.scope.prefix}.policy_events WHERE kind='retire' AND action_id=ANY($1::text[]) AND message_ids <> '{}'",
+          [pending_ids],
+          log: false
+        )
+
+      assert [[["message-3"]]] == events.rows
+    end)
+
+    assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+  end
+
+  for fail_settlement <- [false, true] do
+    test "retaining uncovered work preserves recovery results (failed settlement=#{fail_settlement})",
+         ctx do
+      messages = [message(), message(id: "message-2")]
+      Agent.update(ctx.state, &%{&1 | messages: messages})
+
+      control =
+        start_supervised!({Agent, fn -> %{fail: unquote(fail_settlement)} end},
+          id: :orphan_settle
+        )
+
+      policy = %Policy{
+        adapter: EmailJanitor.TargetPolicy,
+        context: Map.put(ctx.policy.context, :control, control)
+      }
+
+      review = fn targets ->
+        database(fn ->
+          Executor.review(
+            ctx.scope,
+            ctx.inbox,
+            "thread-1",
+            {TestGmail, [state: ctx.state]},
+            {EmailJanitor.TargetClassifier, []},
+            "",
+            1,
+            cleanup_target_ids: targets
+          )
+        end)
+      end
+
+      {:ok, first} = review.(["message-1"])
+      parent = self()
+
+      assert {:error, :executor_unavailable} =
+               EmailJanitor.Owner.run(fn ->
+                 database(fn ->
+                   {:ok, {:created, action}} =
+                     Store.intent(ctx.scope, ctx.inbox.id, first, "100", policy: policy)
+
+                   send(parent, {:orphan_for_overlap, action.id, self()})
+                   raise "Synthetic abandoned prewire action"
+                 end)
+               end)
+
+      assert_receive {:orphan_for_overlap, action_id, owner}
+      monitor = Process.monitor(owner)
+      assert_receive {:DOWN, ^monitor, :process, ^owner, _}, 5_000
+      {:ok, combined} = review.(["message-1", "message-2"])
+
+      result =
+        database(fn ->
+          Executor.execute(ctx.scope, ctx.inbox, combined, {TestGmail, [state: ctx.state]},
+            policy: policy
+          )
+        end)
+
+      if unquote(fail_settlement) do
+        assert {:deferred, ^action_id, {:settlement_pending, ^action_id, :cancelled}} = result
+        Agent.update(control, &%{&1 | fail: false})
+
+        assert {:existing, ^action_id, :cancelled} =
+                 database(fn ->
+                   Executor.settle_action(ctx.scope, ctx.inbox, action_id, policy: policy)
+                 end)
+      else
+        assert {:deferred, ^action_id, {:existing, ^action_id, :cancelled}} = result
+      end
+
+      database(fn ->
+        assert Store.get(ctx.scope, ctx.inbox.id, action_id).state == :cancelled
+
+        assert [[[], ["message-1"]]] ==
+                 Ecto.Adapters.SQL.query!(
+                   TestRepo,
+                   "SELECT message_ids,not_applied_ids FROM #{ctx.scope.prefix}.policy_events WHERE action_id=$1 AND kind='settle'",
+                   [action_id],
+                   log: false
+                 ).rows
+
+        assert [%{message_ids: ["message-2"]}] =
+                 TestRepo.all(
+                   Ecto.Query.from(c in Store.Candidate, where: c.inbox_id == ^ctx.inbox.id),
+                   prefix: ctx.scope.prefix
+                 )
+      end)
+
+      assert Agent.get(ctx.state, & &1.calls) == []
+    end
+  end
+
   for entry <- [:settle_action, :execute] do
     test "#{entry} cannot overwrite terminal reconciliation with stale unresolved settlement",
          ctx do

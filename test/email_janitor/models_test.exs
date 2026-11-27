@@ -182,12 +182,11 @@ defmodule EmailJanitor.ModelsTest do
       assert body =~ "PRIVATE_BODY_SENTINEL"
       request = Jason.decode!(body)
       system = hd(request["messages"])["content"]
-      refute system =~ "OUTPUT_SCHEMA_JSON"
 
-      assert String.ends_with?(
-               system,
-               "USER_PREFERENCES:\nKeep requested customer conversations."
-             )
+      assert system =~
+               "USER_PREFERENCES:\nKeep requested customer conversations.\nOUTPUT_SCHEMA_JSON:"
+
+      assert system =~ "SELECTED_INBOX_JSON:"
 
       assert request["store"] in [nil, false]
       assert get_in(request, ["tool_choice", "function", "name"]) == "structured_output"

@@ -23,7 +23,9 @@ defmodule EmailJanitor.Policy do
               :ok | {:error, atom()}
   @callback reserve(term(), String.t(), String.t(), [String.t()], DateTime.t(), %Admission{}) ::
               :ok | {:blocked, atom()} | {:error, atom()}
-  @optional_callbacks reserve: 6
+  @callback retire_candidate_messages(term(), String.t(), String.t(), [String.t()]) ::
+              :ok | {:error, atom()}
+  @optional_callbacks reserve: 6, retire_candidate_messages: 4
 
   def unlimited, do: %__MODULE__{adapter: EmailJanitor.Policy.Unlimited, context: nil}
 
@@ -78,6 +80,31 @@ defmodule EmailJanitor.Policy do
     _, _ -> {:error, :policy_unavailable}
   end
 
+  @doc "Exact-ID retirement capability; legacy whole-candidate callbacks are never used for a partial withdrawal."
+  def retire_candidate_messages(%__MODULE__{} = policy, inbox_id, candidate_id, ids) do
+    Code.ensure_loaded?(policy.adapter)
+
+    if function_exported?(policy.adapter, :retire_candidate_messages, 4) do
+      case policy.adapter.retire_candidate_messages(policy.context, inbox_id, candidate_id, ids) do
+        :ok -> :ok
+        {:error, :partial_retirement_unsupported} = unsupported -> unsupported
+        _ -> {:error, :policy_unavailable}
+      end
+    else
+      {:error, :partial_retirement_unsupported}
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  catch
+    _, _ -> {:error, :policy_unavailable}
+  end
+
+  def retire_candidate(policy, inbox_id, candidate_id, ids, remaining) do
+    if remaining == [],
+      do: retire_candidate(policy, inbox_id, candidate_id, ids),
+      else: retire_candidate_messages(policy, inbox_id, candidate_id, ids)
+  end
+
   @doc """
   Retire superseded or freshly ineligible proposal metadata independently of
   Gmail/quota outcomes. This includes proven-unapplied cancelled actions whose
@@ -104,4 +131,5 @@ defmodule EmailJanitor.Policy.Unlimited do
   def reserve(_, _, _, _, _, _), do: :ok
   def settle(_, _, _, _), do: :ok
   def retire_candidate(_, _, _, _), do: :ok
+  def retire_candidate_messages(_, _, _, _), do: :ok
 end
