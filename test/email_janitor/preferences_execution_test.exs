@@ -51,7 +51,14 @@ defmodule EmailJanitor.PreferencesExecutionTest do
 
     on_exit(fn ->
       unboxed(fn ->
-        for schema <- [Preferences.Change, Preferences.Row, Candidate, Action, Mailbox],
+        for schema <- [
+              Preferences.Change,
+              Preferences.Row,
+              Store.ReviewFence,
+              Candidate,
+              Action,
+              Mailbox
+            ],
             do: TestRepo.delete_all(schema, prefix: scope.prefix)
       end)
     end)

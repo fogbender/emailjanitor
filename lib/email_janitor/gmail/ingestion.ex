@@ -303,7 +303,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
     end)
   end
 
-  @doc "Preserve a whole thread if ANY current INBOX message lacks durable post-baseline eligibility."
+  @doc "Return only durable same-generation INBOX targets, leaving other thread members as context."
   def eligible_thread(
         %Scope{} = scope,
         %Inbox{} = inbox,
@@ -324,12 +324,13 @@ defmodule EmailJanitor.Gmail.Ingestion do
            true <- valid_messages?(messages, thread_id) do
         ids = messages |> Enum.filter(&Message.in_inbox?/1) |> Enum.map(& &1.id) |> Enum.sort()
         known = known_ids(scope, inbox.id, generation, ids)
+        targets = Enum.filter(ids, &MapSet.member?(known, &1))
 
         cond do
           ids == [] ->
             {:skip, :not_in_inbox}
 
-          Enum.any?(ids, &(not MapSet.member?(known, &1))) ->
+          targets == [] ->
             {:skip, :prebaseline_inbox}
 
           true ->
@@ -338,7 +339,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
                inbox_id: inbox.id,
                generation: generation,
                thread_id: thread_id,
-               message_ids: ids
+               message_ids: targets
              }}
         end
       else
@@ -357,19 +358,23 @@ defmodule EmailJanitor.Gmail.Ingestion do
         %Proposal{} = proposal
       ) do
     protect(fn ->
+      evaluated =
+        case Map.get(proposal, :evaluated_message_ids) do
+          nil -> proposal.message_ids
+          ids -> ids
+        end
+
       with true <- eligible.inbox_id == inbox.id and eligible.thread_id == proposal.thread_id,
-           true <- proposal.message_ids != [] and valid_ids?(proposal.message_ids, 1000),
-           true <- length(Enum.uniq(proposal.message_ids)) == length(proposal.message_ids),
+           true <- selection_ids?(eligible.message_ids),
+           true <- selection_ids?(proposal.message_ids) and selection_ids?(evaluated),
+           true <- Enum.all?(proposal.message_ids, &(&1 in evaluated)),
+           true <- Enum.all?(evaluated, &(&1 in eligible.message_ids)),
            {:ok, %Checkpoint{status: :active, generation: generation, address: address}} <-
              checkpoint(scope, inbox.id),
            true <- address == inbox.address,
            true <- generation == eligible.generation,
-           known = known_ids(scope, inbox.id, generation, proposal.message_ids),
-           true <-
-             Enum.all?(
-               proposal.message_ids,
-               &(&1 in eligible.message_ids and MapSet.member?(known, &1))
-             ) do
+           known = known_ids(scope, inbox.id, generation, evaluated),
+           true <- Enum.all?(evaluated, &MapSet.member?(known, &1)) do
         :ok
       else
         _ -> {:error, :ineligible_proposal}
@@ -397,6 +402,9 @@ defmodule EmailJanitor.Gmail.Ingestion do
 
   defp valid_ids?(ids, max),
     do: is_list(ids) and length(ids) <= max and Enum.all?(ids, &Parser.valid_id?/1)
+
+  defp selection_ids?(ids),
+    do: ids != [] and valid_ids?(ids, 1000) and length(Enum.uniq(ids)) == length(ids)
 
   defp valid_messages?(messages, thread),
     do:

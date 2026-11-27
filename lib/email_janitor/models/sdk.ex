@@ -1,23 +1,10 @@
 defmodule EmailJanitor.Models.SDK do
   @moduledoc "Thin ReqLLM adapter: AWS Bedrock self-hosting and Azure SaaS; no custom wire protocol."
   @behaviour EmailJanitor.Classifier
-  alias EmailJanitor.{Content, Decision, HTML, Inbox, Message}
+  alias EmailJanitor.{Content, Decision, HTML, Inbox, Message, TargetDecisions}
   alias EmailJanitor.Models.Config
   @external_resource Path.expand("../../../priv/prompts/classify.txt", __DIR__)
   @prompt File.read!(@external_resource)
-  @schema %{
-    "type" => "object",
-    "additionalProperties" => false,
-    "required" => ["action", "confidence", "category"],
-    "properties" => %{
-      "action" => %{"type" => "string", "enum" => ["keep", "done"]},
-      "confidence" => %{"type" => "string", "enum" => ["high", "low"]},
-      "category" => %{
-        "type" => "string",
-        "enum" => ["cold_outreach", "legitimate", "uncertain", "user_instruction"]
-      }
-    }
-  }
 
   def classify(messages, instructions, opts) do
     started = System.monotonic_time()
@@ -33,10 +20,24 @@ defmodule EmailJanitor.Models.SDK do
   end
 
   defp perform(messages, instructions, opts) do
+    %Config{} = config = Keyword.fetch!(opts, :config)
     %Inbox{} = inbox = Keyword.fetch!(opts, :inbox)
+
+    # SDK debug logging is process-global; fail closed if a host enables it.
+    false = ReqLLM.Debug.enabled?()
+    # Finch events include raw request bodies/headers. Observer configuration is
+    # a host trust boundary: fail closed if ANY Finch handlers are installed.
+    [] = :telemetry.list_handlers([:finch])
 
     if not is_binary(instructions) or byte_size(instructions) > 32_000,
       do: throw(:invalid_content)
+
+    target_ids = Keyword.get(opts, :target_ids)
+
+    if not is_nil(target_ids) and (not is_list(target_ids) or length(target_ids) not in 1..5),
+      do: throw(:invalid_content)
+
+    schema = if is_nil(target_ids), do: Decision.schema(), else: TargetDecisions.schema()
 
     payload = messages |> selected_messages() |> Enum.map(&payload/1) |> Jason.encode!()
     if byte_size(payload) > 96_000, do: throw(:invalid_content)
@@ -45,17 +46,53 @@ defmodule EmailJanitor.Models.SDK do
       @prompt <>
         "\nSELECTED_INBOX_JSON:\n" <>
         Jason.encode!(%{address: inbox.address, relay_addresses: inbox.relay_addresses}) <>
-        "\nUSER_PREFERENCES:\n" <> instructions
+        "\nUSER_PREFERENCES:\n" <>
+        instructions <>
+        "\nOUTPUT_SCHEMA_JSON:\n" <> Jason.encode!(schema)
 
     user_text = "UNTRUSTED_EMAIL_JSON:\n" <> payload
 
-    with {:ok, object} <-
-           request_object(Content.new(system_text), Content.new(user_text), @schema, opts, false),
-         {:ok, value} <- Jason.decode(Content.read(object)),
-         {:ok, _} <- Decision.parse(value) do
-      {:ok, value}
+    # Bound the entire encoded context, including accumulated preferences and
+    # trusted mailbox identity, before the SDK allocates/prepares any request.
+    encoded_context =
+      Jason.encode!([
+        %{role: "system", content: system_text},
+        %{role: "user", content: user_text}
+      ])
+
+    if byte_size(encoded_context) > 96_000, do: throw(:invalid_content)
+    context = [ReqLLM.Context.system(system_text), ReqLLM.Context.user(user_text)]
+
+    options =
+      [
+        max_tokens: 4096,
+        max_retries: 0,
+        receive_timeout: 30_000,
+        total_timeout: 35_000,
+        telemetry: [payloads: :none],
+        req_http_options: Keyword.get(opts, :http_options, [])
+      ]
+      |> optional(:base_url, config.base_url)
+      |> optional(:deployment, config.deployment)
+
+    {:ok, credentials} = credentials(config, opts)
+    options = Keyword.merge(options, credentials)
+    provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
+
+    model = %{provider: provider, id: config.model}
+    # ReqLLM does not force structured tools for Nova Micro. Classification has
+    # no executable tools, so use its normal text API and validate JSON locally.
+    generated = generate(config.provider, model, context, options, schema)
+
+    with {:ok, response} <- generated,
+         object =
+           if(config.provider == :bedrock,
+             do: ReqLLM.Response.text(response),
+             else: ReqLLM.Response.object(response)
+           ),
+         {:ok, _} <- parse(object, target_ids) do
+      if is_binary(object), do: Jason.decode(object), else: {:ok, object}
     else
-      {:error, :invalid_model_content} -> {:keep, :unreadable_content}
       _ -> {:error, :model_unavailable}
     end
   rescue
@@ -156,6 +193,9 @@ defmodule EmailJanitor.Models.SDK do
   # telemetry before any request can run. No global handlers are detached and no
   # provider protocol/authentication is implemented here. Pinned SDK tests attach
   # a real exporter and assert these events cannot leak on any failure path.
+  defp parse(object, nil), do: Decision.parse(object)
+  defp parse(object, target_ids), do: TargetDecisions.parse(object, target_ids)
+
   defp generate(provider, model, context, options, schema) do
     # The pinned Converse decoder can log untrusted model text at warning level.
     # Silence only this caller while the SDK prepares, dispatches and decodes;
@@ -237,7 +277,9 @@ defmodule EmailJanitor.Models.SDK do
 
   defp payload(message) do
     %{
+      "message_id" => message.id,
       "in_inbox" => Message.in_inbox?(message),
+      "cleanup_target" => Message.cleanup_target?(message),
       "from" => header(message, "from"),
       "reply_to" => header(message, "reply-to"),
       "to" => header(message, "to"),
@@ -254,7 +296,7 @@ defmodule EmailJanitor.Models.SDK do
     {actionable, context} =
       messages
       |> Enum.with_index()
-      |> Enum.split_with(fn {message, _index} -> Message.in_inbox?(message) end)
+      |> Enum.split_with(fn {message, _index} -> Message.cleanup_target?(message) end)
 
     if length(actionable) > 5, do: throw(:invalid_content)
 
