@@ -14,8 +14,17 @@ variable "aws_region" {
   type    = string
   default = "us-east-1"
   validation {
-    condition     = contains(["us-east-1", "us-west-2", "eu-west-1"], var.aws_region)
-    error_message = "The initial supported SES receiving regions are us-east-1, us-west-2 and eu-west-1."
+    condition     = var.aws_region == "us-east-1"
+    error_message = "The v1 AWS reference deployment uses us-east-1 for SES and Bedrock."
+  }
+}
+variable "bedrock_model_id" {
+  type        = string
+  default     = "amazon.nova-micro-v1:0"
+  description = "One regional Bedrock foundation model, not an inference profile or wildcard."
+  validation {
+    condition     = can(regex("^[a-z0-9-]+\\.[a-zA-Z0-9.:-]+$", var.bedrock_model_id))
+    error_message = "Provide a regional foundation-model ID without slashes, ARN prefixes or wildcards."
   }
 }
 variable "mail_domain" { type = string }
@@ -43,6 +52,7 @@ variable "activate_receiving" {
 
 data "aws_availability_zones" "available" { state = "available" }
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 resource "aws_vpc" "service" {
   cidr_block           = "10.73.0.0/24"
   enable_dns_support   = true
@@ -106,6 +116,17 @@ resource "aws_iam_instance_profile" "runtime" {
   name = "${var.name}-runtime"
   role = aws_iam_role.runtime.name
 }
+resource "aws_iam_role_policy" "runtime_model" {
+  role = aws_iam_role.runtime.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["bedrock:InvokeModel"]
+      Resource = "arn:${data.aws_partition.current.partition}:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model_id}"
+    }]
+  })
+}
 resource "aws_instance" "service" {
   ami                    = var.nixos_ami
   instance_type          = "t3.small"
@@ -152,6 +173,7 @@ output "gmail_topic" { value = module.gmail_notifications.topic }
 output "gmail_subscription" { value = module.gmail_notifications.subscription }
 output "google_consumer_service_account" { value = module.gmail_notifications.consumer_service_account }
 output "google_workload_identity_provider" { value = module.gmail_notifications.workload_identity_provider }
+output "bedrock_model_id" { value = var.bedrock_model_id }
 output "ready_for_processing" {
   value       = false
   description = "Infrastructure is not a readiness check. Complete OAuth, SES, model and app round-trip validation."

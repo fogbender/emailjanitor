@@ -60,8 +60,13 @@ managed shared set. Setting the switch true is an explicit regional replacement,
 and must not be done blindly. Removing an active-set resource also changes regional
 receiving state; plan that operation while stopping the service.
 
-This first template supports SES receiving in `us-east-1`, `us-west-2`, or
-`eu-west-1`. Sending identity verification, DKIM and sandbox status are regional.
+The reference deployment uses `us-east-1` for SES and Bedrock. Self-host AI uses
+Bedrock through the EC2 role, with no Azure/OpenAI/Anthropic API key setup. The
+default is the regional `amazon.nova-micro-v1:0` model; runtime IAM grants only
+`bedrock:InvokeModel` for the configured foundation-model ARN. Streaming and
+cross-region inference profiles are outside this initial reference. Keep the
+NixOS `bedrockModelId` equal to OpenTofu `bedrock_model_id` when changing it.
+Sending identity verification, DKIM and sandbox status are regional.
 Self-hosting can initially verify its own destination inboxes in the SES sandbox.
 Arbitrary signup replies and SaaS recipients require production sending access;
 AWS approval is external to OpenTofu.
@@ -87,7 +92,7 @@ credentials, private domain names or company resource groups embedded in it.
 
 Supply `name`, `mail_domain`, `google_project_id`,
 `nixos_ami`, `ssh_key_name`, and a restricted
-`ssh_source_cidr`. Do not put OAuth tokens/model API keys into OpenTofu variables
+`ssh_source_cidr`. Do not put OAuth tokens into OpenTofu variables
 or user-data: those would persist in state and instance metadata.
 
 ## NixOS runtime and secrets

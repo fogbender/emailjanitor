@@ -13,6 +13,11 @@ in {
       default = "/run/secrets/emailjanitor/environment";
       description = "Absolute runtime SOPS-decrypted environment file; never a Nix path or plaintext store value.";
     };
+    bedrockModelId = lib.mkOption {
+      type = lib.types.str;
+      default = "amazon.nova-micro-v1:0";
+      description = "The same regional Bedrock model granted by the OpenTofu reference deployment.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -40,6 +45,10 @@ in {
         JANITOR_DATABASE_NAME = "emailjanitor";
         JANITOR_DATABASE_USER = "emailjanitor";
         ERL_CRASH_DUMP = "/dev/null";
+        RELEASE_DISTRIBUTION = "none";
+        AWS_REGION = "us-east-1";
+        JANITOR_MODEL_PROVIDER = "bedrock";
+        JANITOR_MODEL_ID = cfg.bedrockModelId;
       };
       serviceConfig = {
         Type = "simple";

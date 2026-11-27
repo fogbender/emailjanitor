@@ -54,6 +54,10 @@ run "safe_defaults" {
     condition     = output.ready_for_processing == false
     error_message = "A successful infrastructure plan is not an application readiness check."
   }
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.runtime_model.policy).Statement[0].Resource == "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-micro-v1:0" && jsondecode(aws_iam_role_policy.runtime_model.policy).Statement[0].Action == ["bedrock:InvokeModel"]
+    error_message = "Use role credentials with only the exact configured Bedrock model permission."
+  }
 }
 
 run "reject_public_ssh" {
