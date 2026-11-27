@@ -29,6 +29,7 @@ defmodule EmailJanitor.Jobs do
         name: name,
         queues: [mail: 4],
         notifier: Oban.Notifiers.PG,
+        shutdown_grace_period: 35_000,
         lifeline: [rescue_after: {25, :minutes}],
         pruner: [max_age: {1, :day}],
         log: false
@@ -127,17 +128,7 @@ defmodule EmailJanitor.Jobs do
     repair? = Keyword.get(opts, :repair?, false) == true
 
     with true <- valid_key?(key), {:ok, _} <- definition(name, task) do
-      locked(name, task, key, fn job ->
-        failures = Map.get(job.args, "failures", 0)
-
-        if repair? or failures == 0 do
-          args = job.args |> Map.put("wake", true) |> Map.put("repair", repair?)
-          {:ok, _} = Oban.update_job(name, job, %{args: args})
-          if job.state != "executing", do: Oban.retry_job(name, job)
-        end
-
-        :ok
-      end)
+      locked(name, task, key, &apply_wake(name, &1, repair?))
     else
       _ -> {:error, :invalid_job}
     end
@@ -145,6 +136,26 @@ defmodule EmailJanitor.Jobs do
     _ -> {:error, :job_unavailable}
   catch
     _, _ -> {:error, :job_unavailable}
+  end
+
+  defp apply_wake(name, job, repair?) do
+    repair? = repair? or job.args["repair"] == true
+    failures = Map.get(job.args, "failures", 0)
+
+    if repair? or failures == 0 do
+      executing? = job.state == "executing"
+
+      args =
+        job.args
+        |> Map.put("wake", executing?)
+        |> Map.put("repair", executing? and repair?)
+        |> Map.put("failures", if(repair? and not executing?, do: 0, else: failures))
+
+      {:ok, _} = Oban.update_job(name, job, %{args: args})
+      if not executing?, do: Oban.retry_job(name, job)
+    end
+
+    :ok
   end
 
   def cancel(name, task, key) do
@@ -215,7 +226,7 @@ defmodule EmailJanitor.Jobs do
       locked(conf.name, args["task"], args["key"], fn current ->
         if current.args["wake"] and
              (current.args["repair"] or current.args["failures"] == 0) do
-          Oban.retry_job(conf.name, current)
+          apply_wake(conf.name, current, current.args["repair"] == true)
         end
 
         :ok

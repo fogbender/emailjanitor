@@ -337,6 +337,43 @@ defmodule EmailJanitor.DigestTest do
     refute_received :sent
   end
 
+  test "an uncertain inbox listing preserves digest jobs until membership is definitely removed",
+       ctx do
+    {:ok, listings} = Agent.start_link(fn -> [{ctx.scope, ctx.inbox.id}] end)
+
+    opts = [
+      jobs: EmailJanitor.TestScheduler.jobs(),
+      inboxes: fn -> Agent.get(listings, & &1) end,
+      mail: F.config(fn _ -> flunk("no digest activity to send") end),
+      clock: fn -> @due end,
+      authorize: fn _, _ -> {:ok, ctx.inbox} end
+    ]
+
+    tasks = Worker.tasks(opts)
+    EmailJanitor.TestScheduler.start_tasks(tasks, queues: [discovery: 1, digest: 1])
+
+    EmailJanitor.TestScheduler.await(fn ->
+      case EmailJanitor.TestScheduler.rows("digest") do
+        [%{state: "scheduled"}] -> true
+        _ -> false
+      end
+    end)
+
+    [before] = EmailJanitor.TestScheduler.rows("digest")
+    Agent.update(listings, fn _ -> {:error, :database_unavailable} end)
+    assert :failed = tasks["digest_discovery"].run.(nil)
+    assert :failed = tasks["digest"].run.(before.args["key"])
+    [after_failure] = EmailJanitor.TestScheduler.rows("digest")
+
+    assert {after_failure.id, after_failure.state, after_failure.scheduled_at} ==
+             {before.id, before.state, before.scheduled_at}
+
+    Agent.update(listings, fn _ -> [] end)
+    assert {:next, nil, 60_000} = tasks["digest_discovery"].run.(nil)
+    assert [%{state: "cancelled"}] = EmailJanitor.TestScheduler.rows("digest")
+    Agent.stop(listings)
+  end
+
   test "metadata overflow remains unlisted and host claims are chunked without a daily plan limit",
        ctx do
     sender = "s@a.co"

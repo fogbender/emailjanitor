@@ -108,7 +108,8 @@ defmodule EmailJanitor.JobsTest do
     assert :ok = Jobs.wake(@name, "cleanup", a.args["key"], repair?: true)
     [after_a, after_b] = rows()
     assert after_a.state == "available"
-    assert after_a.args["repair"]
+    refute after_a.args["repair"]
+    assert after_a.args["failures"] == 0
     assert after_b.id == b.id
     assert after_b.scheduled_at == before_b.scheduled_at
     assert after_b.args == before_b.args
@@ -246,7 +247,7 @@ defmodule EmailJanitor.JobsTest do
 
     TestRepo.update_all(
       from(j in Oban.Job, where: j.id == ^job.id),
-      [set: [state: "executing", attempted_at: past, attempt: 1]],
+      [set: [state: "executing", attempted_at: past, attempt: 25]],
       prefix: @prefix,
       log: false
     )
@@ -297,14 +298,21 @@ defmodule EmailJanitor.JobsTest do
     assert one().state == "scheduled"
     :telemetry.execute([:oban, :job, :stop], %{}, %{state: :snoozed, job: job})
     assert one().state == "available"
-    assert one().args["repair"]
+    refute one().args["repair"]
+    assert one().args["failures"] == 0
     # Simulate process death after the acknowledgement but before the telemetry
     # handler. The durable pending wake is applied during the next host boot.
     assert :ok = stop_supervised({Jobs, @name})
 
     TestRepo.update_all(
       from(j in Oban.Job, where: j.id == ^job.id),
-      [set: [state: "scheduled", scheduled_at: DateTime.add(DateTime.utc_now(), 120)]],
+      [
+        set: [
+          state: "scheduled",
+          scheduled_at: DateTime.add(DateTime.utc_now(), 120),
+          args: %{one().args | "wake" => true, "repair" => true, "failures" => 1}
+        ]
+      ],
       prefix: @prefix,
       log: false
     )
@@ -312,6 +320,45 @@ defmodule EmailJanitor.JobsTest do
     start_jobs(%{"late_wake" => definition(fn _ -> {:retry, 120_000} end)})
     assert one().state == "available"
     assert one().id == job.id
+  end
+
+  test "an ordinary signal cannot erase an executing job's pending authenticated repair" do
+    observer = self()
+
+    start_jobs(%{
+      "sticky_repair" =>
+        definition(fn _ ->
+          send(observer, {:running, self()})
+
+          receive do
+            :continue -> {:retry, 120_000}
+          end
+        end)
+    })
+
+    job = %{one() | conf: Oban.config(@name)}
+
+    TestRepo.update_all(from(j in Oban.Job, where: j.id == ^job.id), [set: [state: "executing"]],
+      prefix: @prefix,
+      log: false
+    )
+
+    executor = Task.async(fn -> Worker.perform(job) end)
+    assert_receive {:running, runner}, 3_000
+    assert :ok = Jobs.wake(@name, "sticky_repair", "sticky_repair", repair?: true)
+    assert :ok = Jobs.wake(@name, "sticky_repair", "sticky_repair")
+    assert one().args["repair"]
+    send(runner, :continue)
+    assert {:snooze, 0} = Task.await(executor)
+    assert one().args["failures"] == 0
+  end
+
+  test "waking idle work causes one run and keeps the next normal cadence" do
+    start_jobs(%{"single_wake" => definition(fn _ -> {:next, nil, 60_000} end)})
+    assert :ok = Jobs.wake(@name, "single_wake", "single_wake")
+    refute one().args["wake"]
+    assert %{snoozed: 1} = drain()
+    assert DateTime.diff(one().scheduled_at, DateTime.utc_now()) >= 55
   end
 
   test "wake received while running is persisted and consumed without losing the cursor" do

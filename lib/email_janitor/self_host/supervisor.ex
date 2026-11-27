@@ -119,11 +119,27 @@ defmodule EmailJanitor.SelfHost.Services do
 
   defp active_inboxes do
     with {:ok, refs} <- Store.refs() do
-      for ref <- refs,
-          {:ok, %{state: :active}, inbox} <- [Store.fetch_binding(ref)],
-          do: {SelfHost.scope(), inbox.id}
+      Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, inboxes} ->
+        case Store.fetch_binding(ref) do
+          {:ok, %{state: :active}, inbox} ->
+            {:cont, {:ok, [{SelfHost.scope(), inbox.id} | inboxes]}}
+
+          {:ok, _, _} ->
+            {:cont, {:ok, inboxes}}
+
+          {:error, :inbox_unavailable} ->
+            {:cont, {:ok, inboxes}}
+
+          _ ->
+            {:halt, {:error, :digest_worker_unavailable}}
+        end
+      end)
+      |> case do
+        {:ok, inboxes} -> inboxes
+        error -> error
+      end
     else
-      _ -> []
+      _ -> {:error, :digest_worker_unavailable}
     end
   end
 
