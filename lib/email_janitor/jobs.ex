@@ -41,9 +41,16 @@ defmodule EmailJanitor.Jobs do
 
     children = [
       %{id: :definitions, start: {Agent, :start_link, [fn -> tasks end, [name: registry(name)]]}},
-      {Oban, oban},
-      %{id: :seed, start: {__MODULE__, :seed_start, [name, tasks]}, restart: :transient}
+      {Oban, oban}
     ]
+
+    children =
+      if Keyword.get(opts, :seed, true) do
+        children ++
+          [%{id: :seed, start: {__MODULE__, :seed_start, [name, tasks]}, restart: :transient}]
+      else
+        children
+      end
 
     Supervisor.init(children, strategy: :rest_for_one)
   end

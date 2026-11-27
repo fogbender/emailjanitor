@@ -30,6 +30,45 @@ defmodule EmailJanitor.JobsTest do
   defp one, do: List.last(rows())
   defp drain, do: Oban.drain_queue(@name, queue: :mail, with_scheduled: true, with_safety: false)
 
+  test "an enqueue-only web role neither seeds nor wakes persistent work on boot" do
+    tasks = %{"web_role" => definition(fn _ -> flunk("web cannot execute background work") end)}
+    start_jobs(tasks)
+    job = one()
+    args = %{job.args | "wake" => true, "repair" => true, "failures" => 2}
+    scheduled_at = DateTime.add(DateTime.utc_now(), 120)
+
+    TestRepo.update_all(
+      from(j in Oban.Job, where: j.id == ^job.id),
+      [set: [args: args, state: "scheduled", scheduled_at: scheduled_at]],
+      prefix: @prefix,
+      log: false
+    )
+
+    assert :ok = stop_supervised({Jobs, @name})
+
+    start_supervised!(
+      {Jobs,
+       [
+         name: @name,
+         repo: TestRepo,
+         prefix: @prefix,
+         tasks: tasks,
+         seed: false,
+         oban: [testing: :manual, queues: false, plugins: false]
+       ]}
+    )
+
+    assert [persisted] = rows()
+    assert persisted.id == job.id
+    assert persisted.args == args
+    assert persisted.scheduled_at == scheduled_at
+    assert persisted.state == "scheduled"
+    assert {:ok, new} = Jobs.enqueue(@name, "web_role", "new-inbox-epoch")
+    assert new.state == "available"
+    assert length(rows()) == 2
+    refute new.id == job.id
+  end
+
   test "boot seeds one job and preserves continuation and failure backoff across restarts" do
     observer = self()
 
