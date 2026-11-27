@@ -456,6 +456,25 @@ defmodule EmailJanitor.WorkerTest do
     assert current.cursor == "101"
   end
 
+  test "watch retry counters and their due timestamps are database constrained", ctx do
+    Agent.update(ctx.state, &%{&1 | arrivals: %{}})
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    future = DateTime.add(DateTime.utc_now(), 60)
+
+    for {attempts, next} <- [{-1, nil}, {17, future}, {1, nil}, {0, future}] do
+      assert {:error, %Postgrex.Error{postgres: %{code: :check_violation}}} =
+               Ecto.Adapters.SQL.query(
+                 Repo,
+                 ~s|UPDATE "#{ctx.scope.prefix}".janitor_worker_watches SET attempts=$1, next_attempt_at=$2 WHERE inbox_id=$3|,
+                 [attempts, next, ctx.box.id],
+                 log: false
+               )
+    end
+
+    assert [%EmailJanitor.Worker.Watch{attempts: 0, next_attempt_at: nil}] =
+             Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
+  end
+
   test "at most five targets are admitted per step and remaining arrivals continue", ctx do
     messages = Enum.map(1..7, &Fixtures.message(id: "arrival-#{&1}"))
 

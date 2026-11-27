@@ -91,6 +91,12 @@ defmodule EmailJanitor.Worker.Migration do
       add(:attempts, :integer, null: false, default: 0)
       add(:next_attempt_at, :utc_datetime_usec)
     end
+
+    create(
+      constraint(:janitor_worker_watches, :worker_watch_retry,
+        check: "attempts BETWEEN 0 AND 16 AND ((attempts = 0) = (next_attempt_at IS NULL))"
+      )
+    )
   end
 end
 
