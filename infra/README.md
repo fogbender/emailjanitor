@@ -41,6 +41,11 @@ Google Cloud project**, gives Gmail permission to publish, and creates a dedicat
 consumer service account with access only to its pull subscription. It does not
 create an OAuth client or perform mailbox consent. It also provisions workload identity
 federation restricted to the AWS runtime role, without service account key files.
+The same module accepts a dedicated Azure managed identity for the separate
+private SaaS composition; the stock self-host reference remains AWS only. See
+[notification trust resources](modules/gmail_notifications/README.md). Its
+`external_account_configuration` output is non-secret SDK metadata, never a token
+or a service-account private key.
 The setup CLI must generate the non-secret external-account credential
 configuration from the provider/service-account outputs for the runtime SDK. OAuth audience must support the intended Google accounts. An External
 Testing app can expire Gmail refresh tokens after seven days.
@@ -55,6 +60,17 @@ domain. This code creates a **new zone** and returns its name servers; it never
 changes existing parent-zone MX records. Delegate that subdomain at its parent
 DNS provider after reviewing the output. Do not replace the existing nameservers
 of a domain containing other mail/web services with this zone.
+
+For a dedicated domain whose public Route53 zone is already delegated, the
+shared `modules/mail` module also accepts `existing_hosted_zone_id`. It selects
+only a public zone for the exact `mail_domain` and verifies that its zone ID
+matches the operator's explicit selection. That mode creates no hosted zone and
+does not change its nameserver delegation. Every MX, DMARC, verification and DKIM
+record has `allow_overwrite = false`: an existing record from another service
+must be reviewed/imported deliberately rather than overwritten. An unrelated
+parent zone or a private zone is unsuitable. The new-zone AWS reference remains
+the default. Newly managed zones have a destroy guard; do not toggle a deployed
+stack's zone ownership mode without a reviewed state migration.
 
 An optional name under `emailjanitor.net` can be delegated manually to those same
 name servers. It points directly to your AWS account, with no SaaS mail relay.

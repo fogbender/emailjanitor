@@ -73,7 +73,7 @@ run "safe_transport_defaults" {
     error_message = "Only the exact SES delivery role can publish bounded-retention receipt metadata."
   }
   assert {
-    condition     = aws_route53_record.mx.zone_id == aws_route53_zone.mail.zone_id && length(aws_route53_record.dkim) == 3
+    condition     = aws_route53_record.mx.zone_id == aws_route53_zone.mail[0].zone_id && length(aws_route53_record.dkim) == 3
     error_message = "MX and DKIM belong only to the dedicated new mail zone."
   }
   assert {
