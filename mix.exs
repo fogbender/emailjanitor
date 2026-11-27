@@ -44,6 +44,7 @@ defmodule EmailJanitor.MixProject do
       {:ex_aws_s3, "== 2.6.1"},
       {:ex_aws_sqs, "== 3.5.0"},
       {:sweet_xml, "== 0.7.5"},
+      {:tzdata, "== 1.2.2"},
       {:ex_aws_auth, "~> 1.6"}
     ]
   end

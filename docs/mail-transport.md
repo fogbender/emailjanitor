@@ -52,6 +52,14 @@ it is distinct from ambiguous acceptance after a request may have started.
 This intentionally favors a missing email over a duplicate after ambiguous SES
 acceptance. Calling from an outer database transaction is rejected.
 
+An optional sixth `Outbox.deliver` argument is a trusted DB-only admission callback.
+It executes after rendering/credential resolution, inside the short transaction
+that locks the pending outbox row and commits its send fence. A rejected check
+rolls back both host metadata and the fence; the provider remains outside SQL.
+The digest layer uses this to reserve its current local dispatch day atomically.
+Outgoing plain text is bounded to 3 MiB; maintained-SDK wire and conservative MIME
+size tests keep it below SES v1's 10 MB message limit. Incoming MIME remains 1 MiB.
+
 Confirmed sends also record the actual sender and connected recipient alongside
 the returned bare SES MessageId. `Outbox.self_delivery?(scope, inbox_id, sender,
 headers)` accepts the shared list of `{name, value}` headers and returns
