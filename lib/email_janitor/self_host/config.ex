@@ -97,7 +97,7 @@ defmodule EmailJanitor.SelfHost.Config do
       _ ->
         not match?({:ok, _}, :inet.parse_address(String.to_charlist(host))) and
           not Regex.match?(
-            ~r/\A(?:[0-9]+|0[xX][a-fA-F0-9]+)\z/,
+            ~r/\A(?:[0-9]+|0[xX][a-fA-F0-9]*)\z/,
             List.last(String.split(host, "."))
           ) and
           byte_size(host) <= 253 and not Regex.match?(~r/\A[0-9.]+\z/, host) and
