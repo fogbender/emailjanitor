@@ -631,6 +631,9 @@ Restoration settlement uses the trusted `policy:` option for exact retirement of
 older pending/cancelled metadata, without charging or refunding quota. It uses
 the positive effect timestamp and per-ID review fences, preserves unrelated IDs
 and newer accepted requests, and never constructs an invented review snapshot.
+Hosts that persist worker candidates must also retire the same exact IDs from
+`Worker.Ledger` in their policy callback in that transaction, preserving unrelated
+arrival provenance. Repeated exact retirement is idempotent.
 Explicit rechecks and changed manual selections atomically fence older reviews;
 ordinary scheduler discovery does not refresh that authority.
 The 30s mutation watchdog ends after the provider call; positive proof and

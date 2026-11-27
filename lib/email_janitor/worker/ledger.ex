@@ -266,15 +266,18 @@ defmodule EmailJanitor.Worker.Ledger do
       candidate ->
         remaining = candidate.message_ids -- ids
 
-        scope.repo.update!(
-          Ecto.Changeset.change(candidate,
-            message_ids: remaining,
-            status: if(remaining == [], do: :retired, else: :pending),
-            requested: remaining != [] and candidate.requested
-          ),
-          prefix: scope.prefix,
-          log: false
-        )
+        if remaining != candidate.message_ids do
+          scope.repo.update!(
+            Ecto.Changeset.change(candidate,
+              message_ids: remaining,
+              status: if(remaining == [], do: :retired, else: :pending),
+              requested: remaining != [] and candidate.requested,
+              request_version: candidate.request_version + 1
+            ),
+            prefix: scope.prefix,
+            log: false
+          )
+        end
 
         :ok
     end

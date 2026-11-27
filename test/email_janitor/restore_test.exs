@@ -629,6 +629,74 @@ defmodule EmailJanitor.RestoreTest do
     assert [%Effect{state: :done, applied_at: %DateTime{}}] = effects(ctx)
   end
 
+  for promoted_before_restore <- [true, false] do
+    test "actual digest withdrawal survives callback failure with early promotion #{promoted_before_restore}",
+         ctx do
+      promoted_before_restore = unquote(promoted_before_restore)
+      alias EmailJanitor.Digest
+      alias EmailJanitor.Digest.{Activity, Event}
+
+      :ok = EmailJanitor.Mail.Store.install(ctx.scope)
+      :ok = Digest.install(ctx.scope)
+      :ok = Digest.install_staging(ctx.scope)
+      now = DateTime.utc_now()
+      :ok = Digest.configure(ctx.scope, ctx.box.id, "Etc/UTC", now)
+
+      for {id, subject} <- [
+            {"message-1", "Restored synthetic subject"},
+            {"message-2", "Retained synthetic subject"}
+          ] do
+        {:ok, event} = Event.new(ctx.action_id, id, :done, "sender@example.com", subject, now)
+        :ok = Digest.stage(ctx.scope, ctx.box.id, event)
+      end
+
+      if promoted_before_restore, do: Digest.confirm_staged(ctx.scope, ctx.box.id, ctx.action_id)
+
+      assert {:unresolved, effect_id} =
+               restore(ctx,
+                 on_restored: fn action, ids ->
+                   assert action == ctx.action_id
+                   :ok = Digest.withdraw_pending(ctx.scope, ctx.box.id, ids)
+                   {:error, :synthetic_callback_failure}
+                 end
+               )
+
+      assert {:done, ^effect_id} = Restore.outcome(ctx.scope, ctx.box, effect_id)
+
+      if promoted_before_restore do
+        # Callback rollback cannot remove already committed positive source proof.
+        refute Repo.get_by!(Activity, [message_id: "message-1"], prefix: ctx.scope.prefix).retired
+      else
+        # A distinct connection can promote late after the restore's owner exits.
+        assert :ok =
+                 Task.async(fn -> Digest.confirm_staged(ctx.scope, ctx.box.id, ctx.action_id) end)
+                 |> Task.await()
+
+        assert Repo.get_by!(Activity, [message_id: "message-1"], prefix: ctx.scope.prefix).retired
+      end
+
+      assert {:ok, {:ready, snapshot}} =
+               Digest.tick(ctx.scope, ctx.box.id, DateTime.add(now, 86_400))
+
+      assert {:ok, rendered} = Digest.render(ctx.scope, snapshot.id)
+      refute Content.read(rendered.text) =~ "Restored synthetic subject"
+      assert Content.read(rendered.text) =~ "Retained synthetic subject"
+
+      assert {:done, ^effect_id} =
+               Restore.settle(
+                 ctx.scope,
+                 ctx.box,
+                 effect_id,
+                 Keyword.put(trusted_options(), :on_restored, fn _, ids ->
+                   Digest.withdraw_pending(ctx.scope, ctx.box.id, ids)
+                 end)
+               )
+
+      assert read(ctx).restores == [["message-1"]]
+      assert Store.get(ctx.scope, ctx.box.id, ctx.action_id).state == :done
+    end
+  end
+
   test "restoration between safeguard read and admission fences a newly arrived sibling", ctx do
     Agent.update(ctx.state, &%{&1 | messages: &1.messages ++ [Fixtures.message(id: "message-3")]})
     gmail = {EmailJanitor.TestGmail, [state: ctx.state]}
@@ -830,6 +898,80 @@ defmodule EmailJanitor.RestoreTest do
     assert read(ctx).restores == [["message-1"]]
   end
 
+  test "host exact retirement keeps unrelated arrival provenance available for recheck", ctx do
+    :ok = EmailJanitor.Worker.install(ctx.scope)
+    candidate = seed_candidate(ctx, ["message-1", "message-3"], -60)
+
+    Repo.insert!(
+      %EmailJanitor.Worker.Candidate{
+        inbox_id: ctx.box.id,
+        candidate_id: candidate.id,
+        generation: Ecto.UUID.generate(),
+        thread_id: "thread-1",
+        message_ids: candidate.message_ids,
+        requested: true,
+        inserted_at: candidate.inserted_at,
+        updated_at: candidate.updated_at
+      },
+      prefix: ctx.scope.prefix
+    )
+
+    policy = %EmailJanitor.Policy{
+      adapter: __MODULE__.Policy,
+      context: %{owner: self(), scope: ctx.scope, inbox: ctx.box}
+    }
+
+    parent = self()
+
+    stale_finisher =
+      Task.async(fn ->
+        snapshot =
+          Repo.get_by!(EmailJanitor.Worker.Candidate, [candidate_id: candidate.id],
+            prefix: ctx.scope.prefix
+          )
+
+        send(parent, :candidate_snapshot_read)
+
+        receive do
+          :finish ->
+            EmailJanitor.Worker.Ledger.finish_candidate(
+              ctx.scope,
+              ctx.box,
+              snapshot,
+              :unsupported_policy,
+              DateTime.utc_now()
+            )
+        end
+      end)
+
+    assert_receive :candidate_snapshot_read
+    assert {:done, _} = restore(ctx, policy: policy)
+    send(stale_finisher.pid, :finish)
+    assert :ok = Task.await(stale_finisher)
+
+    assert [
+             %EmailJanitor.Worker.Candidate{
+               message_ids: ["message-3"],
+               status: :pending,
+               requested: true,
+               contract_blocked: false,
+               request_version: 2
+             }
+           ] =
+             Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
+
+    :ok =
+      EmailJanitor.Worker.Ledger.retire_candidate(ctx.scope, ctx.box, candidate.id, ["message-1"])
+
+    assert [%EmailJanitor.Worker.Candidate{request_version: 2}] =
+             Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
+
+    assert :ok = EmailJanitor.Worker.queue_recheck(ctx.scope, ctx.box, candidate.id)
+
+    assert [%EmailJanitor.Worker.Candidate{message_ids: ["message-3"], requested: true}] =
+             Repo.all(EmailJanitor.Worker.Candidate, prefix: ctx.scope.prefix)
+  end
+
   defp seed_candidate(ctx, ids, seconds) do
     %{rows: [[now]]} = Ecto.Adapters.SQL.query!(Repo, "SELECT clock_timestamp()", [], log: false)
     at = DateTime.add(now, seconds)
@@ -874,6 +1016,11 @@ defmodule EmailJanitor.RestoreTest.Policy do
   def settle(_, _, _, _), do: :ok
   def retire_candidate(owner, _, id, ids), do: retire(owner, :whole, id, ids)
   def retire_candidate_messages(owner, _, id, ids), do: retire(owner, :exact, id, ids)
+
+  defp retire(%{owner: owner, scope: scope, inbox: inbox}, mode, id, ids) do
+    send(owner, {:retired, mode, id, ids})
+    EmailJanitor.Worker.Ledger.retire_candidate(scope, inbox, id, ids)
+  end
 
   defp retire(owner, mode, id, ids) do
     send(owner, {:retired, mode, id, ids})
