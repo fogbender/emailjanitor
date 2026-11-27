@@ -87,6 +87,15 @@ defmodule EmailJanitor.MailThreadingTest do
     assert :mimemail.get_header_value("References", headers) ==
              "<earlier@example.org> <source@example.org>"
 
+    assert Regex.match?(
+             ~r/\A<[a-f0-9-]{36}@janitor\.example\.com>\z/,
+             :mimemail.get_header_value("Message-ID", headers)
+           )
+
+    assert String.ends_with?(:mimemail.get_header_value("Date", headers), " +0000")
+    [_, encoded_body] = String.split(raw, "\r\n\r\n", parts: 2)
+    refute encoded_body =~ "=0A"
+    refute encoded_body =~ "=0D"
     assert :mimemail.get_header_value("Bcc", headers) == :undefined
     assert :mimemail.get_header_value("Auto-Submitted", headers) == "auto-replied"
     decoded = Mail.parse(raw)
@@ -107,7 +116,14 @@ defmodule EmailJanitor.MailThreadingTest do
 
     {:ok, prepared} = SDK.prepare(config)
 
-    for subject <- [String.duplicate("X", 980), String.duplicate("漢", 326), ""] do
+    for subject <- [
+          String.duplicate("X", 980),
+          String.duplicate("漢", 326),
+          "",
+          "Re: a;b; c",
+          ";Leading;  two spaces;",
+          String.duplicate("X;", 490)
+        ] do
       {:ok, reply} =
         Message.new(subject, Content.new(String.duplicate(<<1>>, 64_000)),
           in_reply_to: "source@example.org"
@@ -118,6 +134,7 @@ defmodule EmailJanitor.MailThreadingTest do
       assert byte_size(wire) < 1_000_000
       raw = wire |> URI.decode_query() |> Map.fetch!("RawMessage.Data") |> Base.decode64!()
       assert Enum.all?(String.split(raw, "\r\n"), &(byte_size(&1) <= 998))
+      assert Mail.get_subject(Mail.parse(raw)) == subject
     end
   end
 
