@@ -15,11 +15,15 @@ owner identity, OAuth credentials, encryption key and stable web secret.
 The proxy must overwrite `X-Real-IP` with the actual client address, for example
 Nginx `proxy_set_header X-Real-IP $remote_addr;`. Janitor accepts that header only
 from a loopback peer; other peers use their socket address. It hashes canonical
-IP buckets (IPv6 /64) for anonymous OAuth attempt limits, storing no raw address.
-Each client can have three live attempts within the ten-minute expiry; a separate
-1,000-row backstop bounds all anonymous state. Signed-in owner connection flows
+IP buckets (IPv6 /64) with HMAC using the server secret for anonymous OAuth limits.
+No raw address or publicly reversible address hash is stored. Each client can
+have three live attempts within the ten-minute expiry; a network (IPv4 /24 or
+IPv6 /48) can have twenty. A 1,000-row backstop evicts the oldest anonymous attempt
+instead of rejecting every new visitor. Signed-in owner connection flows
 have their own authenticated access. A visitor reaching their limit does not
-consume another client's allowance. Proxy configuration is part of readiness.
+consume an unrelated network's allowance. A supervised task purges expired
+attempts and sessions every minute, even without new sign-ins. Proxy configuration
+is part of readiness.
 
 Only the configured owner can sign in. The owner can connect multiple Google
 accounts, choose the inbox for a conversation and disconnect an account.

@@ -21,7 +21,10 @@ defmodule EmailJanitor.SelfHost.Web do
       render_errors: [formats: [html: EmailJanitor.SelfHostWeb.ErrorHTML], layout: false]
     )
 
-    Supervisor.init([EmailJanitor.SelfHostWeb.ChatLimit, Endpoint], strategy: :one_for_one)
+    Supervisor.init(
+      [EmailJanitor.SelfHostWeb.ChatLimit, EmailJanitor.SelfHostWeb.Maintenance, Endpoint],
+      strategy: :one_for_one
+    )
   end
 
   def install(scope),

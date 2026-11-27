@@ -20,6 +20,7 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     schema "selfhost_web_attempts" do
       field(:browser_hash, :binary)
       field(:client_hash, :binary)
+      field(:network_hash, :binary)
       field(:session_hash, :binary)
       field(:subject, :string)
       field(:mode, Ecto.Enum, values: [:sign_in, :connect])
@@ -122,7 +123,8 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
             %Attempt{
               id: id,
               browser_hash: hash(browser_token),
-              client_hash: hash(client),
+              client_hash: rate_hash("client", client),
+              network_hash: rate_hash("network", network(client)),
               subject: subject,
               session_hash: session_hash,
               mode: mode,
@@ -193,10 +195,30 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
         if is_nil(attempt.subject) do
           anonymous = from(a in Attempt, where: is_nil(a.subject) and a.expires_at > ^now)
           client = from(a in anonymous, where: a.client_hash == ^attempt.client_hash)
+          network = from(a in anonymous, where: a.network_hash == ^attempt.network_hash)
 
           if scope.repo.aggregate(client, :count, options(scope)) >= 3 or
-               scope.repo.aggregate(anonymous, :count, options(scope)) >= 1_000,
+               scope.repo.aggregate(network, :count, options(scope)) >= 20,
              do: scope.repo.rollback(:too_many_attempts)
+
+          # Bound shared state without making a full pool reject every new
+          # visitor. Completed/verified owner flows are never evicted here.
+          if scope.repo.aggregate(anonymous, :count, options(scope)) >= 1_000 do
+            oldest =
+              scope.repo.one(
+                from(a in anonymous,
+                  order_by: [asc: a.expires_at, asc: a.id],
+                  limit: 1,
+                  select: a.id
+                ),
+                options(scope)
+              )
+
+            scope.repo.delete_all(
+              from(a in Attempt, where: a.id == ^oldest and is_nil(a.subject)),
+              options(scope)
+            )
+          end
         end
 
         scope.repo.insert!(attempt, options(scope))
@@ -248,6 +270,23 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
 
   defp random, do: :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
   defp hash(token), do: :crypto.hash(:sha256, token)
+
+  defp rate_hash(kind, value),
+    do:
+      :crypto.mac(
+        :hmac,
+        :sha256,
+        Content.read(host().config().web_secret),
+        "selfhost-oauth-" <> kind <> ":" <> value
+      )
+
+  defp network(client) do
+    case :inet.parse_address(String.to_charlist(client)) do
+      {:ok, {a, b, c, _}} -> to_string(:inet.ntoa({a, b, c, 0})) <> "/24"
+      {:ok, {a, b, c, _, _, _, _, _}} -> to_string(:inet.ntoa({a, b, c, 0, 0, 0, 0, 0})) <> "/48"
+      _ -> client
+    end
+  end
 
   defp digest(token) when is_binary(token) and byte_size(token) == 43 do
     if Regex.match?(~r/\A[A-Za-z0-9_-]{43}\z/, token),
