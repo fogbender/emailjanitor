@@ -45,7 +45,13 @@ keeping the composed preference text within the model adapter's budget.
 
 Updates compare the snapshot's namespace, revisions and mailbox instruction
 version, then bump affected inbox versions atomically. UUID effect receipts
-deduplicate retries without retaining conversation text. Registration serializes
+deduplicate retries for seven days without retaining conversation text or text
+hashes. Reusing a request UUID returns its original effect, even after a later
+correction; callers compare that receipt's revision with current state before
+describing what is active. Clearing a scope removes its older receipts. Writes
+prune expired receipts; hosts also call `Preferences.purge_receipts/2` during
+maintenance. The [migration registry](docs/migrations.md) reserves optional module
+versions alongside the core sequence. Registration serializes
 with global updates so a newly connected inbox cannot miss an invalidation. A
 prepared cleanup also checks the current instruction version at its dispatch
 fence; a correction that commits first cancels that old attempt through the
