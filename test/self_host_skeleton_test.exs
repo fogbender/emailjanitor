@@ -553,6 +553,45 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert {:ok, :ok} = EmailJanitor.Gmail.Ingestion.record_signal(ctx.scope, renamed, "124")
   end
 
+  test "replacing a revoked subject also fences its recorded old generation", ctx do
+    alias EmailJanitor.Gmail.Ingestion
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    first_result = result("work-one", "work@example.com")
+    expiring = with_token(first_result, %{"expires_at" => System.system_time(:second) + 30})
+    {:ok, first} = SelfHost.connect(owner, expiring, "Etc/UTC")
+    binding = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+
+    assert {:ok, original} =
+             Ingestion.baseline(
+               ctx.scope,
+               first,
+               %{history_id: "100", expires_at: DateTime.add(DateTime.utc_now(), 3600)},
+               on_baseline: fn _ -> Store.activate({first.id, binding.epoch}) end
+             )
+
+    refresh_fixture(ctx, fn conn ->
+      conn |> Plug.Conn.put_status(400) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    assert {:error, :reauthorization_required} = Credentials.token({first.id, binding.epoch})
+    {:ok, _other} = SelfHost.connect(owner, result("work-two", "work@example.com"), "Etc/UTC")
+
+    assert %{state: :disconnected, reset_baseline: true, reset_generation: generation} =
+             Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+
+    assert generation == original.generation
+    {:ok, ^first} = SelfHost.connect(owner, first_result, "Etc/UTC")
+    rebound = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+
+    assert {:error, :activation_failed} =
+             Ingestion.activate(ctx.scope, first, original.generation,
+               on_baseline: fn _ -> Store.activate({first.id, rebound.epoch}) end
+             )
+
+    assert %{state: :pending, reset_baseline: true} =
+             Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+  end
+
   test "self delivery retains verified historical address evidence only for the same subject",
        ctx do
     alias EmailJanitor.Mail.{Outbox, Outgoing}
