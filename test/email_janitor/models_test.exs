@@ -1,6 +1,7 @@
 defmodule EmailJanitor.ModelsTest do
   use ExUnit.Case, async: false
   import ExUnit.CaptureLog
+  require Logger
   import EmailJanitor.Fixtures
   alias EmailJanitor.{Classifier, Decision}
   alias EmailJanitor.Models.{Config, SDK}
@@ -143,6 +144,62 @@ defmodule EmailJanitor.ModelsTest do
       assert Agent.get(count, & &1) == 1
       refute logs =~ "PRIVATE_BODY_SENTINEL"
       refute logs =~ "TEST_API_KEY_SENTINEL"
+    end
+  end
+
+  test "Bedrock malformed-tool decoding cannot log raw model text and restores the caller logger" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        output: %{
+          message: %{
+            role: "assistant",
+            content: [
+              %{text: ~s({"name":null,"note":"PRIVATE_BODY_SENTINEL"})}
+            ]
+          }
+        },
+        stopReason: "end_turn",
+        usage: %{inputTokens: 1, outputTokens: 1, totalTokens: 2},
+        metrics: %{latencyMs: 1}
+      })
+    end)
+
+    previous = Logger.get_process_level(self())
+
+    on_exit(fn ->
+      if previous,
+        do: Logger.put_process_level(self(), previous),
+        else: Logger.delete_process_level(self())
+    end)
+
+    for level <- [nil, :debug, :error] do
+      if level,
+        do: Logger.put_process_level(self(), level),
+        else: Logger.delete_process_level(self())
+
+      logs = capture_log(fn -> assert {:error, :model_unavailable} = run(:bedrock) end)
+      refute logs =~ "PRIVATE_BODY_SENTINEL"
+      assert Logger.get_process_level(self()) == level
+    end
+
+    Logger.delete_process_level(self())
+
+    assert capture_log(fn -> Logger.warning("CALLER_LOGGING_RESTORED") end) =~
+             "CALLER_LOGGING_RESTORED"
+  end
+
+  test "a transport failure restores the caller's logger setting" do
+    Req.Test.stub(__MODULE__, fn conn -> Req.Test.transport_error(conn, :econnrefused) end)
+    previous = Logger.get_process_level(self())
+    Logger.put_process_level(self(), :warning)
+
+    try do
+      assert {:error, :model_unavailable} = run(:azure)
+      assert Logger.get_process_level(self()) == :warning
+    after
+      if previous,
+        do: Logger.put_process_level(self(), previous),
+        else: Logger.delete_process_level(self())
     end
   end
 

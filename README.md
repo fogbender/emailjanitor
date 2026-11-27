@@ -206,6 +206,11 @@ its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
 enable runtime HTTP tracing. The model adapter checks for Finch handlers before
 each call and fails closed if any are present; hosts must keep observer settings
 fixed during calls. Only the metadata-only Janitor event above is supported.
+Provider preparation also runs with logging disabled for that caller only,
+restoring its prior logger setting afterward. A first request step disables
+logging inside the SDK's separate short-lived dispatch/decoding task. This prevents the
+pinned Bedrock Converse decoder's malformed-tool warning from persisting raw
+model text; ordinary application logging in other processes stays available.
 Oversized or structurally excessive HTML is kept as `:unreadable_content` rather
 than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
 normal callers should use `Reviewer.review` to include safeguards and context.
