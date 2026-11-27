@@ -1,4 +1,5 @@
 %{
+  "assent": {:hex, :assent, "0.4.0", "5e7bfdbfd1b59e5b1fdb3f8bacab0134fa8905ec53ba0c8e3094631d9c3cf539", [:mix], [{:jose, "~> 1.8", [hex: :jose, repo: "hexpm", optional: true]}, {:req, "~> 0.4", [hex: :req, repo: "hexpm", optional: true]}], "hexpm", "5da8e01a5306b13860cfa298426e23474009c5f35cc685e0f693815c62259195"},
   "db_connection": {:hex, :db_connection, "2.10.3", "9d641d9cb56ed7cd03d0f5520b64f023f8c9a2531944991c952aa38e8afd5405", [:mix], [{:telemetry, "~> 0.4 or ~> 1.0", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "ff441940bfd9ef5cced632e0e36d4ac823abeb9cae2767203fb9b4ccd1bd83cb"},
   "decimal": {:hex, :decimal, "3.2.0", "f1235f05d841a211fda78a08fdb9777f2ff51a71f18455233fae186ff76187c6", [:mix], [], "hexpm", "190bca80580ce61aa69bb0eacadd7677710205c770225c2c2c07e32a5c31b234"},
   "domainatrex": {:hex, :domainatrex, "3.2.0", "3aac4651b523b1c2faf460017f34321c5b535048f24d283c379ab96fb30648f4", [:mix], [], "hexpm", "0cf6258966342100993cf5df277baf65f7124b70ffce2c982866be0fb533294b"},

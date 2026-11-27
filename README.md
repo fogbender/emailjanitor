@@ -57,6 +57,27 @@ here; full SaaS authorization is a later integration gate.
 
 ## Gmail SDK boundary
 
+`EmailJanitor.Google.OAuth` supplies a shared, transient Google connection flow
+using Assent 0.4's native JWT adapter. Build a trusted `OAuth.Config` from the
+application's client ID, secret and registered redirect URI. `authorize_url/2`
+accepts `:sign_in` (openid/email only) or `:connect` (also Gmail.modify and offline
+consent). Every attempt uses random state, nonce and S256 PKCE. `callback/3`
+accepts only a previously saved `OAuth.Session`; it verifies Google's RS256
+signature, issuer, audience, authorized party, expiry, nonce and verified email.
+Connecting requires the granted Gmail scope and a refresh token. Token responses
+are reduced to access/refresh credentials, Bearer type, expiry epoch seconds and
+scope, inside redacted `Content`; ID tokens are discarded after verification.
+
+The host must bind attempts to the initiating browser and account, expire them,
+and atomically consume them once. Store `dump_session/1` encrypted server-side;
+`load_session/1` validates fixed keys without dynamic atoms. Cookies should hold
+only an opaque attempt reference. `refresh/2` preserves an omitted refresh token
+and scope from the previous validated token. Endpoints and algorithms are fixed;
+callback parameters cannot set SDK options. Provider requests disable redirects,
+retries and logging. This module performs no durable storage and reads no machine
+credential stores. The internal Config HTTP options accept only a trusted test
+plug, never options from a browser request.
+
 `EmailJanitor.Gmail.SDK` uses Google's generated `google_api_gmail` client. Supply
 an `EmailJanitor.Gmail.Config` with the connected `Inbox` and a zero-argument
 token resolver returning `{:ok, access_token}` (or a redacted `Content` wrapper).
