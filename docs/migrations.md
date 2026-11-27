@@ -18,7 +18,6 @@ inside an optional module.
 | 9 | Conversation execution ownership | Conversation installer (in development) |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
-
 | 12 | Pre-dispatch digest header staging | Digest staging installer (in development) |
 
 Changes to an already released schema require a new
