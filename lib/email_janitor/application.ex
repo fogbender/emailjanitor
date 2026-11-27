@@ -3,7 +3,10 @@ defmodule EmailJanitor.Application do
   use Application
 
   def start(_, _) do
-    children = [{Task.Supervisor, name: EmailJanitor.ExecutorSupervisor}]
+    children = [
+      {Registry, keys: :unique, name: EmailJanitor.JobRegistry},
+      {Task.Supervisor, name: EmailJanitor.ExecutorSupervisor}
+    ]
 
     if EmailJanitor.SelfHost.Config.enabled?() do
       case EmailJanitor.SelfHost.Config.load() do

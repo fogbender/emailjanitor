@@ -27,6 +27,7 @@ defmodule EmailJanitor.MixProject do
   defp deps do
     [
       {:jason, "~> 1.4"},
+      {:oban, "== 2.24.1"},
       {:mail, "~> 0.5.2"},
       {:gen_smtp, "== 1.3.0"},
       {:floki, "~> 0.38.0"},

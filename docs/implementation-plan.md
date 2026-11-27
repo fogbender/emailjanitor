@@ -171,6 +171,12 @@ classification and prompt reasoning distinct from the executor that is allowed
 to mutate Gmail. The model never receives OAuth secrets, cloud credentials, arbitrary
 shell/network tools, or authority to email arbitrary destinations.
 
+The MIT host uses Oban OSS. The private SaaS uses the commercially licensed Oban
+Pro copy vendored in TNA; its source stays in the private repository. Jobs persist
+only task names, opaque keys, continuation markers and retry/wake state. Host
+callbacks and provider configuration remain in memory. Oban owns scheduling and
+recovery; existing action/outbox ledgers still fence external effects.
+
 ## Durable data and privacy
 
 Persist only what is necessary:
@@ -215,7 +221,9 @@ abandoned/failed objects; lifecycle expiration is a fallback, not prompt deletio
 No object versioning, replication, or backups for that spool. Document actual
 transport/provider retention honestly, including retries and failure cleanup.
 Do not promise upstream cloud/model providers have zero retention without checking
-their selected services, deployment settings, and agreements.
+their selected services, deployment settings, and agreements. The no-body-retention
+requirement applies to our own storage. Azure default upstream abuse monitoring is
+accepted for the SaaS pilot; modified abuse monitoring is not a prerequisite.
 
 Classify Gmail mail by refetching Gmail, not by sending cleaned inbox bodies through
 SES. Fetch attachments only if a supported feedback workflow actually needs them;

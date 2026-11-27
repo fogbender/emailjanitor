@@ -2,22 +2,19 @@ defmodule EmailJanitor.Mail.Receiver do
   @moduledoc "Independent receipt intake, body disposal, authenticated feedback and TTL cleanup jobs."
   import Ecto.Query
   alias EmailJanitor.Mail.{Feedback, Incoming, Receipt, SDK, Spool}
-  alias EmailJanitor.Mail.Job
 
-  def children(%Feedback.Config{} = config) do
-    [
-      job(:receipt_intake, fn _ -> receive_once(config) end, 45_000),
-      job(:incoming_processing, fn _ -> process_once(config) end, 40_000),
-      job(:authenticated_feedback, fn _ -> feedback_once(config) end, 1_100_000),
-      job(:feedback_metadata_cleanup, fn _ -> purge_feedback(config) end, 30_000),
-      job(:spool_cleanup, fn marker -> sweep(config, marker) end, 1_100_000),
-      job(:orphan_cleanup, fn marker -> sweep_orphans(config, marker) end, 1_100_000)
-    ]
+  def tasks(%Feedback.Config{} = config) do
+    Map.new([
+      task("receipt_intake", fn _ -> receive_once(config) end, 45_000, :intake),
+      task("incoming_processing", fn _ -> process_once(config) end, 40_000, :process),
+      task("authenticated_feedback", fn _ -> feedback_once(config) end, 1_100_000, :feedback),
+      task("feedback_metadata_cleanup", fn _ -> purge_feedback(config) end, 30_000, :maintenance),
+      task("spool_cleanup", fn marker -> sweep(config, marker) end, 1_100_000, :spool),
+      task("orphan_cleanup", fn marker -> sweep_orphans(config, marker) end, 1_100_000, :orphan)
+    ])
   end
 
-  defp job(name, run, timeout) do
-    Supervisor.child_spec({Job, run: run, timeout_ms: timeout}, id: name)
-  end
+  defp task(name, run, timeout, queue), do: {name, %{run: run, timeout_ms: timeout, queue: queue}}
 
   @doc false
   def receive_once(config) do

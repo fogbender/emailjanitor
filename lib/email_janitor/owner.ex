@@ -17,6 +17,10 @@ defmodule EmailJanitor.Owner do
   def workflow(fun, timeout_ms \\ 900_000) when timeout_ms in 1..900_000,
     do: run_with_budget(fun, timeout_ms)
 
+  @doc "Bound a background job and cancel its nested owners when the Oban executor dies."
+  def background(fun, timeout_ms) when timeout_ms in 1..1_200_000,
+    do: run_with_budget(fun, timeout_ms)
+
   defp run_with_budget(fun, timeout_ms) do
     caller = self()
     own_deadline = System.monotonic_time(:millisecond) + timeout_ms

@@ -39,4 +39,11 @@ for prefix <- ["ej_digest_stage", "ej_digest_stage_other", "ej_digest_stage_conc
   EmailJanitor.Digest.install_staging(scope)
 end
 
+EmailJanitor.TestRepo.query!(~s(CREATE SCHEMA IF NOT EXISTS "ej_jobs_test"), [], log: false)
+
+Ecto.Migrator.up(EmailJanitor.TestRepo, 1, EmailJanitor.Jobs.Migration,
+  prefix: "ej_jobs_test",
+  log: false
+)
+
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)
