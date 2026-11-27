@@ -31,6 +31,9 @@ defmodule EmailJanitor.Classifier do
       {:keep, :unreadable_content} = keep ->
         keep
 
+      {:error, :model_rejected} ->
+        {:error, :model_rejected}
+
       {:error, _} ->
         {:error, :model_unavailable}
 

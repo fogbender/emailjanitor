@@ -87,6 +87,7 @@ defmodule EmailJanitor.Models.SDK do
     case generated do
       {:ok, response} -> decision_object(response, config.provider, target_ids)
       {:invalid, :decision} -> {:invalid, :decision}
+      {:error, :model_rejected} -> {:error, :model_rejected}
       _ -> {:error, :model_unavailable}
     end
   rescue
@@ -184,13 +185,22 @@ defmodule EmailJanitor.Models.SDK do
           %Req.Response{status: status} when status in 200..299 ->
             {:invalid, :decision}
 
+          %Req.Response{status: status} when status in [400, 413, 422] ->
+            {:error, :model_rejected}
+
           _ ->
             {:error, :model_unavailable}
         end)
 
       case result do
-        {:error, %ReqLLM.Error.API.Response{status: status}} when status in 200..299 ->
+        {:error, %{__struct__: kind, status: status}}
+        when kind in [ReqLLM.Error.API.Request, ReqLLM.Error.API.Response] and status in 200..299 ->
           {:invalid, :decision}
+
+        {:error, %{__struct__: kind, status: status}}
+        when kind in [ReqLLM.Error.API.Request, ReqLLM.Error.API.Response] and
+               status in [400, 413, 422] ->
+          {:error, :model_rejected}
 
         other ->
           other
