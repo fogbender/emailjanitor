@@ -228,7 +228,7 @@ defmodule EmailJanitor.PreferencesTest do
     end
   end
 
-  test "clearing instructions removes old receipts and maintenance prunes the retry window",
+  test "clearing retains text-free recovery proof until maintenance prunes the retry window",
        ctx do
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.first.id)
     first_id = Ecto.UUID.generate()
@@ -246,13 +246,15 @@ defmodule EmailJanitor.PreferencesTest do
     assert is_nil(TestRepo.get(Preferences.Change, first_id, prefix: ctx.scope.prefix))
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.first.id)
 
-    {:ok, _} =
+    second_id = Ecto.UUID.generate()
+
+    {:ok, second_receipt} =
       Preferences.replace(
         ctx.scope,
         :all,
         snapshot,
         Content.new("Keep people I know."),
-        Ecto.UUID.generate()
+        second_id
       )
 
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, ctx.first.id)
@@ -261,9 +263,25 @@ defmodule EmailJanitor.PreferencesTest do
              Preferences.replace(ctx.scope, :all, snapshot, Content.new(""), Ecto.UUID.generate())
 
     refute Map.has_key?(Map.from_struct(receipt), :instruction_hash)
-    assert [^receipt] = TestRepo.all(Preferences.Change, prefix: ctx.scope.prefix)
+
+    assert MapSet.new(TestRepo.all(Preferences.Change, prefix: ctx.scope.prefix)) ==
+             MapSet.new([receipt, second_receipt])
+
     {:ok, current} = Preferences.snapshot(ctx.scope, ctx.first.id)
     assert Content.read(current.global) == ""
+
+    assert {:ok, ^second_receipt} =
+             Preferences.replace(
+               ctx.scope,
+               :all,
+               current,
+               Content.new("Must not revive."),
+               second_id
+             )
+
+    {:ok, unchanged} = Preferences.snapshot(ctx.scope, ctx.first.id)
+    assert Content.read(unchanged.global) == ""
+    assert unchanged.instruction_version == current.instruction_version
   end
 
   test "a local correction leaves another inbox's prepared action dispatchable", ctx do
@@ -291,8 +309,8 @@ defmodule EmailJanitor.PreferencesTest do
     second = prepare.(ctx.second)
     first_id = ctx.first.id
     second_id = ctx.second.id
-    assert_receive {:prepared_local, ^first_id, a}
-    assert_receive {:prepared_local, ^second_id, b}
+    assert_receive {:prepared_local, ^first_id, a}, 1_000
+    assert_receive {:prepared_local, ^second_id, b}, 1_000
     {:ok, snapshot} = Preferences.snapshot(ctx.scope, first_id)
 
     {:ok, _} =

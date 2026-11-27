@@ -15,14 +15,17 @@ inside an optional module.
 | 6 | Target categories, remaining candidate/cancelled metadata and review fences | `Store.install/1` |
 | 7 | Exact restoration effects and durable per-message protections | `Store.install/1` / `Restore.install/1` |
 | 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
-| 9 | Conversation execution ownership | Conversation installer (in development) |
+| 9 | Conversation execution ownership and exact action bindings | `Conversation.Ledger.install/1` |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement/deferred provenance ledger | `Worker.install/1` |
 | 12 | Staged digest action headers | `Digest.install_staging/1` |
+| 13 | Body-free incoming feedback/reply receipts | Feedback installer (in development) |
 | 100 | Opt-in single-user owner and encrypted bindings | `SelfHost.Store.install/1` |
 | 101 | Single-user browser attempts and sessions | `SelfHost.Web.install/1` (in development) |
+| 102 | Single-user authenticated manual retry authority | Single-user release migrator |
+| 103 | Durable encrypted Google grant retirement and relink fence | `SelfHost.Revocations.install/1` |
 
 Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's
 global `public` schema has its own independent registry and migration table.
-Versions 100–101 apply only to the opt-in fixed `ej_selfhost` scope.
+Versions 100–103 apply only to the opt-in fixed `ej_selfhost` scope.

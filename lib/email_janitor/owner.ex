@@ -10,12 +10,37 @@ defmodule EmailJanitor.Owner do
   @deadline_key {__MODULE__, :execution_deadline}
 
   @doc "Run one execution in an isolated owner, never the caller's reusable process."
-  def run(fun, timeout_ms \\ 60_000) when timeout_ms in 1..60_000 do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
+  def run(fun, timeout_ms \\ 60_000) when timeout_ms in 1..60_000,
+    do: run_with_budget(fun, timeout_ms)
+
+  @doc "An isolated workflow owner covering bounded planning and several independent executions."
+  def workflow(fun, timeout_ms \\ 900_000) when timeout_ms in 1..900_000,
+    do: run_with_budget(fun, timeout_ms)
+
+  @doc "Bound a background job and cancel its nested owners when the Oban executor dies."
+  def background(fun, timeout_ms) when timeout_ms in 1..1_200_000,
+    do: run_with_budget(fun, timeout_ms)
+
+  defp run_with_budget(fun, timeout_ms) do
+    caller = self()
+    own_deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    deadline =
+      case Process.get(@deadline_key) do
+        inherited when is_integer(inherited) -> min(inherited, own_deadline)
+        _ -> own_deadline
+      end
 
     task =
       Task.Supervisor.async_nolink(EmailJanitor.ExecutorSupervisor, fn ->
         Process.put(@deadline_key, deadline)
+        owner = self()
+        finished = make_ref()
+
+        {watchdog, watchdog_monitor} =
+          spawn_monitor(fn ->
+            watch_budget(caller, owner, deadline, finished)
+          end)
 
         try do
           fun.()
@@ -23,6 +48,16 @@ defmodule EmailJanitor.Owner do
           _ -> {:error, :executor_unavailable}
         catch
           _, _ -> {:error, :executor_unavailable}
+        after
+          send(watchdog, {:finished, finished})
+
+          receive do
+            {:DOWN, ^watchdog_monitor, :process, ^watchdog, _} -> :ok
+          after
+            1_000 ->
+              Process.exit(watchdog, :kill)
+              Process.demonitor(watchdog_monitor, [:flush])
+          end
         end
       end)
 
@@ -31,6 +66,29 @@ defmodule EmailJanitor.Owner do
     case Task.yield(task, remaining) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} -> result
       _ -> {:error, :executor_unavailable}
+    end
+  end
+
+  # The caller may itself die or be suspended while waiting. Its Task.yield
+  # timeout cannot be the only owner of this budget. This independent watcher
+  # controls exactly the task created above, never any unrelated supervised job.
+  defp watch_budget(caller, owner, deadline, finished) do
+    caller_monitor = Process.monitor(caller)
+    owner_monitor = Process.monitor(owner)
+    remaining = max(0, deadline - System.monotonic_time(:millisecond))
+
+    receive do
+      {:finished, ^finished} ->
+        Process.demonitor(caller_monitor, [:flush])
+        Process.demonitor(owner_monitor, [:flush])
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _} ->
+        Process.demonitor(caller_monitor, [:flush])
+
+      {:DOWN, ^caller_monitor, :process, ^caller, _} ->
+        Process.exit(owner, :kill)
+    after
+      remaining -> Process.exit(owner, :kill)
     end
   end
 

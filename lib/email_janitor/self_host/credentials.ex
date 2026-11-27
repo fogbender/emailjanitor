@@ -1,9 +1,9 @@
 defmodule EmailJanitor.SelfHost.Credentials do
   @moduledoc "Refresh only this explicit inbox's encrypted grant; never use a machine Google profile."
   import Ecto.Query
-  alias EmailJanitor.{Content, SelfHost}
+  alias EmailJanitor.{Content, Owner, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.Store
+  alias EmailJanitor.SelfHost.{Binding, Grants, Refreshes, Revocations, Store}
   alias EmailJanitor.Store.Mailbox
 
   def token(ref) do
@@ -23,25 +23,64 @@ defmodule EmailJanitor.SelfHost.Credentials do
   end
 
   defp refresh(ref, before, old) do
-    # Provider calls and encryption happen outside the short publication lock.
-    # A disconnected/reconsented binding cannot be overwritten by a late refresh.
-    case OAuth.refresh(SelfHost.config().google_oauth, old) do
-      {:ok, content} -> publish(ref, before, content)
-      {:error, :reauthorization_required} -> retire(ref, before)
+    # Persist ownership before wire, independently of publication/CAS. Disconnect
+    # waits until every reply was captured or its owner is physically quarantined.
+    result =
+      Owner.run(
+        fn ->
+          case Refreshes.begin(ref, before) do
+            {:ok, attempt} ->
+              case OAuth.refresh(SelfHost.config().google_oauth, old) do
+                {:ok, content} ->
+                  publish(ref, before, content, attempt)
+
+                {:error, :reauthorization_required} ->
+                  retire(ref, before, attempt)
+
+                _ ->
+                  Refreshes.ambiguous(attempt)
+                  {:error, :google_credentials_unavailable}
+              end
+
+            _ ->
+              cached_token(ref)
+          end
+        end,
+        40_000
+      )
+
+    case result do
+      {:ok, %Content{}} -> result
+      {:error, :reauthorization_required} -> result
       _ -> {:error, :google_credentials_unavailable}
     end
   end
 
-  defp publish(ref, before, content) do
-    with {:ok, token} <- Store.token_data(content),
-         true <- token["expires_at"] >= System.system_time(:second) + 120,
+  defp publish(ref, before, content, attempt) do
+    with {:ok, token} <- Store.token_data(content, require_mail_scope: false),
          {:ok, cipher} <- SelfHost.seal("gmail-token", before.id, content),
-         {:ok, :ok} <-
+         {:ok, :captured} <-
+           Store.transaction(fn scope ->
+             Store.lock_mailbox(scope, before.id)
+             Grants.retain!(scope, before.id, content, cipher)
+             Refreshes.complete!(scope, attempt)
+             :captured
+           end),
+         {:ok, publication} <-
            Store.transaction(fn scope ->
              Store.lock_mailbox(scope, before.id)
 
-             with {:ok, current, _} <- Store.fetch_binding(ref),
-                  true <- current.token_version == before.token_version do
+             current = scope.repo.get!(Binding, before.id, prefix: scope.prefix, log: false)
+
+             allowed =
+               match?({:ok, _}, Store.token_data(content)) and
+                 match?({:ok, _, _}, Store.fetch_binding(ref)) and
+                 current.token_version == before.token_version and
+                 token["expires_at"] >= System.system_time(:second) + 120
+
+             if allowed, do: Grants.retain_cipher!(scope, before.id, current.token_ciphertext)
+
+             if allowed do
                scope.repo.update!(
                  Ecto.Changeset.change(current,
                    token_ciphertext: cipher,
@@ -50,25 +89,44 @@ defmodule EmailJanitor.SelfHost.Credentials do
                  prefix: scope.prefix
                )
 
-               :ok
+               :published
              else
-               _ -> scope.repo.rollback(:credentials_changed)
+               # A late rotation is still an owned capability, even after
+               # disconnect. Never activate it or throw it away on a CAS miss.
+               # Reauthorization alone is not an explicit retirement. Keep its
+               # accepted late grant dormant so fresh consent resumes normally.
+               if current.state in [:disconnected, :revoking, :revocation_required] do
+                 state =
+                   Revocations.stage!(scope, %{current | token_ciphertext: nil}, new_grant: true)
+
+                 scope.repo.update!(Ecto.Changeset.change(current, state: state),
+                   prefix: scope.prefix,
+                   log: false
+                 )
+               end
+
+               :captured_stale
              end
            end) do
-      {:ok, Content.new(token["access_token"])}
+      if publication == :published,
+        do: {:ok, Content.new(token["access_token"])},
+        else: cached_token(ref)
     else
       {:error, :credentials_changed} -> cached_token(ref)
       _ -> {:error, :google_credentials_unavailable}
     end
   end
 
-  defp retire(ref, before) do
+  defp retire(ref, before, attempt) do
     result =
       Store.transaction(fn scope ->
         Store.lock_mailbox(scope, before.id)
+        Refreshes.complete!(scope, attempt)
 
         with {:ok, current, _} <- Store.fetch_binding(ref),
              true <- current.token_version == before.token_version do
+          Grants.forget_cipher!(scope, before.id, current.token_ciphertext)
+
           scope.repo.update!(
             Ecto.Changeset.change(current,
               state: :reauthorization_required,

@@ -14,7 +14,13 @@ defmodule EmailJanitor.Google.OAuth do
     alias EmailJanitor.Content
     @enforce_keys [:client_id, :client_secret, :redirect_uri]
     @derive {Inspect, only: [:client_id, :redirect_uri]}
-    defstruct [:client_id, :client_secret, :redirect_uri, http_options: []]
+    defstruct [
+      :client_id,
+      :client_secret,
+      :redirect_uri,
+      :revocation_executable,
+      http_options: []
+    ]
 
     def new(client_id, secret, redirect_uri) do
       with true <- text?(client_id, 4096),
@@ -107,8 +113,9 @@ defmodule EmailJanitor.Google.OAuth do
              |> Keyword.put(:session_params, Map.from_struct(session))
              |> OIDC.callback(Map.take(params, ~w(state code error)), __MODULE__),
            {:ok, token} <- sanitize_token(raw),
-           true <- session.mode == :sign_in or @gmail in String.split(token["scope"]),
            true <- session.mode == :sign_in or valid_credential?(token["refresh_token"]) do
+        # A verified offline grant still needs host custody if Gmail was declined.
+        # Hosts capture it before validating scopes and deciding activation.
         {:ok, %Result{subject: subject, email: email, token: Content.new(Jason.encode!(token))}}
       else
         _ -> {:error, :authorization_failed}
@@ -158,6 +165,17 @@ defmodule EmailJanitor.Google.OAuth do
   end
 
   def refresh(_, _), do: {:error, :refresh_failed}
+
+  @doc "Revoke the stored refresh token using a trusted official-SDK executable; hosts own durable erasure/relink fencing."
+  def revoke(%Config{} = config, %Content{} = token),
+    do: revoke(config, token, executable: config.revocation_executable)
+
+  def revoke(_, _), do: {:error, :revocation_unavailable}
+
+  def revoke(%Config{}, %Content{} = token, options) when is_list(options),
+    do: EmailJanitor.Google.Revocation.revoke(token, Keyword.get(options, :executable))
+
+  def revoke(_, _, _), do: {:error, :revocation_unavailable}
 
   defp refresh_access_token(settings, previous) do
     case OAuth2.refresh_access_token(settings, previous) do

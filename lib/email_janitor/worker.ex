@@ -292,6 +292,33 @@ defmodule EmailJanitor.Worker do
   defp inbox_failure?({:deferred, _, result}), do: inbox_failure?(result)
   defp inbox_failure?(_), do: false
 
+  defp review_with_policy(config, thread_id, targets, instructions, version) do
+    factory = fn messages ->
+      with {:ok, derived} <- Config.with_message_policy(config, messages),
+           do: {:ok, %Policy{adapter: Gate, context: %{config: derived}}}
+    end
+
+    {result, policy} =
+      Executor.review_with_context(
+        config.scope,
+        config.inbox,
+        thread_id,
+        config.gmail,
+        config.classifier,
+        Content.read(instructions),
+        version,
+        cleanup_target_ids: targets,
+        self_mail: config.self_mail,
+        policy: %Policy{adapter: Gate, context: %{config: config}},
+        context_factory: factory
+      )
+
+    case policy do
+      %Policy{adapter: Gate, context: %{config: derived}} -> {result, derived}
+      _ -> {result, config}
+    end
+  end
+
   defp review_targets(config, checkpoint, id, snapshot, instructions, version, now) do
     case Ingestion.eligible_thread(
            config.scope,
@@ -307,23 +334,8 @@ defmodule EmailJanitor.Worker do
         if targets == [] do
           processed(config, checkpoint, [id], :skipped)
         else
-          options = [
-            cleanup_target_ids: targets,
-            self_mail: config.self_mail,
-            policy: %Policy{adapter: Gate, context: %{config: config}}
-          ]
-
-          result =
-            Executor.review(
-              config.scope,
-              config.inbox,
-              eligible.thread_id,
-              config.gmail,
-              config.classifier,
-              Content.read(instructions),
-              version,
-              options
-            )
+          {result, reviewed_config} =
+            review_with_policy(config, eligible.thread_id, targets, instructions, version)
 
           throttled? =
             Ledger.model_outcome(
@@ -336,7 +348,16 @@ defmodule EmailJanitor.Worker do
             )
 
           finished =
-            finish_review(config, checkpoint, eligible, targets, snapshot, version, now, result)
+            finish_review(
+              reviewed_config,
+              checkpoint,
+              eligible,
+              targets,
+              snapshot,
+              version,
+              now,
+              result
+            )
 
           if throttled?, do: result, else: finished
         end
@@ -597,18 +618,13 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :unreadable, now)
         :deferred
       else
-        review =
-          Executor.review(
-            config.scope,
-            config.inbox,
+        {review, reviewed_config} =
+          review_with_policy(
+            config,
             candidate.thread_id,
-            config.gmail,
-            config.classifier,
-            Content.read(instructions),
-            version,
-            cleanup_target_ids: candidate.message_ids,
-            self_mail: config.self_mail,
-            policy: %Policy{adapter: Gate, context: %{config: config}}
+            candidate.message_ids,
+            instructions,
+            version
           )
 
         throttled? =
@@ -621,7 +637,9 @@ defmodule EmailJanitor.Worker do
             now
           )
 
-        finished = finish_recheck(config, checkpoint, candidate, snapshot, version, now, review)
+        finished =
+          finish_recheck(reviewed_config, checkpoint, candidate, snapshot, version, now, review)
+
         if throttled?, do: review, else: finished
       end
     else
@@ -635,8 +653,7 @@ defmodule EmailJanitor.Worker do
         {:deferred, reason}
 
       {:error, :thread_not_found} ->
-        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
-        :skipped
+        retire_deleted_source(config, checkpoint, candidate, version, now)
 
       {:error, :ineligible_recheck} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
@@ -680,15 +697,14 @@ defmodule EmailJanitor.Worker do
 
   defp finish_recheck(
          config,
-         _checkpoint,
+         checkpoint,
          candidate,
          _snapshot,
-         _version,
+         version,
          now,
          {:error, :thread_not_found}
        ) do
-    Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
-    :skipped
+    retire_deleted_source(config, checkpoint, candidate, version, now)
   end
 
   defp finish_recheck(config, checkpoint, candidate, snapshot, version, now, {:ok, proposal}) do
@@ -722,8 +738,7 @@ defmodule EmailJanitor.Worker do
         :done
 
       {:error, :thread_not_found} ->
-        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
-        :skipped
+        retire_deleted_source(config, checkpoint, candidate, version, now)
 
       {:unresolved, _} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
@@ -808,6 +823,37 @@ defmodule EmailJanitor.Worker do
 
     Ledger.finish_candidate(config.scope, config.inbox, candidate, reason, now)
     if inbox_failure?(error), do: error, else: {:deferred, status(error)}
+  end
+
+  defp retire_deleted_source(config, checkpoint, candidate, version, now) do
+    policy = %Policy{adapter: Gate, context: %{config: config}}
+    guard = fn -> with :ok <- authorized(config), do: Config.recheck(config, candidate) end
+
+    case Ledger.retire_deleted(
+           config.scope,
+           config.inbox,
+           candidate,
+           checkpoint.generation,
+           version,
+           policy,
+           guard
+         ) do
+      :ok ->
+        :skipped
+
+      {:error, reason}
+      when reason in [
+             :partial_retirement_unsupported,
+             :manual_recheck_unsupported,
+             :manual_authorization_changed
+           ] ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :unsupported_policy, now)
+        {:deferred, reason}
+
+      error ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :retry, now)
+        if inbox_failure?(error), do: error, else: {:deferred, status(error)}
+    end
   end
 
   defp processed(config, checkpoint, ids, outcome) do

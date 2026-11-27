@@ -10,6 +10,7 @@ defmodule EmailJanitor.SelfHost.Config do
     :google_oauth,
     :credential_key,
     :web_secret,
+    :reply_parser_executable,
     :database,
     :mail,
     :pubsub,
@@ -26,7 +27,10 @@ defmodule EmailJanitor.SelfHost.Config do
          {:ok, key} <- secret(env["JANITOR_CREDENTIAL_KEY_FILE"], 32, 32),
          {:ok, web_secret} <- secret(env["JANITOR_SECRET_KEY_BASE_FILE"], 64, 4096),
          {:ok, google} <- google(env["JANITOR_GOOGLE_CLIENT_JSON_FILE"], public_url),
+         {:ok, google} <- revocation(google, env["JANITOR_GOOGLE_REVOKE_EXECUTABLE"]),
          {:ok, database} <- database(env),
+         parser <- env["JANITOR_REPLY_PARSER_EXECUTABLE"],
+         true <- is_nil(parser) or (is_binary(parser) and Path.type(parser) == :absolute),
          region when is_binary(region) <- Map.get(env, "AWS_REGION", "us-east-1"),
          true <- region == "us-east-1",
          model when is_binary(model) <-
@@ -40,6 +44,7 @@ defmodule EmailJanitor.SelfHost.Config do
          public_url: public_url,
          credential_key: Content.new(key),
          web_secret: Content.new(web_secret),
+         reply_parser_executable: parser,
          google_oauth: google,
          database: database,
          enable_web: web == "1",
@@ -140,6 +145,17 @@ defmodule EmailJanitor.SelfHost.Config do
       :error
     end
   end
+
+  defp revocation(nil, nil), do: {:ok, nil}
+  defp revocation(google, nil), do: {:ok, google}
+
+  defp revocation(%OAuth.Config{} = google, path) when is_binary(path) do
+    if Path.type(path) == :absolute,
+      do: {:ok, %{google | revocation_executable: path}},
+      else: :error
+  end
+
+  defp revocation(_, _), do: :error
 
   defp google(nil, _), do: {:ok, nil}
 

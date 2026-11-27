@@ -15,6 +15,10 @@ defmodule EmailJanitor.Mail.Spool do
   alias EmailJanitor.Owner
   alias EmailJanitor.Mail.{Config, Incoming, Receipt, SDK}
   alias EmailJanitor.Store.{Mailbox, Scope}
+  @processing_ttl_seconds 3600
+
+  @doc "The processing lifetime used for persisted receipt expiry. Feedback derives its original trusted SES time from this same duration."
+  def processing_ttl_seconds, do: @processing_ttl_seconds
 
   def get(%Scope{} = scope, id), do: scope.repo.get(Incoming, id, prefix: scope.prefix)
 
@@ -27,7 +31,7 @@ defmodule EmailJanitor.Mail.Spool do
         envelope_from: receipt.envelope_from,
         recipients: receipt.recipients,
         verdicts: receipt.verdicts,
-        expires_at: DateTime.add(receipt.received_at, 3600)
+        expires_at: DateTime.add(receipt.received_at, @processing_ttl_seconds)
       }
 
       scope.repo.insert!(row, prefix: scope.prefix, on_conflict: :nothing, conflict_target: [:id])

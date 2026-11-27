@@ -28,6 +28,7 @@ for prefix <- [
   EmailJanitor.Mail.Store.install(scope)
   EmailJanitor.Digest.install(scope)
   EmailJanitor.Conversation.Ledger.install(scope)
+  EmailJanitor.SelfHost.Web.install(scope)
 end
 
 for prefix <- ["ej_digest_stage", "ej_digest_stage_other", "ej_digest_stage_concurrency"] do
@@ -37,5 +38,12 @@ for prefix <- ["ej_digest_stage", "ej_digest_stage_other", "ej_digest_stage_conc
   EmailJanitor.Digest.install(scope)
   EmailJanitor.Digest.install_staging(scope)
 end
+
+EmailJanitor.TestRepo.query!(~s(CREATE SCHEMA IF NOT EXISTS "ej_jobs_test"), [], log: false)
+
+Ecto.Migrator.up(EmailJanitor.TestRepo, 1, EmailJanitor.Jobs.Migration,
+  prefix: "ej_jobs_test",
+  log: false
+)
 
 Ecto.Adapters.SQL.Sandbox.mode(EmailJanitor.TestRepo, :manual)

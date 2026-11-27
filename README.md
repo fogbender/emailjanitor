@@ -1,5 +1,9 @@
 # Email Janitor
 
+AWS self-host operators can start with the [setup CLI](docs/setup.md): private
+key initialization, local configuration checks, official Google WIF config
+generation, and the SOPS/OAuth/SES handoff. Setup leaves cleanup disabled.
+
 The [SES transport foundation](docs/mail-transport.md) documents the metadata-only
 outbox, trusted inbound receipts, short-lived spool and remaining host contracts.
 The [daily digest library](docs/daily-digests.md) adds local-21:00 scheduling,
@@ -11,8 +15,9 @@ one user can connect multiple Google inboxes. The hosted application's tenancy
 and billing live separately in `fogbender/emailjanitor-saas`.
 
 **Under development.** No integrated production service yet. A
-[locked Nix release](docs/release-packaging.md) now builds the reviewed library;
-host startup and live provider verification remain integration gates. The
+[locked Nix release](docs/release-packaging.md) builds the opt-in single-user host,
+including its browser and background services. Installed startup is tested with
+isolated synthetic providers; live provider verification remains a launch gate. The
 existing personal Janitor remains independent until a verified cutover.
 
 The [implementation plan](docs/implementation-plan.md) records the agreed product
@@ -61,14 +66,33 @@ split prompt injection.
 These checks supplement the prompt; execution still
 requires the immutable executor safeguards and the host's policy.
 
-`Conversation.Ledger.install/1` installs migration 8 for seven-day metadata-only
+`Conversation.respond/3` uses a trusted `Conversation.Context` supplied by the
+host. It resolves references inside the selected inbox, applies small preference
+edits, and routes explicit Done requests through the same executor safeguards
+and policy as automatic cleanup. Completion replies come from exact durable
+message outcomes. Hosts must provide the policy and current connection guard;
+model output cannot select a storage scope or a Gmail credential.
+Read-only questions normally receive a transient model answer. If the preceding
+request has uncertain effects, that turn reports its durable status instead of
+letting generated prose claim success. An interrupted instruction update is
+recovered from its saved preference-change receipt; without that proof the user
+is asked to send the instruction again. Pinned message selections are never
+replanned during recovery.
+
+Email hosts can supply `Conversation.Evidence.new/3` as `request_evidence` to keep
+the authenticated author's text separate from untrusted forwarded content.
+`previous_request_id` pins a verified reply to its exact scoped predecessor;
+an expired explicit predecessor never falls back to a newer unrelated request.
+
+`Conversation.Ledger.install/1` installs migrations 8 and 9 for seven-day metadata-only
 request/effect receipts and previous reference IDs. It stores no user request,
 model response, search query, sender, subject or body. Hosts call `purge/2` during
 maintenance. `Conversation.Outcome` derives completion claims from recorded
 effects, preserves ambiguous results, and detects instructions changed since an
-earlier request. The authenticated runner, Gmail lookup/restoration and website
-and email entry-point wiring remain separate integration work; this foundation
-does not enable cleanup.
+earlier request. A live request owner excludes duplicate effects; takeover requires
+actual owner death, and completed receipts cannot be changed. The runner's Gmail
+search/restoration capabilities and authenticated website/email entry points are
+still being integrated; no live cleanup or production service is enabled here.
 
 Versioned distilled preferences are available through `Preferences.install/1`
 (migration 3), `snapshot/2`, `text/1` and `replace/5`. The host selects either all
@@ -82,7 +106,8 @@ version, then bump affected inbox versions atomically. UUID effect receipts
 deduplicate retries for seven days without retaining conversation text or text
 hashes. Reusing a request UUID returns its original effect, even after a later
 correction; callers compare that receipt's revision with current state before
-describing what is active. Clearing a scope removes its older receipts. Writes
+describing what is active. Clearing a scope removes its instruction text while
+keeping recovery metadata for the same seven-day retry window. Writes
 prune expired receipts; hosts also call `Preferences.purge_receipts/2` during
 maintenance. The [migration registry](docs/migrations.md) reserves optional module
 versions alongside the core sequence. Registration serializes
@@ -171,9 +196,10 @@ part of this metadata.
 
 The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
 has separate HTTP-transport tests; model tests exercise both real SDK pipelines
-against synthetic responses. No live Gmail account or model credentials are connected yet. There
-is no running cleanup service, email transport, chat UI, billing, or cloud
-deployment yet.
+against synthetic responses. The opt-in host includes cleanup, email feedback,
+digests and its browser UI; installed startup is tested locally. No live Gmail
+account or model credentials are connected and no production deployment has run.
+SaaS billing, tenancy and the fresh TNA LiveView foundation live in the private repo.
 
 The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
@@ -227,7 +253,11 @@ accepts only a previously saved `OAuth.Session`; it verifies Google's RS256
 signature, issuer, audience, authorized party, expiry, nonce and verified email.
 Both documented Google issuer values (`https://accounts.google.com` and
 `accounts.google.com`) are accepted; unrelated issuers remain rejected.
-Connecting requires the granted Gmail scope and a refresh token. Token responses
+Connect callbacks require a refresh token, and may return a verified grant even
+when the user declined Gmail access. The host must capture it in encrypted
+storage before checking Gmail scope and deciding whether to activate the inbox.
+Keep every accepted grant until it is revoked; declining scope must not lose it.
+Sign-in requires only verified identity. Token responses
 are reduced to access/refresh credentials, Bearer type, expiry epoch seconds and
 scope, inside redacted `Content`; ID tokens are discarded after verification.
 
@@ -435,19 +465,32 @@ already active checkpoint from periodic history catch-up or local cleanup.
 Verified Janitor deliveries are removed before safeguards, correspondence lookup
 and classification; ordinary siblings retain all of those checks.
 
-`Worker.Server` supervises these steps with bounded concurrency (default two,
-maximum eight), one active task per trusted inbox reference, bounded task
-lifetimes and retry backoff. Supply `list: fn -> {:ok, refs} end` and
-`resolve: fn ref -> {:ok, config} end` as bounded host database operations;
-provider/model calls run in supervised tasks. Periodic catch-up remains necessary
-even when Pub/Sub notifications are absent. Supervise the authenticated
-`Gmail.NotificationWorker.Server` pull loop separately (trusted `source:`
-adapter/config, database-only `router:`, optional `wake:` callback), and call
-`Worker.Server.wake/1` after committing notifications when lower latency is needed.
-That generic wake preserves failure backoff. Only a trusted explicit auth/config
-repair or upgrade uses `wake/2` with a host-derived reference to reset that one
-inbox's backoff; new references must still appear in the trusted list callback.
-Host references are opaque binaries of 1–256 bytes, independent of Gmail IDs.
+`Worker.Server.tasks/1` supplies Oban discovery and per-inbox cleanup tasks.
+Supervise one `Jobs` instance in a host-owned schema (the single-user release uses
+`ej_selfhost`, migration 104), with `cleanup: 2`, `discovery: 1` and
+`notification: 1` queues. Pass its name as `jobs:`, plus bounded trusted
+`list: fn -> {:ok, refs} end` and `resolve: fn ref -> {:ok, config} end` callbacks.
+Only opaque references and fixed retry metadata enter Oban; credentials and
+provider/model callbacks remain in memory. Durable retries survive process and
+machine restarts, while domain effect ledgers still decide whether a mutation
+may be attempted. Periodic catch-up remains necessary without Pub/Sub signals.
+
+Merge `Gmail.NotificationWorker.Server.tasks/1` into the same runtime task map
+(trusted `source:` adapter/config, database-only `router:`, optional `wake:`).
+The optional timer-free `Worker.Server` facade takes the same cleanup options;
+`wake/1` hints healthy work without bypassing failure backoff. Only a trusted
+explicit auth/config repair or upgrade uses `wake/2` to reset one host-derived
+reference. New references must appear in the trusted list, and removed epochs
+are cancelled. Host references are opaque UTF-8 binaries of 1–256 bytes,
+independent of Gmail IDs. Immediate authenticated chat remains transient.
+
+A positively typed deleted-thread result retires the current pending recheck's
+exact core, host and worker metadata, without a quota refund. The worker captures
+a database timestamp before provider reads and revalidates connection generation,
+instruction version, host authorization and the request version under database
+locks. Newer review fences and unrelated selected-message siblings survive.
+Profile 404s, unreadable content and temporary failures retain retry provenance;
+unsupported partial host retirement pauses instead of withdrawing a wider grant.
 
 The host's `authorize` callback is checked again inside admission. It must use
 bounded local database checks, and explicit disconnect/binding changes must lock
@@ -580,6 +623,48 @@ partial metadata withdrawal. Legacy `retire_candidate/4` is used only when all
 remaining work is withdrawn; unsupported partial retirement rolls back before
 changing either host metadata or the core candidate.
 
+### Incoming email feedback (host integration)
+
+`Mail.Feedback` adds a metadata-only M13 workflow, with no SMTP body, Gmail body,
+reply prose, or auth tokens stored. A trusted host constructs `Feedback.Config`
+with its transport-only Scope/Inbox, Mail config, absolute parser executable,
+`route(envelope)` and `resolve(route_key)` callbacks. Initial routing identifies
+only the sender's currently connected Google inbox. Neither SMTP headers nor SES
+verdicts authorize a command. Known requests are durably accepted before the
+spool purges the raw S3 object, including while Gmail Sent indexing is delayed.
+
+The worker freshly verifies the Gmail account and searches an exact, unique
+Sent RFC Message-ID. It requires the current sender, Janitor recipient, SENT
+label, and an internal timestamp within one hour of the SES receipt. It parses
+only that authenticated Sent body. Maintained Crisp reply/forward parsers run in
+a bounded one-shot Nix executable (`.#reply-parser`, `emailjanitor-reply-parser`),
+with separate authored instructions and untrusted forwarded evidence. Unsupported
+MIME, ambiguous forwards, and interleaved quotes receive a clarification.
+
+`Feedback.Binding.route_verified(fresh_sent)` constructs the command Context
+only after authentication, using scoped confirmed Janitor outgoing references.
+`Feedback.Reference.delivery/3` is strict about the current recipient; `/4`
+accepts a trusted, exact subject-bound historical-recipient callback for renamed
+Google accounts. The host may return `{:clarify, sender_context}` for an expired
+or ambiguous reference, without executing a guessed conversation. A referenced
+digest may address another inbox only within the same trusted Scope; the reply
+still goes to the authenticated sender inbox. SMTP References are never passed
+to the routing callback. Hosts must derive the original conversation ID and,
+where present, exact prior request ID from their durable outgoing reference.
+
+`Feedback.accept(config, incoming, raw_content)` is the `Spool.process` handler;
+`Feedback.tick(config)` performs one due metadata receipt. Hosts bound worker
+concurrency and call `Feedback.Ledger.purge(scope, now)` during maintenance. They
+supply current DB-only guards and `respond(request_uuid, authored, evidence)` /
+`render(request_uuid)` functions. Request UUIDs depend only on the scoped inbox
+and canonical RFC ID. A reply interrupted after execution can be rebuilt from
+durable effect metadata; an unretained read-only answer gets an honest fixed
+fallback. Ambiguous SES dispatch is terminal, with no automatic resend. Unknown
+human senders can receive a configured signup link, limited to once per sender, plus a global 100-new-senders/day abuse backstop, with no Gmail inbox provisioned for Janitor.
+
+This is library plumbing tested with isolated PostgreSQL and synthetic HTTP.
+It is not activated, and real Google/SES delivery and threaded replies still
+need the final host/release integration gates.
 ## Exact-message restoration and search
 
 `Gmail.SDK.search(inbox_id, query, options)` returns at most ten message/thread
@@ -650,3 +735,38 @@ repair then preserves the original authority age. Explicit repair still uses
 `queue_recheck` to reset paused or capped work.
 The 30s mutation watchdog ends after the provider call; positive proof and
 reporting use the remaining overall 60s owner budget, including database waits.
+
+
+### Retained Google grants
+
+The opt-in single-user host stores every received, canonical offline grant under
+its immutable Google identity. A new consent commits its encrypted capability
+before a separate binding/publication transaction, so failed validation, stale
+publication or a SQL rollback cannot erase it. Repeated refresh IDs are deduplicated
+with a domain-separated HMAC using the existing credential master. Only encrypted
+authentication JSON and metadata are retained; no email bodies are added.
+
+Superseded grants stay dormant while a newer connection is active. Revoking one
+may invalidate other grants for the same Google user/project. Disconnect stops
+local work immediately, then retires one saved snapshot per bounded worker tick.
+A callback received while retirement is fenced is retained without activation.
+Only the exact snapshot covered by a provider result is erased; a newer recapture
+survives. Reconnection stays fenced until all retained capabilities are settled.
+
+Refresh ownership is committed before SDK wire I/O. SDK replies are captured
+independently before normalization, version checks or credential publication.
+Retirement waits for active refreshes. A confirmed-dead owner receives a physical
+30-second quarantine, covering the SDK's connect10s + receive15s bounds even after
+a wall-clock jump. A lost response remains explicitly uncertain. Success from the
+project-wide revocation endpoint can resolve that uncertainty; an invalid old
+refresh token alone cannot prove an uncaptured rotation gone. In that case local
+access stays stopped and the existing exact local operator confirmation of ALL
+former Google access removed is required. Fresh captures invalidate stale manual
+confirmation IDs. Provider calls never run under SQL locks.
+
+These facade calls belong outside caller-owned SQL transactions. The maintained
+browser host observes that boundary; a host must not wrap OAuth exchange/capture
+in a transaction that it may later roll back. Migration105 preserves legacy
+in-flight retirements and refuses rollback while grants or uncertain refreshes
+remain. Keep the credential master stable, complete retirement before a supported
+schema rollback, and never downgrade to a host that ignores the retained ledger.

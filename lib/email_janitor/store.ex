@@ -529,6 +529,23 @@ defmodule EmailJanitor.Store do
   end
 
   defp retirement_ids(ids, opts) do
+    case Keyword.fetch(opts, :retire_only_ids) do
+      {:ok, exact} when is_list(exact) ->
+        if length(exact) <= 200 and Enum.all?(exact, &is_binary/1) and Enum.uniq(exact) == exact do
+          Enum.filter(ids, &(&1 in exact))
+        else
+          raise ArgumentError, "Invalid exact metadata retirement selection"
+        end
+
+      :error ->
+        review_retirement_ids(ids, opts)
+
+      _ ->
+        raise ArgumentError, "Invalid exact metadata retirement selection"
+    end
+  end
+
+  defp review_retirement_ids(ids, opts) do
     case Keyword.fetch(opts, :inbox_message_ids) do
       :error ->
         ids

@@ -9,6 +9,20 @@ defmodule EmailJanitor.Conversation.Outcome do
       else: Content.new("I could not verify this request's inbox context.")
   end
 
+  # Answers are transient, so completed receipts cannot reconstruct their prose.
+  # A fresh plan may also have an empty answer; this neutral notice fits both.
+  defp verified(
+         %Receipt{
+           completed: true,
+           operation: :answer,
+           preference_target: :none,
+           preference_status: :none
+         },
+         _snapshot
+       ) do
+    Content.new("I do not have a saved answer to that question. Please send it again.")
+  end
+
   defp verified(receipt, snapshot) do
     preferences = preference(receipt, snapshot)
     results = receipt.results
@@ -16,10 +30,19 @@ defmodule EmailJanitor.Conversation.Outcome do
     restored = Enum.count(results, &(&1["status"] == "restored"))
     blocked = Enum.count(results, &(&1["status"] == "blocked"))
     protected = Enum.count(results, &(&1["status"] == "protected"))
+    handled_elsewhere = Enum.count(results, &(&1["status"] == "handled_elsewhere"))
+    deferred = Enum.count(results, &(&1["status"] == "deferred"))
     missing = max(0, length(receipt.references) - length(results))
-    uncertain = Enum.count(results, &(&1["status"] == "unresolved")) + missing
+
+    uncertain =
+      Enum.count(results, &(&1["status"] == "unresolved")) +
+        if(receipt.completed, do: missing, else: 0)
+
+    awaiting = if receipt.completed, do: 0, else: missing
     unavailable = Enum.count(results, &(&1["status"] == "unavailable"))
     unchanged = Enum.count(results, &(&1["status"] == "unchanged"))
+    not_found = Enum.count(results, &(&1["status"] == "missing"))
+    unsupported = Enum.count(results, &(&1["status"] == "unsupported"))
 
     [
       preferences,
@@ -39,8 +62,22 @@ defmodule EmailJanitor.Conversation.Outcome do
         do:
           "The result for #{count(uncertain)} is uncertain. I will not repeat that Gmail request automatically."
       ),
+      if(awaiting > 0, do: "I haven't confirmed the result for #{count(awaiting)} yet."),
       if(unavailable > 0,
         do: "I could not finish processing #{count(unavailable)}. Please try again."
+      ),
+      if(not_found > 0, do: "#{count(not_found)} could no longer be found."),
+      if(unsupported > 0,
+        do:
+          "I could not restore #{count(unsupported)} because restoration is unavailable for this request."
+      ),
+      if(handled_elsewhere > 0,
+        do:
+          "Another Janitor action already handled #{count(handled_elsewhere)}. I did not send another Gmail request."
+      ),
+      if(deferred > 0,
+        do:
+          "I deferred #{count(deferred)} while another action was processed; this request did not change them."
       ),
       if(unchanged > 0, do: "#{count(unchanged)} needed no inbox change.")
     ]
@@ -53,7 +90,7 @@ defmodule EmailJanitor.Conversation.Outcome do
   end
 
   defp preference(%{preference_status: :failed}, _),
-    do: "I could not update your instructions. Please try again."
+    do: "I could not confirm your instruction update. Please send that instruction again."
 
   defp preference(%{preference_status: :pending}, _),
     do: "An instruction change is still being verified; I cannot confirm its outcome yet."

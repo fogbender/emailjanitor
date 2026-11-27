@@ -1,9 +1,11 @@
 defmodule EmailJanitor.WorkerServerTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
+  import EmailJanitor.TestScheduler
   alias EmailJanitor.Worker.{Config, Server}
+  alias EmailJanitor.Jobs
 
-  defp config(ref) do
-    %Config{
+  defp config(ref),
+    do: %Config{
       scope: nil,
       inbox: %{EmailJanitor.Fixtures.inbox() | id: ref},
       gmail: {nil, []},
@@ -12,318 +14,234 @@ defmodule EmailJanitor.WorkerServerTest do
       authorize: fn -> :ok end,
       topic: "synthetic"
     }
-  end
 
-  test "bounded scheduler never overlaps the same inbox and fills available slots" do
-    owner = self()
+  defp options(refs, step),
+    do: [
+      list: fn -> {:ok, refs} end,
+      resolve: fn ref -> {:ok, config(ref)} end,
+      step: step,
+      interval_ms: 5_000,
+      timeout_ms: 5_000
+    ]
 
-    step = fn config ->
-      send(owner, {:started, config.inbox.id, self()})
-
-      receive do
-        :continue -> :ok
-      end
-
-      {:ok, %{status: :idle, more?: false}}
-    end
+  test "actual Oban queue limits cleanup concurrency and never duplicates a running inbox" do
+    observer = self()
 
     server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, ["a", "b", "c", "a"]} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: step,
-         max_concurrency: 2,
-         interval_ms: 1_000,
-         timeout_ms: 5_000}
+      start_cleanup(
+        options(["a", "b", "c", "a"], fn cfg ->
+          send(observer, {:started, cfg.inbox.id, self()})
+          receive do: (:continue -> :ok)
+          {:ok, %{status: :idle, more?: false}}
+        end)
       )
 
-    assert_receive {:started, "a", first}, 1_000
-    assert_receive {:started, "b", second}, 1_000
-    Server.wake(server)
-    refute_receive {:started, _, _}, 50
+    assert_receive {:started, a, first}, 3_000
+    assert_receive {:started, b, second}, 3_000
+    assert a != b
+    assert :ok = Server.wake(server)
+    refute_receive {:started, _, _}, 100
     send(first, :continue)
-    assert_receive {:started, "c", third}, 1_000
-    refute_receive {:started, "a", _}, 50
+    assert_receive {:started, c, third}, 3_000
+    assert c not in [a, b]
     send(second, :continue)
     send(third, :continue)
     refute inspect(:sys.get_state(server)) =~ "preferences"
+    assert length(rows("cleanup")) == 3
   end
 
-  test "a timed-out inbox cannot block another and its next attempt backs off" do
-    owner = self()
+  test "a timed out inbox releases the bounded slot and preserves durable failure backoff" do
+    observer = self()
 
-    step = fn config ->
-      send(owner, {:started, config.inbox.id, self()})
-      if config.inbox.id == "a", do: receive(do: (:continue -> :ok))
-      {:ok, %{status: :idle, more?: false}}
-    end
+    opts =
+      options(["a", "b"], fn cfg ->
+        send(observer, {:started, cfg.inbox.id, self()})
+        if cfg.inbox.id == "a", do: receive(do: (:never -> :ok))
+        {:ok, %{status: :idle, more?: false}}
+      end)
+      |> Keyword.merge(timeout_ms: 150, max_concurrency: 1)
 
-    start_supervised!(
-      {Server,
-       list: fn -> {:ok, ["a", "b"]} end,
-       resolve: fn ref -> {:ok, config(ref)} end,
-       step: step,
-       max_concurrency: 1,
-       interval_ms: 1_000,
-       timeout_ms: 200}
-    )
-
-    assert_receive {:started, "a", first}, 1_000
+    start_cleanup(opts)
+    assert_receive {:started, "a", first}, 3_000
     monitor = Process.monitor(first)
-    assert_receive {:DOWN, ^monitor, :process, ^first, reason}, 1_000
-    assert reason in [:killed, :noproc]
-    assert_receive {:started, "b", _}, 500
-    refute_receive {:started, "a", _}, 100
+    assert_receive {:DOWN, ^monitor, :process, ^first, _}, 3_000
+    assert_receive {:started, "b", _}, 3_000
+    await(fn -> row("a").args["failures"] == 1 end)
+    refute_receive {:started, "a", _}, 150
   end
 
-  test "resolver failures remain isolated and returned secrets never appear in logs" do
+  test "ordinary wake and discovery preserve failed jobs; trusted repair resets only its reference" do
+    observer = self()
+
+    server =
+      start_cleanup(
+        options(["a", "b"], fn cfg ->
+          send(observer, {:attempt, cfg.inbox.id})
+          {:ok, %{status: :model_unavailable, more?: false}}
+        end)
+      )
+
+    assert_receive {:attempt, "a"}, 3_000
+    assert_receive {:attempt, "b"}, 3_000
+    await(fn -> Enum.all?(rows("cleanup"), &(&1.args["failures"] == 1)) end)
+    before = row("b")
+    for _ <- 1..3, do: Server.wake(server)
+    refute_receive {:attempt, _}, 100
+    assert row("b").scheduled_at == before.scheduled_at
+    assert :ok = Server.wake(server, "a")
+    assert_receive {:attempt, "a"}, 3_000
+    refute_receive {:attempt, "b"}, 100
+    assert row("b").args["failures"] == 1
+  end
+
+  for failed? <- [true, false] do
+    test "ordinary running wake coalesces and respects failed=#{failed?}" do
+      observer = self()
+
+      server =
+        start_cleanup(
+          options(["a"], fn _ ->
+            send(observer, {:started, self()})
+            receive do: (:continue -> :ok)
+            {:ok, %{status: if(unquote(failed?), do: :rate_limited, else: :idle), more?: false}}
+          end)
+        )
+
+      assert_receive {:started, first}, 3_000
+      for _ <- 1..3, do: Server.wake(server)
+      assert row("a").args["wake"]
+      send(first, :continue)
+
+      if unquote(failed?) do
+        await(fn -> row("a").args["failures"] == 1 end)
+        refute_receive {:started, _}, 150
+      else
+        assert_receive {:started, second}, 3_000
+        send(second, :continue)
+        refute_receive {:started, _}, 150
+      end
+    end
+  end
+
+  test "explicit repair while running resolves fresh credentials on its immediate next attempt" do
+    observer = self()
+    repaired = start_supervised!({Agent, fn -> false end})
+
+    opts =
+      options(["a"], fn cfg ->
+        send(observer, {:started, cfg.topic, self()})
+        if cfg.topic == "old", do: receive(do: (:continue -> :ok))
+        {:ok, %{status: :rate_limited, more?: false}}
+      end)
+      |> Keyword.put(:resolve, fn ref ->
+        {:ok, %{config(ref) | topic: if(Agent.get(repaired, & &1), do: "repaired", else: "old")}}
+      end)
+
+    server = start_cleanup(opts)
+    assert_receive {:started, "old", first}, 3_000
+    Agent.update(repaired, fn _ -> true end)
+    assert :ok = Server.wake(server, "a")
+    send(first, :continue)
+    assert_receive {:started, "repaired", _}, 3_000
+  end
+
+  test "new trusted refs can repair without reviving siblings; removed refs are cancelled" do
+    observer = self()
+    trusted = start_supervised!({Agent, fn -> ["group:inbox.1"] end})
+
+    opts =
+      options([], fn cfg ->
+        send(observer, {:attempt, cfg.inbox.id})
+        {:ok, %{status: :model_unavailable, more?: false}}
+      end)
+      |> Keyword.put(:list, fn -> {:ok, Agent.get(trusted, & &1)} end)
+
+    server = start_cleanup(opts)
+    assert_receive {:attempt, "group:inbox.1"}, 3_000
+    await(fn -> row("group:inbox.1").args["failures"] == 1 end)
+    Agent.update(trusted, fn _ -> ["group:inbox.1", "new-ref"] end)
+    Server.wake(server, "new-ref")
+    assert_receive {:attempt, "new-ref"}, 3_000
+    refute_receive {:attempt, "group:inbox.1"}, 150
+    Server.wake(server, "not-authorized")
+    refute_receive {:attempt, "not-authorized"}, 100
+    Agent.update(trusted, fn _ -> ["new-ref"] end)
+    Server.wake(server)
+    assert row("group:inbox.1").state == "cancelled"
+  end
+
+  test "actual jobs survive scheduler restart without resetting failures or leaking runtime secrets" do
     import ExUnit.CaptureLog
-    owner = self()
+    observer = self()
+
+    opts =
+      options(["a"], fn _ ->
+        send(observer, :attempt)
+        raise "PRIVATE_MODEL_BODY_OR_TOKEN"
+      end)
 
     logs =
       capture_log(fn ->
-        start_supervised!(
-          {Server,
-           list: fn -> {:ok, ["a", "b"]} end,
-           resolve: fn
-             "a" -> raise "PRIVATE_RESOLVER_SECRET"
-             ref -> {:ok, config(ref)}
-           end,
-           step: fn cfg ->
-             send(owner, {:stepped, cfg.inbox.id})
-             {:ok, %{status: :idle, more?: false}}
-           end,
-           interval_ms: 1_000}
+        server = start_cleanup(opts)
+        assert_receive :attempt, 3_000
+        await(fn -> row("a").args["failures"] == 1 end)
+        before = row("a")
+        :ok = stop_supervised({Jobs, jobs()})
+
+        start_tasks(Server.tasks(Keyword.put(opts, :jobs, jobs())),
+          queues: [cleanup: 2, discovery: 1]
         )
 
-        assert_receive {:stepped, "b"}, 500
-        refute_receive {:stepped, "a"}, 50
+        assert :ok = Server.wake(server)
+        assert row("a").args == before.args
+        assert row("a").scheduled_at == before.scheduled_at
+        refute_receive :attempt, 150
+        refute inspect(row("a")) =~ "PRIVATE_MODEL_BODY_OR_TOKEN"
       end)
 
-    refute logs =~ "PRIVATE_RESOLVER_SECRET"
+    refute logs =~ "PRIVATE_MODEL_BODY_OR_TOKEN"
   end
 
-  test "notification wake does not bypass failure backoff", _ctx do
-    owner = self()
+  test "a resolver exception is isolated and neither jobs nor logs retain its secret" do
+    import ExUnit.CaptureLog
+    observer = self()
 
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, ["a"]} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: fn _ ->
-           send(owner, :attempted)
-           {:ok, %{status: :rate_limited, more?: false}}
-         end,
-         interval_ms: 1_000}
-      )
+    opts =
+      options(["a", "b"], fn cfg ->
+        send(observer, {:resolved_step, cfg.inbox.id})
+        {:ok, %{status: :idle, more?: false}}
+      end)
+      |> Keyword.put(:resolve, fn
+        "a" -> raise "PRIVATE_RESOLVER_CREDENTIAL"
+        ref -> {:ok, config(ref)}
+      end)
 
-    assert_receive :attempted, 1_000
-    # The completion is serialized through this same server before the wake.
-    wait_failed(server, 100)
-    for _ <- 1..5, do: Server.wake(server)
-    refute_receive :attempted, 100
+    logs =
+      capture_log(fn ->
+        start_cleanup(opts)
+        assert_receive {:resolved_step, "b"}, 3_000
+        await(fn -> row("a").args["failures"] == 1 end)
+        refute_receive {:resolved_step, "a"}, 100
+        refute inspect(rows("cleanup")) =~ "PRIVATE_RESOLVER_CREDENTIAL"
+      end)
+
+    refute logs =~ "PRIVATE_RESOLVER_CREDENTIAL"
   end
 
-  test "notification wake during a successful step coalesces into one immediate followup" do
-    owner = self()
+  test "pending backlog continues promptly through durable snoozes" do
+    observer = self()
+    count = start_supervised!({Agent, fn -> 0 end})
 
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, ["a"]} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: fn _ ->
-           send(owner, {:started, self()})
-           receive do: (:continue -> :ok)
-           {:ok, %{status: :idle, more?: false}}
-         end,
-         interval_ms: 5_000,
-         timeout_ms: 5_000}
-      )
-
-    assert_receive {:started, first}, 1_000
-    for _ <- 1..3, do: Server.wake(server)
-    assert :sys.get_state(server).entries["a"].pending_wake
-    refute_receive {:started, _}, 50
-    send(first, :continue)
-    assert_receive {:started, second}, 1_000
-    send(second, :continue)
-    refute_receive {:started, _}, 100
-  end
-
-  test "notification wake during a failed step preserves backoff and consumes the hint" do
-    owner = self()
-
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, ["a"]} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: fn _ ->
-           send(owner, {:started, self()})
-           receive do: (:continue -> :ok)
-           {:ok, %{status: :rate_limited, more?: false}}
-         end,
-         interval_ms: 5_000,
-         timeout_ms: 5_000}
-      )
-
-    assert_receive {:started, first}, 1_000
-    Server.wake(server)
-    assert :sys.get_state(server).entries["a"].pending_wake
-    send(first, :continue)
-    wait_failed(server, 100)
-    refute Map.get(:sys.get_state(server).entries["a"], :pending_wake, false)
-    refute_receive {:started, _}, 100
-  end
-
-  test "due backlog runs again promptly without waiting the normal poll interval" do
-    owner = self()
-    counter = start_supervised!({Agent, fn -> 0 end})
-
-    start_supervised!(
-      {Server,
-       list: fn -> {:ok, ["a"]} end,
-       resolve: fn ref -> {:ok, config(ref)} end,
-       step: fn _ ->
-         count = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
-         send(owner, {:slice, count})
-         {:ok, %{status: :done, more?: count == 1}}
-       end,
-       interval_ms: 5_000}
+    start_cleanup(
+      options(["a"], fn _ ->
+        n = Agent.get_and_update(count, &{&1 + 1, &1 + 1})
+        send(observer, {:slice, n})
+        {:ok, %{status: :done, more?: n == 1}}
+      end)
     )
 
-    assert_receive {:slice, 1}, 1_000
-    assert_receive {:slice, 2}, 1_000
+    assert_receive {:slice, 1}, 3_000
+    assert_receive {:slice, 2}, 3_000
     refute_receive {:slice, 3}, 100
-  end
-
-  test "explicit trusted repair resets only the selected reference" do
-    owner = self()
-
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, ["a", "b"]} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: fn cfg ->
-           send(owner, {:attempted, cfg.inbox.id})
-           {:ok, %{status: :rate_limited, more?: false}}
-         end,
-         interval_ms: 5_000}
-      )
-
-    assert_receive {:attempted, "a"}, 1_000
-    assert_receive {:attempted, "b"}, 1_000
-    wait_failed_refs(server, ["a", "b"], 100)
-    Server.wake(server, "a")
-    assert_receive {:attempted, "a"}, 1_000
-    refute_receive {:attempted, "b"}, 100
-  end
-
-  test "opaque bounded host references are resolved and can be explicitly repaired" do
-    owner = self()
-    refs = ["group:inbox.1", "owner@example.com", "plain"]
-
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, refs} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: fn cfg ->
-           send(owner, {:opaque, cfg.inbox.id})
-           {:ok, %{status: :rate_limited, more?: false}}
-         end,
-         interval_ms: 5_000}
-      )
-
-    for ref <- refs, do: assert_receive({:opaque, ^ref}, 1_000)
-    wait_failed_refs(server, refs, 100)
-    Server.wake(server, "owner@example.com")
-    assert_receive {:opaque, "owner@example.com"}, 1_000
-    refute_receive {:opaque, "plain"}, 100
-    Server.wake(server, String.duplicate("x", 257))
-    refute_receive {:opaque, _}, 100
-  end
-
-  test "new explicit wake refreshes the trusted list without reviving another failed inbox" do
-    owner = self()
-    refs = start_supervised!({Agent, fn -> ["a"] end})
-
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, Agent.get(refs, & &1)} end,
-         resolve: fn ref -> {:ok, config(ref)} end,
-         step: fn cfg ->
-           send(owner, {:attempted, cfg.inbox.id})
-           {:ok, %{status: :rate_limited, more?: false}}
-         end,
-         interval_ms: 5_000}
-      )
-
-    assert_receive {:attempted, "a"}, 1_000
-    wait_failed_refs(server, ["a"], 100)
-    Agent.update(refs, fn _ -> ["a", "new-ref"] end)
-    Server.wake(server, "new-ref")
-    assert_receive {:attempted, "new-ref"}, 1_000
-    refute_receive {:attempted, "a"}, 100
-    Server.wake(server, "not-in-trusted-list")
-    refute_receive {:attempted, "not-in-trusted-list"}, 100
-  end
-
-  test "explicit repair arriving mid-step runs fresh configuration immediately afterward" do
-    owner = self()
-    repaired = start_supervised!({Agent, fn -> false end})
-
-    server =
-      start_supervised!(
-        {Server,
-         list: fn -> {:ok, ["a"]} end,
-         resolve: fn ref ->
-           {:ok,
-            %{config(ref) | topic: if(Agent.get(repaired, & &1), do: "repaired", else: "old")}}
-         end,
-         step: fn cfg ->
-           send(owner, {:started_config, cfg.topic, self()})
-           if cfg.topic == "old", do: receive(do: (:release -> :ok))
-           {:ok, %{status: if(cfg.topic == "old", do: :rate_limited, else: :idle), more?: false}}
-         end,
-         interval_ms: 5_000,
-         timeout_ms: 5_000}
-      )
-
-    assert_receive {:started_config, "old", first}, 1_000
-    Agent.update(repaired, fn _ -> true end)
-    Server.wake(server, "a")
-    assert :sys.get_state(server).entries["a"].repair
-    send(first, :release)
-    assert_receive {:started_config, "repaired", _}, 1_000
-  end
-
-  defp wait_failed_refs(_server, _refs, 0), do: flunk("references did not enter backoff")
-
-  defp wait_failed_refs(server, refs, left) do
-    state = :sys.get_state(server)
-
-    if Enum.all?(refs, &(state.entries[&1].attempts > 0)) do
-      :ok
-    else
-      Process.sleep(5)
-      wait_failed_refs(server, refs, left - 1)
-    end
-  end
-
-  defp wait_failed(_server, 0), do: flunk("step did not enter failure backoff")
-
-  defp wait_failed(server, left) do
-    if :sys.get_state(server).entries["a"].attempts > 0 do
-      :ok
-    else
-      Process.sleep(5)
-      wait_failed(server, left - 1)
-    end
   end
 end

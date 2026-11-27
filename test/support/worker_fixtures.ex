@@ -57,6 +57,8 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   end
 
   def thread_snapshot(_, thread, options) do
+    if hook = options[:snapshot_hook], do: hook.()
+
     Agent.get_and_update(options[:state], fn state ->
       result =
         cond do
@@ -250,4 +252,32 @@ defmodule EmailJanitor.WorkerTest.WholeOnlyPolicy do
         send(observer, {:legacy_whole_retired, ids})
         :ok
       )
+end
+
+defmodule EmailJanitor.WorkerTest.FreshPolicy do
+  @behaviour EmailJanitor.Policy
+  alias EmailJanitor.Policy
+
+  def reserve(ctx, box, id, ids, now),
+    do: reserve(ctx, box, id, ids, now, %Policy.Admission{inbox_message_ids: ids})
+
+  def reserve(ctx, box, id, ids, now, admission) do
+    send(ctx.observer, {:fresh_policy, ctx.subject, :reserve, ids})
+    Policy.reserve(ctx.base, box, id, ids, now, admission)
+  end
+
+  def settle(ctx, box, id, result) do
+    send(ctx.observer, {:fresh_policy, ctx.subject, :settle, id})
+    Policy.settle(ctx.base, box, id, result)
+  end
+
+  def retire_candidate(ctx, box, id, ids) do
+    send(ctx.observer, {:fresh_policy, ctx.subject, :retire, ids})
+    Policy.retire_candidate(ctx.base, box, id, ids)
+  end
+
+  def retire_candidate_messages(ctx, box, id, ids) do
+    send(ctx.observer, {:fresh_policy, ctx.subject, :retire_exact, ids})
+    Policy.retire_candidate_messages(ctx.base, box, id, ids)
+  end
 end

@@ -1,16 +1,24 @@
 defmodule EmailJanitor.Conversation.Ledger do
   @moduledoc "Pins effect selection before execution without retaining a conversation transcript."
   import Ecto.Query
+  alias EmailJanitor.Owner
   alias EmailJanitor.Conversation.{Plan, Receipt, Reference}
   alias EmailJanitor.Store.{Mailbox, Scope}
 
-  def install(%Scope{} = scope),
-    do:
-      Ecto.Migrator.up(scope.repo, 8, EmailJanitor.Conversation.Migration,
+  def install(%Scope{} = scope) do
+    for {version, module} <- [
+          {8, EmailJanitor.Conversation.Migration},
+          {9, EmailJanitor.Conversation.OwnershipMigration}
+        ] do
+      Ecto.Migrator.up(scope.repo, version, module,
         prefix: scope.prefix,
         log: false,
         telemetry_event: nil
       )
+    end
+
+    :ok
+  end
 
   def get(%Scope{} = scope, inbox_id, conversation_id, request_id) do
     cutoff = cutoff()
@@ -27,17 +35,22 @@ defmodule EmailJanitor.Conversation.Ledger do
     )
   end
 
-  def latest(%Scope{} = scope, inbox_id, conversation_id) do
+  def latest(%Scope{} = scope, inbox_id, conversation_id, excluded_id \\ nil) do
     cutoff = DateTime.add(DateTime.utc_now(), -604_800)
 
-    scope.repo.one(
+    query =
       from(r in Receipt,
         where:
           r.inbox_id == ^inbox_id and r.conversation_id == ^conversation_id and
             r.inserted_at >= ^cutoff,
         order_by: [desc: r.inserted_at, desc: r.id],
         limit: 1
-      ),
+      )
+
+    query = if excluded_id, do: from(r in query, where: r.id != ^excluded_id), else: query
+
+    scope.repo.one(
+      query,
       prefix: scope.prefix,
       log: false,
       telemetry_event: nil
@@ -102,7 +115,8 @@ defmodule EmailJanitor.Conversation.Ledger do
                 context_references: Enum.map(refs, &metadata/1),
                 search_complete: plan.search_complete,
                 preference_status: if(plan.preference_target == :none, do: :none, else: :pending)
-              },
+              }
+              |> struct(Owner.capture()),
               prefix: scope.prefix,
               log: false,
               telemetry_event: nil
@@ -111,8 +125,9 @@ defmodule EmailJanitor.Conversation.Ledger do
           %Receipt{inbox_id: ^inbox_id, conversation_id: ^conversation_id} = existing ->
             if existing.operation == plan.operation and
                  existing.preference_target == plan.preference_target and
-                 existing.references == metadata,
-               do: existing,
+                 Enum.sort_by(existing.references, & &1["token"]) ==
+                   Enum.sort_by(metadata, & &1["token"]),
+               do: own(scope, existing),
                else: scope.repo.rollback(:request_conflict)
 
           _ ->
@@ -123,6 +138,100 @@ defmodule EmailJanitor.Conversation.Ledger do
       _ -> {:error, :invalid_request}
     end
   end
+
+  defmodule ActionBinding do
+    use Ecto.Schema
+    @primary_key {:action_id, Ecto.UUID, autogenerate: false}
+    schema "conversation_action_bindings" do
+      field(:request_id, Ecto.UUID)
+      field(:inbox_id, :string)
+      field(:message_ids, {:array, :string})
+    end
+  end
+
+  @doc "Called only by the trusted admission policy inside Store.intent's mailbox transaction."
+  def bind_action(scope, inbox_id, request_id, owner_token, action_id, ids) do
+    if not scope.repo.in_transaction?(),
+      do: raise(ArgumentError, "binding requires admission transaction")
+
+    receipt =
+      scope.repo.get(Receipt, request_id, prefix: scope.prefix, log: false, telemetry_event: nil)
+
+    with %Receipt{
+           inbox_id: ^inbox_id,
+           operation: :done,
+           completed: false,
+           owner_token: ^owner_token
+         } <- receipt,
+         true <- is_list(ids) and length(ids) in 1..5,
+         true <-
+           Enum.all?(ids, fn id -> Enum.any?(receipt.references, &(&1["message_id"] == id)) end) do
+      scope.repo.insert!(
+        %ActionBinding{
+          action_id: action_id,
+          request_id: request_id,
+          inbox_id: inbox_id,
+          message_ids: Enum.sort(ids)
+        },
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
+
+      :ok
+    else
+      _ -> {:error, :conversation_changed}
+    end
+  end
+
+  @doc "Actual request-bound Gmail outcome, independent of provider reads or the receipt owner's liveness."
+  def action_result(scope, inbox_id, request_id, message_id) do
+    action =
+      scope.repo.one(
+        from(b in ActionBinding,
+          join: a in EmailJanitor.Store.Action,
+          on: a.id == b.action_id,
+          where:
+            b.request_id == ^request_id and b.inbox_id == ^inbox_id and
+              a.inbox_id == ^inbox_id and ^message_id in b.message_ids and
+              (a.state in [:intent, :unresolved] or
+                 (a.state in [:done, :restored] and ^message_id in a.applied_message_ids)),
+          order_by: [desc: a.inserted_at],
+          limit: 1,
+          select: a
+        ),
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
+
+    case action do
+      %{state: state, applied_message_ids: ids, id: id} when state in [:done, :restored] ->
+        if message_id in ids, do: {:done, id}, else: :none
+
+      %{state: :intent, dispatch_started_at: nil, id: id} ->
+        {:prepared, id}
+
+      %{state: state, id: id} when state in [:intent, :unresolved] ->
+        {:unresolved, id}
+
+      _ ->
+        :none
+    end
+  end
+
+  @doc false
+  def owns_action?(scope, inbox_id, request_id, action_id),
+    do:
+      scope.repo.exists?(
+        from(b in ActionBinding,
+          where:
+            b.action_id == ^action_id and b.request_id == ^request_id and b.inbox_id == ^inbox_id
+        ),
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
 
   def record_preference(scope, inbox_id, conversation_id, request_id, status, revision)
       when status in [:none, :updated, :unchanged, :failed] and
@@ -144,7 +253,7 @@ defmodule EmailJanitor.Conversation.Ledger do
     end)
   end
 
-  @result_statuses ~w(done restored protected blocked unresolved unavailable unchanged)
+  @result_statuses ~w(done restored protected blocked unresolved unavailable unchanged missing unsupported handled_elsewhere deferred)
   def record_result(scope, inbox_id, conversation_id, request_id, reference, status, effect_id)
       when status in @result_statuses do
     with true <- is_nil(effect_id) or match?({:ok, _}, Ecto.UUID.cast(effect_id)) do
@@ -171,7 +280,11 @@ defmodule EmailJanitor.Conversation.Ledger do
                 "protected",
                 "blocked",
                 "unresolved",
-                "unchanged"
+                "unchanged",
+                "missing",
+                "unsupported",
+                "handled_elsewhere",
+                "deferred"
               ] ->
             receipt
 
@@ -197,8 +310,9 @@ defmodule EmailJanitor.Conversation.Ledger do
           expected = Enum.map(receipt.references, & &1["token"]) |> Enum.sort()
           observed = Enum.map(receipt.results, & &1["reference"]) |> Enum.sort()
 
-          if expected != observed or receipt.preference_status == :pending,
-            do: scope.repo.rollback(:effects_pending)
+          if expected != observed or receipt.preference_status == :pending or
+               Enum.any?(receipt.results, &(&1["status"] == "unavailable")),
+             do: scope.repo.rollback(:effects_pending)
 
           Ecto.Changeset.change(receipt, completed: true)
         end
@@ -221,6 +335,9 @@ defmodule EmailJanitor.Conversation.Ledger do
       receipt =
         get(scope, inbox_id, conversation_id, request_id) || scope.repo.rollback(:unknown_request)
 
+      if receipt.completed, do: scope.repo.rollback(:request_complete)
+      if not Owner.owns?(receipt), do: scope.repo.rollback(:request_in_flight)
+
       case fun.(receipt) do
         %Ecto.Changeset{} = changes ->
           scope.repo.update!(changes, prefix: scope.prefix, log: false, telemetry_event: nil)
@@ -237,6 +354,23 @@ defmodule EmailJanitor.Conversation.Ledger do
       log: false,
       telemetry_event: nil
     ) || scope.repo.rollback(:unknown_inbox)
+  end
+
+  defp own(_scope, %Receipt{completed: true} = receipt), do: receipt
+
+  defp own(scope, receipt) do
+    cond do
+      Owner.owns?(receipt) ->
+        receipt
+
+      is_nil(receipt.owner_runtime) or Owner.proof(receipt) == :dead ->
+        receipt
+        |> Ecto.Changeset.change(Owner.capture())
+        |> scope.repo.update!(prefix: scope.prefix, log: false, telemetry_event: nil)
+
+      true ->
+        scope.repo.rollback(:request_in_flight)
+    end
   end
 
   defp cutoff, do: DateTime.add(DateTime.utc_now(), -604_800)

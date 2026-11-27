@@ -1,0 +1,24 @@
+{
+  "name": "@emailjanitor/reply-parser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "emailjanitor-reply-parser": "cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "email-reply-parser": "3.0.0",
+    "email-forward-parser": "1.8.5"
+  },
+  "files": [
+    "cli.mjs",
+    "parser.mjs"
+  ]
+}

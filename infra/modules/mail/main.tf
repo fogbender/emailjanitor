@@ -15,10 +15,20 @@ variable "name" {
 
 variable "mail_domain" {
   type        = string
-  description = "A dedicated domain/subdomain delegated to this module's new Route53 zone."
+  description = "A dedicated receiving domain/subdomain in a new zone or an explicitly selected existing public Route53 zone."
   validation {
     condition     = can(regex("^([a-z0-9]([a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,63}$", var.mail_domain))
     error_message = "Provide a lowercase DNS name without a trailing dot."
+  }
+}
+
+variable "existing_hosted_zone_id" {
+  type        = string
+  default     = null
+  description = "Optional existing PUBLIC zone for this exact mail_domain. Never select an unrelated parent zone or overwrite existing MX records."
+  validation {
+    condition     = var.existing_hosted_zone_id == null ? true : can(regex("^Z[A-Z0-9]{1,32}$", var.existing_hosted_zone_id))
+    error_message = "Provide a Route53 hosted-zone ID, or null for a new isolated zone."
   }
 }
 
@@ -42,47 +52,71 @@ locals {
   rule_arn   = "arn:${local.partition}:ses:${local.region}:${local.account_id}:receipt-rule-set/${local.ruleset}:receipt-rule/${local.rule}"
   topic_arn  = "arn:${local.partition}:sns:${local.region}:${local.account_id}:${var.name}-receipts"
   sender     = "janitor@${var.mail_domain}"
+  zone_id    = var.existing_hosted_zone_id == null ? aws_route53_zone.mail[0].zone_id : data.aws_route53_zone.existing[0].zone_id
+}
+
+moved {
+  from = aws_route53_zone.mail
+  to   = aws_route53_zone.mail[0]
+}
+
+data "aws_route53_zone" "existing" {
+  count        = var.existing_hosted_zone_id == null ? 0 : 1
+  name         = var.mail_domain
+  private_zone = false
+  lifecycle {
+    postcondition {
+      condition     = trimsuffix(self.name, ".") == var.mail_domain && self.zone_id == var.existing_hosted_zone_id
+      error_message = "The selected existing zone must be public and match mail_domain exactly."
+    }
+  }
 }
 
 resource "aws_route53_zone" "mail" {
-  name = var.mail_domain
-  tags = { Application = "Email Janitor" }
+  count = var.existing_hosted_zone_id == null ? 1 : 0
+  name  = var.mail_domain
+  tags  = { Application = "Email Janitor" }
+  lifecycle { prevent_destroy = true }
 }
 
 resource "aws_ses_domain_identity" "mail" { domain = var.mail_domain }
 resource "aws_ses_domain_dkim" "mail" { domain = aws_ses_domain_identity.mail.domain }
 
 resource "aws_route53_record" "verification" {
-  zone_id = aws_route53_zone.mail.zone_id
-  name    = "_amazonses.${var.mail_domain}"
-  type    = "TXT"
-  ttl     = 300
-  records = [aws_ses_domain_identity.mail.verification_token]
+  zone_id         = local.zone_id
+  name            = "_amazonses.${var.mail_domain}"
+  type            = "TXT"
+  allow_overwrite = false
+  ttl             = 300
+  records         = [aws_ses_domain_identity.mail.verification_token]
 }
 
 resource "aws_route53_record" "dkim" {
-  count   = 3
-  zone_id = aws_route53_zone.mail.zone_id
-  name    = "${aws_ses_domain_dkim.mail.dkim_tokens[count.index]}._domainkey.${var.mail_domain}"
-  type    = "CNAME"
-  ttl     = 300
-  records = ["${aws_ses_domain_dkim.mail.dkim_tokens[count.index]}.dkim.amazonses.com"]
+  count           = 3
+  zone_id         = local.zone_id
+  name            = "${aws_ses_domain_dkim.mail.dkim_tokens[count.index]}._domainkey.${var.mail_domain}"
+  type            = "CNAME"
+  allow_overwrite = false
+  ttl             = 300
+  records         = ["${aws_ses_domain_dkim.mail.dkim_tokens[count.index]}.dkim.amazonses.com"]
 }
 
 resource "aws_route53_record" "mx" {
-  zone_id = aws_route53_zone.mail.zone_id
-  name    = var.mail_domain
-  type    = "MX"
-  ttl     = 300
-  records = ["10 inbound-smtp.${local.region}.amazonaws.com"]
+  zone_id         = local.zone_id
+  name            = var.mail_domain
+  type            = "MX"
+  allow_overwrite = false
+  ttl             = 300
+  records         = ["10 inbound-smtp.${local.region}.amazonaws.com"]
 }
 
 resource "aws_route53_record" "dmarc" {
-  zone_id = aws_route53_zone.mail.zone_id
-  name    = "_dmarc.${var.mail_domain}"
-  type    = "TXT"
-  ttl     = 300
-  records = ["v=DMARC1; p=reject; adkim=s; aspf=r"]
+  zone_id         = local.zone_id
+  name            = "_dmarc.${var.mail_domain}"
+  type            = "TXT"
+  allow_overwrite = false
+  ttl             = 300
+  records         = ["v=DMARC1; p=reject; adkim=s; aspf=r"]
 }
 
 resource "aws_kms_key" "spool" {
@@ -297,7 +331,8 @@ resource "aws_iam_role_policy" "runtime_mail" {
   })
 }
 
-output "name_servers" { value = aws_route53_zone.mail.name_servers }
+output "name_servers" { value = var.existing_hosted_zone_id == null ? aws_route53_zone.mail[0].name_servers : data.aws_route53_zone.existing[0].name_servers }
+output "hosted_zone_id" { value = local.zone_id }
 output "sender" { value = local.sender }
 output "spool_bucket" { value = aws_s3_bucket.spool.id }
 output "queue_url" { value = aws_sqs_queue.mail.url }

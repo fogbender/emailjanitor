@@ -1,12 +1,13 @@
 defmodule EmailJanitor.Worker.Server do
   @moduledoc """
-  Bounded local scheduler for trusted metadata inbox references. List/resolve are
-  bounded host database/config operations, never model tools. Returned configs
-  must bind authorization/reporting to that connection; no ambient active user.
-  Durable arrival/receipt/defer state makes scheduler restarts resume safely.
+  Oban cleanup tasks and a timer-free host wake facade. Only trusted opaque inbox
+  references enter jobs; scope, credentials and callbacks are resolved afresh.
+  Hosts configure the cleanup queue's concurrency (normally two).
   """
   use GenServer
-  alias EmailJanitor.Worker
+  alias EmailJanitor.{Jobs, Worker}
+  @derive {Inspect, only: [:jobs, :interval_ms, :timeout_ms]}
+  defstruct [:jobs, :list, :resolve, :step, :interval_ms, :timeout_ms]
 
   @good [
     :idle,
@@ -19,256 +20,148 @@ defmodule EmailJanitor.Worker.Server do
     :existing,
     :settlement_pending
   ]
-  @derive {Inspect, only: [:max_concurrency, :interval_ms]}
-  defstruct [
-    :list,
-    :resolve,
-    :step,
-    :supervisor,
-    :max_concurrency,
-    :interval_ms,
-    :timeout_ms,
-    :timer,
-    entries: %{},
-    running: %{}
-  ]
 
-  def start_link(options),
-    do: GenServer.start_link(__MODULE__, options, Keyword.take(options, [:name]))
-
-  def wake(server), do: GenServer.cast(server, :wake)
-
-  @doc "Explicit trusted auth/config/upgrade repair only. Pub/Sub must use wake/1."
-  def wake(server, ref), do: GenServer.cast(server, {:wake, ref})
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+  def wake(server), do: GenServer.call(server, :wake)
+  def wake(server, ref), do: GenServer.call(server, {:repair, ref})
 
   @impl true
-  def init(options) do
-    list = options[:list]
-    resolve = options[:resolve]
-    maximum = Keyword.get(options, :max_concurrency, 2)
-    interval = Keyword.get(options, :interval_ms, 30_000)
-    timeout = Keyword.get(options, :timeout_ms, 300_000)
-    step = Keyword.get(options, :step, &Worker.step/1)
-
-    if is_function(list, 0) and is_function(resolve, 1) and is_function(step, 1) and
-         is_integer(maximum) and maximum in 1..8 and is_integer(interval) and
-         interval in 10..300_000 and
-         is_integer(timeout) and timeout in 10..300_000 do
-      {:ok, supervisor} = Task.Supervisor.start_link()
-      send(self(), :tick)
-
-      {:ok,
-       %__MODULE__{
-         list: list,
-         resolve: resolve,
-         step: step,
-         supervisor: supervisor,
-         max_concurrency: maximum,
-         interval_ms: interval,
-         timeout_ms: timeout
-       }}
-    else
-      {:stop, :invalid_worker_server}
+  def init(opts) do
+    case configuration(opts) do
+      {:ok, config} -> {:ok, config}
+      error -> {:stop, elem(error, 1)}
     end
   end
 
   @impl true
-  def handle_cast({:wake, ref}, state) do
-    if valid_ref?(ref) do
-      now = System.monotonic_time(:millisecond)
+  def handle_call(:wake, _from, config), do: {:reply, wake_refs(config, nil), config}
+  def handle_call({:repair, ref}, _from, config), do: {:reply, wake_refs(config, ref), config}
 
-      entries =
-        case Map.fetch(state.entries, ref) do
-          {:ok, _} ->
-            busy = Enum.any?(state.running, fn {_, running} -> running.key == ref end)
-            Map.put(state.entries, ref, %{due: now, attempts: 0, repair: busy})
+  def tasks(opts) do
+    {:ok, config} = configuration(opts)
 
-          :error ->
-            state.entries
+    %{
+      "cleanup_discovery" => %{
+        run: fn _ -> discover(config) end,
+        timeout_ms: 30_000,
+        queue: :discovery
+      },
+      "cleanup" => %{
+        run: fn ref -> run_ref(config, ref) end,
+        timeout_ms: config.timeout_ms,
+        queue: :cleanup,
+        seed?: false
+      }
+    }
+  end
+
+  defp configuration(opts) do
+    config = %__MODULE__{
+      jobs: opts[:jobs],
+      list: opts[:list],
+      resolve: opts[:resolve],
+      step: Keyword.get(opts, :step, &Worker.step/1),
+      interval_ms: Keyword.get(opts, :interval_ms, 30_000),
+      timeout_ms: Keyword.get(opts, :timeout_ms, 300_000)
+    }
+
+    if not is_nil(config.jobs) and is_function(config.list, 0) and
+         is_function(config.resolve, 1) and is_function(config.step, 1) and
+         is_integer(config.interval_ms) and config.interval_ms in 10..300_000 and
+         is_integer(config.timeout_ms) and config.timeout_ms in 10..300_000,
+       do: {:ok, config},
+       else: {:error, :invalid_worker_server}
+  end
+
+  defp discover(config) do
+    with {:ok, refs} <- refs(config),
+         :ok <- Jobs.reconcile_keys(config.jobs, "cleanup", refs),
+         :ok <- enqueue_refs(config, refs) do
+      {:next, nil, config.interval_ms}
+    else
+      _ -> retry(config)
+    end
+  rescue
+    _ -> retry(config)
+  catch
+    _, _ -> retry(config)
+  end
+
+  defp wake_refs(config, selected) do
+    with {:ok, refs} <- refs(config),
+         true <- is_nil(selected) or selected in refs,
+         :ok <- Jobs.reconcile_keys(config.jobs, "cleanup", refs) do
+      chosen = if is_nil(selected), do: refs, else: [selected]
+
+      Enum.reduce_while(chosen, :ok, fn ref, _ ->
+        with {:ok, _} <- Jobs.enqueue(config.jobs, "cleanup", ref),
+             :ok <- Jobs.wake(config.jobs, "cleanup", ref, repair?: not is_nil(selected)) do
+          {:cont, :ok}
+        else
+          _ -> {:halt, {:error, :worker_unavailable}}
         end
-
-      # New refs are accepted only from the next trusted list refresh.
-      send(self(), :tick)
-      {:noreply, %{state | entries: entries}}
-    else
-      {:noreply, state}
-    end
-  end
-
-  @impl true
-  def handle_cast(:wake, state) do
-    now = System.monotonic_time(:millisecond)
-
-    entries =
-      Map.new(state.entries, fn {key, entry} ->
-        busy = Enum.any?(state.running, fn {_, running} -> running.key == key end)
-        entry = if busy, do: Map.put(entry, :pending_wake, true), else: entry
-        {key, if(entry.attempts == 0, do: %{entry | due: now}, else: entry)}
       end)
-
-    send(self(), :tick)
-    {:noreply, %{state | entries: entries}}
+    else
+      false -> :ok
+      _ -> {:error, :worker_unavailable}
+    end
+  rescue
+    _ -> {:error, :worker_unavailable}
+  catch
+    _, _ -> {:error, :worker_unavailable}
   end
 
-  @impl true
-  def handle_info(:tick, state) do
-    if state.timer, do: Process.cancel_timer(state.timer)
-    timer = Process.send_after(self(), :tick, state.interval_ms)
-    state = %{state | timer: timer}
-    now = System.monotonic_time(:millisecond)
+  defp refs(config) do
+    case config.list.() do
+      {:ok, refs} when is_list(refs) and length(refs) <= 10_000 ->
+        if Enum.all?(refs, &valid_ref?/1),
+          do: {:ok, Enum.uniq(refs)},
+          else: {:error, :worker_unavailable}
 
-    entries =
-      case list_refs(state.list) do
-        {:ok, refs} ->
-          Map.new(refs, fn key -> {key, Map.get(state.entries, key, %{due: now, attempts: 0})} end)
+      _ ->
+        {:error, :worker_unavailable}
+    end
+  end
 
-        _ ->
-          state.entries
+  defp enqueue_refs(config, refs) do
+    Enum.reduce_while(refs, :ok, fn ref, _ ->
+      case Jobs.enqueue(config.jobs, "cleanup", ref) do
+        {:ok, _} -> {:cont, :ok}
+        _ -> {:halt, {:error, :worker_unavailable}}
       end
-
-    {:noreply, schedule_next(dispatch(%{state | entries: entries}, now))}
-  end
-
-  def handle_info({ref, outcome}, state) when is_reference(ref) do
-    case Map.pop(state.running, ref) do
-      {nil, _} ->
-        {:noreply, state}
-
-      {%{key: key, timer: timer}, running} ->
-        Process.cancel_timer(timer)
-        Process.demonitor(ref, [:flush])
-        state = finish(%{state | running: running}, key, outcome)
-        {:noreply, schedule_next(dispatch(state, System.monotonic_time(:millisecond)))}
-    end
-  end
-
-  def handle_info({:worker_timeout, ref}, state) do
-    case Map.pop(state.running, ref) do
-      {nil, _} ->
-        {:noreply, state}
-
-      {%{task: task, key: key}, running} ->
-        Task.shutdown(task, :brutal_kill)
-        state = finish(%{state | running: running}, key, :failed)
-        {:noreply, schedule_next(dispatch(state, System.monotonic_time(:millisecond)))}
-    end
-  end
-
-  def handle_info({:DOWN, ref, :process, _, _}, state) do
-    case Map.pop(state.running, ref) do
-      {nil, _} ->
-        {:noreply, state}
-
-      {%{key: key, timer: timer}, running} ->
-        Process.cancel_timer(timer)
-        state = finish(%{state | running: running}, key, :failed)
-        {:noreply, schedule_next(dispatch(state, System.monotonic_time(:millisecond)))}
-    end
-  end
-
-  defp dispatch(state, now) do
-    busy = MapSet.new(Enum.map(state.running, fn {_, value} -> value.key end))
-
-    selected =
-      state.entries
-      |> Enum.reject(fn {key, value} -> value.due > now or MapSet.member?(busy, key) end)
-      |> Enum.sort_by(fn {key, value} -> {value.due, key} end)
-      |> Enum.take(max(0, state.max_concurrency - map_size(state.running)))
-
-    Enum.reduce(selected, state, fn {key, _}, state ->
-      resolver = state.resolve
-      step = state.step
-      task = Task.Supervisor.async_nolink(state.supervisor, fn -> run(resolver, step, key) end)
-      timer = Process.send_after(self(), {:worker_timeout, task.ref}, state.timeout_ms)
-      %{state | running: Map.put(state.running, task.ref, %{task: task, key: key, timer: timer})}
     end)
   end
 
-  defp finish(state, key, outcome) do
-    case Map.get(state.entries, key) do
-      nil ->
-        state
-
-      entry ->
-        repaired = Map.get(entry, :repair, false)
-        attempts = if outcome == :failed and not repaired, do: min(entry.attempts + 1, 8), else: 0
-
-        delay =
-          cond do
-            repaired -> 0
-            outcome != :failed and Map.get(entry, :pending_wake, false) -> 0
-            outcome == :more -> 100
-            outcome == :failed -> min(state.interval_ms * Integer.pow(2, attempts), 300_000)
-            true -> state.interval_ms
-          end
-
-        %{
-          state
-          | entries:
-              Map.put(state.entries, key, %{
-                due: System.monotonic_time(:millisecond) + delay,
-                attempts: attempts
-              })
-        }
-    end
-  end
-
-  defp schedule_next(state) do
-    if state.timer, do: Process.cancel_timer(state.timer)
-    now = System.monotonic_time(:millisecond)
-    busy = MapSet.new(Enum.map(state.running, fn {_, value} -> value.key end))
-
-    delay =
-      if map_size(state.running) < state.max_concurrency do
-        state.entries
-        |> Enum.reject(fn {key, _} -> MapSet.member?(busy, key) end)
-        |> Enum.map(fn {_, entry} -> max(1, entry.due - now) end)
-        |> Enum.min(fn -> state.interval_ms end)
-        |> min(state.interval_ms)
+  defp run_ref(config, ref) do
+    # Re-check membership before resolving an old scheduled reference. Removing a
+    # connection never makes persisted job metadata an authority to use it.
+    with true <- valid_ref?(ref),
+         {:ok, refs} <- refs(config) do
+      if ref in refs do
+        with {:ok, %Worker.Config{} = current} <- config.resolve.(ref),
+             {:ok, %{status: status, more?: more?}} when status in @good and is_boolean(more?) <-
+               config.step.(current) do
+          {:next, ref, if(more?, do: 100, else: config.interval_ms)}
+        else
+          _ -> retry(config)
+        end
       else
-        state.interval_ms
+        :done
       end
-
-    %{state | timer: Process.send_after(self(), :tick, delay)}
-  end
-
-  defp run(resolve, step, key) do
-    try do
-      case resolve.(key) do
-        {:ok, %Worker.Config{} = config} ->
-          case step.(config) do
-            {:ok, %{status: status, more?: more}} when status in @good and is_boolean(more) ->
-              if more, do: :more, else: :ok
-
-            _ ->
-              :failed
-          end
-
-        _ ->
-          :failed
-      end
-    rescue
-      _ -> :failed
-    catch
-      _, _ -> :failed
+    else
+      _ -> retry(config)
     end
+  rescue
+    _ -> retry(config)
+  catch
+    _, _ -> retry(config)
   end
 
-  defp list_refs(list) do
-    try do
-      case list.() do
-        {:ok, refs} when is_list(refs) and length(refs) <= 10_000 ->
-          if Enum.all?(refs, &valid_ref?/1), do: {:ok, Enum.uniq(refs)}, else: :error
+  defp retry(config),
+    do:
+      {:retry,
+       min(config.interval_ms * Integer.pow(2, min(Jobs.failure_count() + 1, 8)), 300_000)}
 
-        _ ->
-          :error
-      end
-    rescue
-      _ -> :error
-    catch
-      _, _ -> :error
-    end
-  end
-
-  defp valid_ref?(ref), do: is_binary(ref) and byte_size(ref) in 1..256
+  defp valid_ref?(ref),
+    do: is_binary(ref) and byte_size(ref) in 1..256 and String.valid?(ref)
 end

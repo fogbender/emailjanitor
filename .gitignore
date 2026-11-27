@@ -4,9 +4,12 @@
 /.direnv/
 /result
 /cover/
+/tmp/
 /erl_crash.dump
 /.env
 /.env.*
 *.beam
 
 /bridge/google-auth/node_modules/
+/browser/node_modules/
+/bridge/reply-parser/node_modules/

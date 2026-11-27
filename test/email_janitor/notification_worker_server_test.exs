@@ -1,128 +1,99 @@
 defmodule EmailJanitor.NotificationWorkerServerTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
+  import EmailJanitor.TestScheduler
   alias EmailJanitor.Gmail.NotificationWorker.Server
+  alias EmailJanitor.Jobs
 
-  test "only one pull task runs and wake follows durable recorded results" do
-    owner = self()
+  test "one actual Oban pull runs and partial recorded results wake cleanup while failures back off" do
+    observer = self()
 
-    server =
-      start_supervised!(
-        {Server,
-         poll: fn ->
-           send(owner, {:polling, self()})
-
-           receive do
-             :complete -> :ok
-           end
-
-           {:ok, %{recorded: 1, acknowledged: 0, failed: 1}}
-         end,
-         wake: fn -> send(owner, :wake) end,
-         interval_ms: 1_000,
-         timeout_ms: 5_000}
+    tasks =
+      Server.tasks(
+        poll: fn ->
+          send(observer, {:polling, self()})
+          receive do: (:complete -> :ok)
+          {:ok, %{recorded: 1, acknowledged: 0, failed: 1}}
+        end,
+        wake: fn -> send(observer, :wake) end,
+        interval_ms: 5_000,
+        timeout_ms: 5_000
       )
 
-    assert_receive {:polling, task}, 1_000
-    send(server, :tick)
-    send(server, :tick)
-    refute_receive {:polling, _}, 50
+    start_tasks(tasks)
+    assert_receive {:polling, task}, 3_000
+    assert {:ok, %{conflict?: true}} = Jobs.enqueue(jobs(), "gmail_notifications")
+    refute_receive {:polling, _}, 100
     refute_received :wake
     send(task, :complete)
-    assert_receive :wake, 1_000
-    refute_receive {:polling, _}, 50
-    refute inspect(:sys.get_state(server)) =~ "poll:"
+    assert_receive :wake, 3_000
+    await(fn -> hd(rows("gmail_notifications")).args["failures"] == 1 end)
+    refute_receive {:polling, _}, 150
   end
 
-  test "failed or timed out pulls back off and no longer hold a running task" do
-    owner = self()
+  test "timed out pulls release their queue and keep durable retry state" do
+    observer = self()
 
-    server =
-      start_supervised!(
-        {Server,
-         poll: fn ->
-           send(owner, {:polling, self()})
-
-           receive do
-             :complete -> :ok
-           end
-
-           {:error, :synthetic}
-         end,
-         interval_ms: 1_000,
-         timeout_ms: 100}
+    start_tasks(
+      Server.tasks(
+        poll: fn ->
+          send(observer, {:polling, self()})
+          receive do: (:never -> :ok)
+        end,
+        interval_ms: 1_000,
+        timeout_ms: 100
       )
+    )
 
-    assert_receive {:polling, task}, 1_000
+    assert_receive {:polling, task}, 3_000
     monitor = Process.monitor(task)
-    assert_receive {:DOWN, ^monitor, :process, ^task, reason}, 1_000
-    assert reason in [:killed, :noproc]
-    state = await_state(server, &(&1.running == nil and &1.attempts == 1))
-    assert state.running == nil and state.attempts == 1
+    assert_receive {:DOWN, ^monitor, :process, ^task, _}, 3_000
+    await(fn -> hd(rows("gmail_notifications")).args["failures"] == 1 end)
     refute_receive {:polling, _}, 100
   end
 
-  test "raw poll exceptions are sanitized and never wake inbox workers" do
+  test "raw poll exceptions remain out of Oban storage and logs" do
     import ExUnit.CaptureLog
-    owner = self()
+    observer = self()
 
     logs =
       capture_log(fn ->
-        server =
-          start_supervised!(
-            {Server,
-             poll: fn ->
-               send(owner, :called)
-               raise "PRIVATE_NOTIFICATION_TOKEN"
-             end,
-             wake: fn -> send(owner, :wake) end,
-             interval_ms: 1_000}
+        start_tasks(
+          Server.tasks(
+            poll: fn ->
+              send(observer, :called)
+              raise "PRIVATE_NOTIFICATION_TOKEN"
+            end,
+            wake: fn -> send(observer, :wake) end,
+            interval_ms: 5_000
           )
+        )
 
-        assert_receive :called, 1_000
+        assert_receive :called, 3_000
+        await(fn -> hd(rows("gmail_notifications")).args["failures"] == 1 end)
         refute_receive :wake, 50
-        state = await_state(server, &(&1.running == nil and &1.attempts == 1))
-        assert state.attempts == 1 and state.running == nil
+        refute inspect(rows("gmail_notifications")) =~ "PRIVATE_NOTIFICATION_TOKEN"
       end)
 
     refute logs =~ "PRIVATE_NOTIFICATION_TOKEN"
   end
 
-  test "acknowledged deliberate disconnections do not wake cleanup workers" do
-    owner = self()
+  test "acknowledged deliberate disconnections do not wake workers" do
+    observer = self()
 
-    server =
-      start_supervised!(
-        {Server,
-         poll: fn ->
-           send(owner, :polled_disconnected)
-           {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 0}}
-         end,
-         wake: fn -> send(owner, :incorrect_cleanup_wake) end,
-         interval_ms: 5_000}
+    start_tasks(
+      Server.tasks(
+        poll: fn ->
+          send(observer, :polled)
+          {:ok, %{recorded: 0, ignored: 1, acknowledged: 1, failed: 0}}
+        end,
+        wake: fn -> send(observer, :incorrect_wake) end,
+        interval_ms: 5_000
       )
+    )
 
-    assert_receive :polled_disconnected, 1_000
-    await_state(server, &is_nil(&1.running))
-    refute_receive :incorrect_cleanup_wake, 100
-    assert :sys.get_state(server).attempts == 0
-  end
-
-  defp await_state(server, predicate),
-    do: await_state(server, predicate, System.monotonic_time(:millisecond) + 2_000)
-
-  defp await_state(server, predicate, deadline) do
-    state = :sys.get_state(server)
-
-    cond do
-      predicate.(state) ->
-        state
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("notification task did not settle")
-
-      true ->
-        Process.sleep(1)
-        await_state(server, predicate, deadline)
-    end
+    assert_receive :polled, 3_000
+    await(fn -> hd(rows("gmail_notifications")).state == "scheduled" end)
+    refute_receive :incorrect_wake, 100
+    assert hd(rows("gmail_notifications")).args["failures"] == 0
   end
 end

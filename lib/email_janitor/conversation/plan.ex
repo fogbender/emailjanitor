@@ -51,7 +51,7 @@ defmodule EmailJanitor.Conversation.Plan do
          true <- text?(value["query"], 512),
          true <- text?(value["reply"], 1024),
          true <-
-           is_list(source_bodies) and length(source_bodies) <= 35 and
+           is_list(source_bodies) and length(source_bodies) <= 38 and
              Enum.all?(source_bodies, &valid_source?/1),
          true <- instruction_references?(value, instruction_refs),
          true <- compatible?(value),

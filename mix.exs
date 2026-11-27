@@ -27,7 +27,9 @@ defmodule EmailJanitor.MixProject do
   defp deps do
     [
       {:jason, "~> 1.4"},
+      {:oban, "== 2.24.1"},
       {:mail, "~> 0.5.2"},
+      {:gen_smtp, "== 1.3.0"},
       {:floki, "~> 0.38.0"},
       {:domainatrex, "~> 3.2"},
       {:ecto_sql, "~> 3.14"},
@@ -36,7 +38,10 @@ defmodule EmailJanitor.MixProject do
       {:google_api_gmail, "~> 0.17.0"},
       {:google_api_pub_sub, "~> 0.42.0"},
       {:assent, "~> 0.4.0"},
-      {:plug, "~> 1.20", only: :test},
+      {:plug, "~> 1.20"},
+      {:phoenix, "~> 1.8.17"},
+      {:phoenix_html, "~> 4.4"},
+      {:bandit, "~> 1.15"},
       {:stream_data, "~> 1.4", only: :test},
       {:req_llm, "~> 1.31.0"},
       {:ex_aws, "~> 2.8"},

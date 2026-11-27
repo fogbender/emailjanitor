@@ -78,6 +78,144 @@ defmodule EmailJanitor.WorkerTest do
   defp read(state), do: Agent.get(state, & &1)
   defp pending(ctx), do: Ingestion.pending(ctx.scope, ctx.box)
 
+  defp fresh_policy(config) do
+    observer = self()
+
+    factory = fn messages ->
+      send(observer, {:policy_factory, Enum.map(messages, & &1.id)})
+      subject = messages |> hd() |> EmailJanitor.Message.header("subject")
+
+      {:ok,
+       %Policy{
+         adapter: __MODULE__.FreshPolicy,
+         context: %{base: config.policy, observer: observer, subject: subject}
+       }}
+    end
+
+    %{config | policy_for_messages: factory}
+  end
+
+  test "automatic cleanup derives one header policy and reuses it for admission and settlement",
+       ctx do
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(
+              headers: [{"From", "sales@vendor.com"}, {"Subject", "Fresh subject"}]
+            )
+          ]
+      }
+    )
+
+    assert {:ok, %{status: :done}} = Worker.step(fresh_policy(ctx.config))
+    assert_receive {:policy_factory, ["message-1"]}
+    refute_receive {:policy_factory, _}
+    assert_receive {:fresh_policy, "Fresh subject", :reserve, ["message-1"]}
+    assert_receive {:fresh_policy, "Fresh subject", :settle, _}
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == 3
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "queued Keep retirement receives the newly fetched header policy", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    [%Candidate{candidate_id: id}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | model: :keep,
+          messages: [
+            Fixtures.message(
+              headers: [{"From", "sales@vendor.com"}, {"Subject", "Changed subject"}]
+            )
+          ]
+      }
+    )
+
+    assert {:ok, %{status: :kept}} = Worker.step(fresh_policy(ctx.config))
+    assert_receive {:policy_factory, ["message-1"]}
+    assert_receive {:fresh_policy, "Changed subject", :retire, ["message-1"]}
+    assert read(ctx.state).mutations == []
+  end
+
+  test "invalid derived policies fail closed and retain arrival provenance for retry", ctx do
+    for failure <- [fn _ -> {:ok, nil} end, fn _ -> raise "PRIVATE_FACTORY_BODY" end] do
+      assert {:ok, %{status: :policy_unavailable}} =
+               Worker.step(%{ctx.config | policy_for_messages: failure})
+
+      assert {:ok, [_]} = pending(ctx)
+      assert read(ctx.state).model_inputs == []
+      assert read(ctx.state).mutations == []
+      advance(ctx.clock, 901)
+    end
+
+    assert {:ok, %{status: :done}} = Worker.step(fresh_policy(ctx.config))
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "durable settlement recovery uses the base policy without another header read", ctx do
+    Agent.update(ctx.quota, &%{&1 | failures: 1})
+    assert {:ok, %{status: :settlement_pending}} = Worker.step(fresh_policy(ctx.config))
+    assert_receive {:policy_factory, _}
+    assert_receive {:fresh_policy, _, :reserve, _}
+    assert_receive {:fresh_policy, _, :settle, _}
+    before = Enum.count(read(ctx.state).calls, &(&1 == :full_thread))
+    observer = self()
+
+    config = %{
+      ctx.config
+      | policy_for_messages: fn _ ->
+          send(observer, :unexpected_recovery_factory)
+          {:error, :policy_unavailable}
+        end
+    }
+
+    assert {:ok, %{recovery: :settled, status: :idle}} = Worker.step(config)
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == before
+    refute_receive :unexpected_recovery_factory
+    refute_receive {:fresh_policy, _, _, _}
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "a queued candidate retains its retry after a derived policy failure", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    [%Candidate{candidate_id: id}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+    before = length(read(ctx.state).model_inputs)
+    bad = %{ctx.config | policy_for_messages: fn _ -> {:ok, nil} end}
+    assert {:ok, %{status: :policy_unavailable}} = Worker.step(bad)
+
+    assert [%Candidate{status: :pending, requested: true, candidate_id: ^id}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(read(ctx.state).model_inputs) == before
+    assert read(ctx.state).mutations == []
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :done}} = Worker.step(fresh_policy(ctx.config))
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "worker config accepts only a unary policy factory", ctx do
+    for factory <- [:bad, fn -> :ok end] do
+      assert {:error, :invalid_worker_config} =
+               Config.new(ctx.scope, ctx.box,
+                 gmail: ctx.config.gmail,
+                 classifier: ctx.config.classifier,
+                 preferences: ctx.config.preferences,
+                 authorize: ctx.config.authorize,
+                 topic: ctx.config.topic,
+                 policy_for_messages: factory
+               )
+    end
+  end
+
   test "install is idempotent and the first watch seeds no old-inbox cleanup", ctx do
     assert :ok = Worker.install(ctx.scope)
 
@@ -536,6 +674,206 @@ defmodule EmailJanitor.WorkerTest do
     assert read(ctx.state).mutations == []
   end
 
+  for {phase, options} <- [
+        {:snapshot, [snapshot_error: :thread_not_found]},
+        {:review, [full_thread_error_at: 1]},
+        {:execute, [full_thread_error_at: 2]}
+      ] do
+    test "confirmed deleted #{phase} retires core and host provenance without backlog churn",
+         ctx do
+      Agent.update(ctx.quota, &%{&1 | block: :cap})
+      assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+      assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+      Agent.update(ctx.state, &Map.put(&1, :full_thread_count, 0))
+      before = read(ctx.quota).calls
+      config = %{ctx.config | gmail: {Gmail, [state: ctx.state] ++ unquote(options)}}
+      assert {:ok, %{status: :skipped}} = Worker.step(config)
+      assert Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix) == []
+
+      assert [%Candidate{status: :retired, message_ids: [], requested: false}] =
+               Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+      assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+      assert read(ctx.quota).calls -- before == [{:retire_whole, ["message-1"]}]
+      assert read(ctx.state).mutations == []
+    end
+  end
+
+  test "deleted manual subset retires exact metadata and preserves unrelated siblings", ctx do
+    id = manual_candidate(ctx)
+    :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"], authority_id: id)
+    before = read(ctx.quota).calls
+
+    config = %{
+      ctx.config
+      | gmail: {Gmail, [state: ctx.state, snapshot_error: :thread_not_found]},
+        allow_manual_recheck: fn _, _ -> :ok end
+    }
+
+    assert {:ok, %{status: :skipped}} = Worker.step(config)
+
+    assert [%EmailJanitor.Store.Candidate{remaining_message_ids: ["message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx.quota).calls -- before == [{:retire_exact, ["message-1"]}]
+    assert read(ctx.state).mutations == []
+  end
+
+  test "a newer explicit recheck cannot be retired by an older deletion snapshot", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    [source] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn ->
+               :ok = Worker.queue_recheck(ctx.scope, ctx.box, source.candidate_id)
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true, request_version: version}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert version == source.request_version + 1
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+  end
+
+  test "new per-ID authority after the source fetch preserves metadata even before a new worker row",
+       ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn ->
+               {:ok, :ok} =
+                 Repo.transaction(fn ->
+                   Store.fence_recheck(ctx.scope, ctx.box.id, ["message-1"])
+                 end)
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+  end
+
+  test "a connection generation change prevents deletion metadata retirement", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn ->
+               {:ok, cp} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+
+               {:ok, _} =
+                 Ingestion.reconnect(ctx.scope, ctx.box, cp.generation, %{
+                   history_id: "900",
+                   expires_at: DateTime.add(DateTime.utc_now(), 604_800)
+                 })
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+  end
+
+  test "unsupported partial deletion retirement pauses without whole-candidate withdrawal", ctx do
+    id = manual_candidate(ctx)
+    :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"], authority_id: id)
+
+    config = %{
+      ctx.config
+      | gmail: {Gmail, [state: ctx.state, snapshot_error: :thread_not_found]},
+        allow_manual_recheck: fn _, _ -> :ok end,
+        policy: %Policy{adapter: __MODULE__.WholeOnlyPolicy, context: self()}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{requested: false, contract_blocked: true, message_ids: ["message-1"]}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert [%EmailJanitor.Store.Candidate{remaining_message_ids: ["message-1", "message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    refute_received {:legacy_whole_retired, _}
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+  end
+
+  test "authorization revoked during the missing-thread read preserves all provenance", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    auth = start_supervised!({Agent, fn -> true end}, id: :deleted_auth)
+
+    config = %{
+      ctx.config
+      | authorize: fn -> if Agent.get(auth, & &1), do: :ok, else: {:error, :disconnected} end,
+        gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn -> Agent.update(auth, fn _ -> false end) end
+           ]}
+    }
+
+    assert {:ok, %{status: :connection_changed}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+    assert read(ctx.state).mutations == []
+  end
+
+  test "failed host retirement rolls back deleted source metadata for retry", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.quota, &Map.put(&1, :retire_error, true))
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_error: :thread_not_found]}}
+    assert {:ok, %{status: :policy_unavailable}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+    assert read(ctx.state).mutations == []
+  end
+
   for {reason, expected, requested} <- [
         {:thread_not_found, :skipped, false},
         {:not_found, :gmail_unavailable, true}
@@ -818,15 +1156,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted-inbox"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted-inbox"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    assert_receive {:reported_worker_status, :done}, 2_000
+    assert_receive {:reported_worker_status, :done}, 5_000
     assert read(ctx.state).mutations == [["z-new"]]
 
     assert [%Deferral{status: :unreadable, message_ids: ["a-old-1", "a-old-2"]}] =
@@ -866,15 +1203,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted-inbox"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted-inbox"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    assert_receive {:reported_worker_status, :done}, 2_000
+    assert_receive {:reported_worker_status, :done}, 5_000
     assert read(ctx.state).mutations == [["z-new"]]
 
     assert [%Deferral{status: :unreadable, message_ids: ["a-old-1", "a-old-2"]}] =
@@ -948,15 +1284,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted-inbox"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted-inbox"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    assert_receive {:reported_model_step, :done}, 2_000
+    assert_receive {:reported_model_step, :done}, 8_000
     assert read(ctx.state).mutations == [["z-new"]]
     assert {:ok, pending} = pending(ctx)
     assert Enum.sort(Enum.map(pending, & &1.message_id)) == ["bad-1", "bad-2", "bad-3"]
@@ -985,12 +1320,11 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
     assert_receive {:global_outcome, :model_unavailable}, 1_000
@@ -1080,12 +1414,11 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
     assert_receive {:policy_outcome, :policy_unavailable}, 1_000
@@ -1120,12 +1453,11 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
     assert_receive {:candidate_policy, :policy_unavailable}, 1_000
@@ -1156,15 +1488,14 @@ defmodule EmailJanitor.WorkerTest do
         end
     }
 
-    start_supervised!(
-      {EmailJanitor.Worker.Server,
-       list: fn -> {:ok, ["trusted"]} end,
-       resolve: fn _ -> {:ok, config} end,
-       interval_ms: 5_000,
-       max_concurrency: 1}
+    EmailJanitor.TestScheduler.start_cleanup(
+      list: fn -> {:ok, ["trusted"]} end,
+      resolve: fn _ -> {:ok, config} end,
+      interval_ms: 5_000,
+      max_concurrency: 1
     )
 
-    for _ <- 1..4, do: assert_receive({:rejection_report, :model_rejected}, 1_500)
+    for _ <- 1..4, do: assert_receive({:rejection_report, :model_rejected}, 3_000)
     refute_receive {:rejection_report, _}, 250
     assert length(read(ctx.state).model_inputs) == 4
     assert read(ctx.state).mutations == []

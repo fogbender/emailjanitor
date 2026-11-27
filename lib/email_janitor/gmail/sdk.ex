@@ -82,6 +82,132 @@ defmodule EmailJanitor.Gmail.SDK do
     end)
   end
 
+  @doc "Fetch a unique current Sent copy by a safe RFC Message-ID; never treat an SMTP body as user authority."
+  def feedback_sent(inbox_id, rfc_message_id, opts) do
+    guarded(fn ->
+      with {:ok, canonical} <- EmailJanitor.Mail.RFCMessageID.canonical(rfc_message_id),
+           {:ok, connection, _} <- verified(inbox_id, opts) do
+        feedback_sent_list(connection, canonical)
+      else
+        {:error, :not_found} -> {:error, :gmail_unavailable}
+        {:error, _} = error -> error
+        _ -> {:error, :gmail_unavailable}
+      end
+    end)
+  end
+
+  defp feedback_sent_list(connection, canonical) do
+    query = "in:sent rfc822msgid:\"" <> canonical <> "\""
+
+    case call(fn ->
+           Users.gmail_users_messages_list(connection, "me",
+             q: query,
+             labelIds: ["SENT"],
+             maxResults: 2
+           )
+         end) do
+      {:ok, %Model.ListMessagesResponse{messages: values, nextPageToken: token}}
+      when token in [nil, ""] ->
+        case values || [] do
+          [] -> {:error, :sent_not_indexed}
+          [%Model.Message{id: id}] -> feedback_sent_message(connection, id, canonical)
+          _ -> {:error, :ambiguous_sent}
+        end
+
+      {:ok, %Model.ListMessagesResponse{}} ->
+        {:error, :ambiguous_sent}
+
+      {:error, :not_found} ->
+        {:error, :gmail_unavailable}
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :gmail_unavailable}
+    end
+  end
+
+  defp feedback_sent_message(connection, id, canonical) do
+    with true <- Parser.valid_id?(id),
+         {:ok, %Model.Message{id: ^id} = value} <-
+           call(fn ->
+             Users.gmail_users_messages_get(connection, "me", id, format: "full")
+           end),
+         {:ok, message} <- Parser.message(value),
+         {:ok, message} <- feedback_representation(value, message),
+         true <- "SENT" in message.labels,
+         {:ok, ^canonical} <-
+           EmailJanitor.Mail.RFCMessageID.canonical(
+             EmailJanitor.Message.header(message, "message-id")
+           ) do
+      {:ok, message}
+    else
+      {:error, :not_found} ->
+        {:error, :sent_not_indexed}
+
+      {:error, reason} = error
+      when reason in [:authorization_required, :forbidden, :rate_limited, :gmail_unavailable] ->
+        error
+
+      _ ->
+        {:error, :invalid_sent_message}
+    end
+  end
+
+  # The cleanup parser intentionally combines readable alternatives. For feedback
+  # choose its single structured plain-text alternative instead: concatenating
+  # HTML and text can turn an old quoted command into a new visible fragment.
+  defp feedback_representation(value, original) do
+    {plain, attached_forward} = feedback_plain_parts(value.payload, 0)
+
+    case {plain, attached_forward} do
+      {[part], false} ->
+        payload = %{part | headers: value.payload.headers}
+
+        with {:ok, message} <- Parser.message(%{value | payload: payload}),
+             do: {:ok, %{message | feedback_format: :plain}}
+
+      {[], false} ->
+        {:ok, %{original | feedback_format: :html}}
+
+      _ ->
+        {:ok, %{original | feedback_format: :ambiguous}}
+    end
+  end
+
+  defp feedback_plain_parts(_, depth) when depth > 30, do: {[], true}
+
+  defp feedback_plain_parts(%Model.MessagePart{} = part, depth) do
+    attached =
+      (is_binary(part.filename) and part.filename != "") or
+        Enum.any?(part.headers || [], fn header ->
+          is_binary(header.name) and String.downcase(header.name) == "content-disposition" and
+            is_binary(header.value) and
+            String.downcase(header.value |> String.split(";", parts: 2) |> hd() |> String.trim()) ==
+              "attachment"
+        end)
+
+    cond do
+      part.mimeType == "message/rfc822" ->
+        {[], true}
+
+      attached ->
+        {[], false}
+
+      part.mimeType == "text/plain" ->
+        {[part], false}
+
+      true ->
+        Enum.reduce(part.parts || [], {[], false}, fn child, {parts, forward} ->
+          {found, nested} = feedback_plain_parts(child, depth + 1)
+          {parts ++ found, forward or nested}
+        end)
+    end
+  end
+
+  defp feedback_plain_parts(_, _), do: {[], true}
+
   @doc "Resolve an arrival's thread ID using only minimal metadata, without downloading its body."
   def thread_id(inbox_id, message_id, opts) do
     guarded(fn ->

@@ -1,6 +1,6 @@
 defmodule EmailJanitor.Mail.SDK do
   @moduledoc "Maintained SES/S3/SQS operations with explicit host credentials and fixed, body-free errors."
-  alias EmailJanitor.{Content, Inbox, TransportPrivacy}
+  alias EmailJanitor.{Address, Content, Inbox, TransportPrivacy}
   alias EmailJanitor.Mail.{Config, HTTP, Message, Prepared}
   @event [:email_janitor, :private_mail_sdk]
 
@@ -44,6 +44,33 @@ defmodule EmailJanitor.Mail.SDK do
   end
 
   def send(%Config{} = config, %Prepared{} = prepared, %Inbox{} = inbox, %Message{} = message) do
+    with {:ok, message} <- Message.validate(message),
+         :ok <- outgoing_addresses(config, inbox),
+         {:ok, operation} <- outgoing_operation(config, inbox, message) do
+      case request(operation, prepared) do
+        {:ok, %{body: %{message_id: id}}} when is_binary(id) and byte_size(id) in 1..256 ->
+          if Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, id),
+            do: {:ok, id},
+            else: {:error, :unresolved_delivery}
+
+        _ ->
+          {:error, :unresolved_delivery}
+      end
+    end
+  rescue
+    _ -> {:error, :invalid_outgoing_content}
+  catch
+    _, _ -> {:error, :invalid_outgoing_content}
+  end
+
+  defp outgoing_addresses(config, inbox) do
+    if Address.normalize(config.sender) == {:ok, config.sender} and
+         Address.normalize(inbox.address) == {:ok, inbox.address},
+       do: :ok,
+       else: {:error, :invalid_outgoing_content}
+  end
+
+  defp outgoing_operation(config, inbox, %{in_reply_to: nil} = message) do
     operation =
       ExAws.SES.send_email(
         %{to: [inbox.address]},
@@ -54,15 +81,52 @@ defmodule EmailJanitor.Mail.SDK do
         config.sender
       )
 
-    case request(operation, prepared) do
-      {:ok, %{body: %{message_id: id}}} when is_binary(id) and byte_size(id) in 1..256 ->
-        if Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, id),
-          do: {:ok, id},
-          else: {:error, :unresolved_delivery}
+    {:ok, operation}
+  end
 
-      _ ->
-        {:error, :unresolved_delivery}
-    end
+  defp outgoing_operation(config, inbox, message) do
+    headers = [
+      {"From", config.sender},
+      {"To", inbox.address},
+      {"Subject", Content.read(message.subject)},
+      {"Message-ID", "<" <> Ecto.UUID.generate() <> "@" <> Address.domain(config.sender) <> ">"},
+      {"Date", Calendar.strftime(DateTime.utc_now(), "%a, %d %b %Y %H:%M:%S +0000")},
+      {"In-Reply-To", "<" <> message.in_reply_to <> ">"},
+      {"References", Enum.map_join(message.references, " ", &("<" <> &1 <> ">"))},
+      {"Auto-Submitted", "auto-replied"},
+      {"X-Auto-Response-Suppress", "All"}
+    ]
+
+    raw =
+      quietly(fn ->
+        :mimemail.encode(
+          {"text", "plain", headers,
+           %{content_type_params: [{"charset", "UTF-8"}], disposition: "inline"},
+           String.replace(Content.read(message.text), ~r/\r\n|\r|\n/, "\r\n")}
+        )
+      end)
+      |> normalize_subject_folding()
+
+    if byte_size(raw) <= 1_000_000 and
+         Enum.all?(String.split(raw, "\r\n"), &(byte_size(&1) <= 998)),
+       do: {:ok, ExAws.SES.send_raw_email(raw, source: config.sender)},
+       else: {:error, :invalid_outgoing_content}
+  end
+
+  # gen_smtp 1.3 folds every semicolon, including those in unstructured Subject.
+  # Remove only its inserted fold from that header; preserve original spaces,
+  # encoded-word folding, all other headers and the transfer-encoded body.
+  defp normalize_subject_folding(raw) do
+    [headers, body] = String.split(raw, "\r\n\r\n", parts: 2)
+
+    headers =
+      Regex.replace(
+        ~r/(?:\A|\r\n)Subject: [^\r\n]*(?:\r\n[ \t][^\r\n]*)*/,
+        headers,
+        &String.replace(&1, ";\r\n\t", ";")
+      )
+
+    headers <> "\r\n\r\n" <> body
   end
 
   def poll(%Config{} = config) do
