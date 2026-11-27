@@ -391,6 +391,19 @@ defmodule EmailJanitor.Worker do
   defp finish_review(
          config,
          checkpoint,
+         _eligible,
+         targets,
+         _snapshot,
+         _version,
+         _now,
+         {:error, :thread_not_found}
+       ) do
+    processed(config, checkpoint, targets, :skipped)
+  end
+
+  defp finish_review(
+         config,
+         checkpoint,
          eligible,
          targets,
          snapshot,
@@ -707,6 +720,10 @@ defmodule EmailJanitor.Worker do
       {:done, _} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :done
+
+      {:error, :thread_not_found} ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
+        :skipped
 
       {:unresolved, _} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
