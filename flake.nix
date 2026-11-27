@@ -30,7 +30,7 @@
             npmDepsHash = "sha256-guVbJYRmU1jMjKI2sehAzxmtue/yA+Dwl5CjaYkwee0=";
             npmFlags = [ "--ignore-scripts" ];
             dontNpmBuild = true;
-            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper pkgs.python3 ];
             doCheck = true;
             checkPhase = "npm test";
             postInstall = ''
@@ -74,6 +74,21 @@
               test ! -s revoke.stdout
               printf 'Google grant revocation unavailable.\n' >revoke.expected
               cmp revoke.expected revoke.stderr
+              # The actual installed helper must end even if its BEAM owner
+              # disappears before supplying a frame. No Google request is made.
+              python3 - "$out/bin/emailjanitor-google-revoke" <<'PY'
+              import subprocess, sys
+              p = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              try:
+                  assert p.wait(timeout=15) == 1
+                  assert p.stdout.read() == b""
+                  assert p.stderr.read() == b'Google grant revocation unavailable.\n'
+              finally:
+                  if p.poll() is None:
+                      p.kill()
+                      p.wait()
+                  p.stdin.close()
+              PY
               runHook postInstallCheck
             '';
             meta = {

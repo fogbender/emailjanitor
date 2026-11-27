@@ -11,20 +11,27 @@ Google's fixed endpoint, no redirects/retries, a 10-second HTTP deadline, a
 15-second outer deadline; the Nix wrapper has an independent OS watchdog.
 
 Only HTTP 200 returns `:ok`. Exact Google `400 invalid_token` becomes
-`{:error, :refresh_token_invalid}`, never successful erasure. All other failures
+`{:error, :refresh_token_invalid}`, never a claim that project permissions were
+revoked. All other failures
 return `{:error, :revocation_unavailable}` without provider text. An access-only
 credential is insufficient: an expired access token does not establish that the
 offline grant was removed. A crash after remote success but before a local commit
-may require retry or visible manual provider cleanup if Google returns an invalid
-token on replay. Grant retirement may take time to propagate at Google.
+can yield that exact unusable-credential result on replay. Grant retirement may
+take time to propagate at Google.
 
 Hosts first fence ordinary work, durably retain the encrypted pending credential,
 then call this boundary outside database locks. They erase the pending credential
-and release the identity only after positive confirmation. Timeouts and invalid
-tokens remain honestly pending; the SDK boundary does not manage the host's
-durable queue. New Google grants for the same immutable subject and project must
+and release the identity after positive confirmation, or retire an exact
+provider-rejected unusable credential after permanently stopping every old
+attempt. In the latter case the host reports only that local access was removed;
+it cannot claim all Google permissions were revoked. Generic errors and timeouts
+stay pending. The SDK boundary does not manage the host's durable queue. New
+Google grants for the same immutable subject and project must
 remain blocked throughout revocation, including during the remote call, so an old
-revoke cannot invalidate a newly accepted connection.
+revoke cannot invalidate a newly accepted connection. Dead BEAM ownership alone
+does not prove an external SDK helper exited: recovery must preserve a quarantine
+longer than the owning operation plus its possible last-started 13-second OS
+helper. A successful current call is returned only after the helper's exit status.
 
 Use an isolated product Google Cloud project. Google documents that revoking
 access removes **all scopes and all OAuth clients registered under that project**
