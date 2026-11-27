@@ -25,7 +25,7 @@ defmodule EmailJanitor.Mail.Receipt do
          %{"type" => "S3", "topicArn" => topic, "bucketName" => bucket, "objectKey" => key} <-
            action,
          true <- topic == config.topic_arn and bucket == config.bucket,
-         true <- key == id,
+         true <- key in [id, "incoming/" <> id],
          object_key = "incoming/" <> id,
          true <- SDK.valid_key?(object_key),
          {:ok, verdicts} <- verdicts(receipt) do
