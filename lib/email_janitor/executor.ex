@@ -471,6 +471,9 @@ defmodule EmailJanitor.Executor do
       {:ok, _} = result ->
         result
 
+      {:error, :thread_not_found} = error ->
+        error
+
       {:error, reason}
       when reason in [
              :invalid_thread,

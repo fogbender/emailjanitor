@@ -931,6 +931,7 @@ defmodule EmailJanitor.GmailSDKTest do
   test "404 types identify the requested resource and never misidentify a missing profile" do
     mock(fn _ -> Tesla.Mock.json(%{"error" => "PRIVATE_RESPONSE"}, status: 404) end)
     assert {:error, :thread_not_found} = SDK.thread("inbox-1", "thread-1", options())
+    assert {:error, :thread_not_found} = SDK.thread_snapshot("inbox-1", "thread-1", options())
     assert {:error, :message_not_found} = SDK.thread_id("inbox-1", "message-1", options())
 
     Tesla.Mock.mock(fn env ->
@@ -939,6 +940,9 @@ defmodule EmailJanitor.GmailSDKTest do
     end)
 
     assert {:error, :not_found} = SDK.thread("inbox-1", "thread-1", options())
+    assert {:error, :not_found} = SDK.thread_snapshot("inbox-1", "thread-1", options())
     assert {:error, :not_found} = SDK.thread_id("inbox-1", "message-1", options())
+    assert {:error, :not_found} = SDK.history("inbox-1", "100", options())
+    assert {:error, :not_found} = SDK.ingestion_batch("inbox-1", "100", options())
   end
 end

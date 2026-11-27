@@ -48,9 +48,10 @@ defmodule EmailJanitor.WorkerTest.Gmail do
 
   def thread_id(_, id, options) do
     Agent.get(options[:state], fn state ->
-      case Enum.find(state.messages, &(&1.id == id)) do
-        nil -> {:error, :not_found}
-        message -> {:ok, message.thread_id}
+      case {options[:thread_id_error], Enum.find(state.messages, &(&1.id == id))} do
+        {error, _} when not is_nil(error) -> {:error, error}
+        {_, nil} -> {:error, :message_not_found}
+        {_, message} -> {:ok, message.thread_id}
       end
     end)
   end
@@ -59,6 +60,9 @@ defmodule EmailJanitor.WorkerTest.Gmail do
     Agent.get_and_update(options[:state], fn state ->
       result =
         cond do
+          options[:snapshot_error] ->
+            {:error, options[:snapshot_error]}
+
           thread in Keyword.get(options, :snapshot_outages, []) ->
             {:error, :gmail_unavailable}
 
@@ -76,9 +80,13 @@ defmodule EmailJanitor.WorkerTest.Gmail do
   def thread(_, thread, options) do
     Agent.get_and_update(options[:state], fn state ->
       result =
-        if thread in Keyword.get(options, :thread_failures, []),
-          do: {:error, Keyword.get(options, :thread_error, :invalid_thread)},
-          else: {:ok, Enum.filter(state.messages, &(&1.thread_id == thread))}
+        if options[:full_thread_error],
+          do: {:error, options[:full_thread_error]},
+          else:
+            if(thread in Keyword.get(options, :thread_failures, []),
+              do: {:error, Keyword.get(options, :thread_error, :invalid_thread)},
+              else: {:ok, Enum.filter(state.messages, &(&1.thread_id == thread))}
+            )
 
       {result, %{state | calls: state.calls ++ [:full_thread]}}
     end)

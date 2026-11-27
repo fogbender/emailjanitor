@@ -475,6 +475,47 @@ defmodule EmailJanitor.WorkerTest do
              Repo.all(EmailJanitor.Worker.Watch, prefix: ctx.scope.prefix)
   end
 
+  for {stage, expected} <- [
+        {:thread_id_error, :gmail_unavailable},
+        {:snapshot_error, :gmail_unavailable},
+        {:full_thread_error, :eligibility_unavailable}
+      ] do
+    test "profile 404 at #{stage} preserves the arrival for provider recovery", ctx do
+      options = Keyword.put([state: ctx.state], unquote(stage), :not_found)
+      config = %{ctx.config | gmail: {Gmail, options}}
+      assert {:ok, %{status: unquote(expected)}} = Worker.step(config)
+      assert {:ok, [_]} = pending(ctx)
+      assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+    end
+  end
+
+  for {stage, reason} <- [
+        {:thread_id_error, :message_not_found},
+        {:snapshot_error, :thread_not_found},
+        {:full_thread_error, :thread_not_found}
+      ] do
+    test "only typed deletion #{stage} retires that arrival", ctx do
+      options = Keyword.put([state: ctx.state], unquote(stage), unquote(reason))
+      config = %{ctx.config | gmail: {Gmail, options}}
+      assert {:ok, %{status: :skipped}} = Worker.step(config)
+      assert {:ok, []} = pending(ctx)
+      assert read(ctx.state).model_inputs == [] and read(ctx.state).mutations == []
+    end
+  end
+
+  test "recheck profile 404 keeps durable provenance requested for retry", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_error: :not_found]}}
+    assert {:ok, %{status: :gmail_unavailable}} = Worker.step(config)
+
+    assert [%Candidate{requested: true, status: :pending, attempts: 1}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx.state).mutations == []
+  end
+
   test "at most five targets are admitted per step and remaining arrivals continue", ctx do
     messages = Enum.map(1..7, &Fixtures.message(id: "arrival-#{&1}"))
 
