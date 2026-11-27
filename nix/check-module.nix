@@ -25,6 +25,10 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert service.serviceConfig.User == "emailjanitor";
    assert service.environment.ERL_CRASH_DUMP == "/dev/null";
    assert service.serviceConfig.LimitCORE == 0;
+   assert service.serviceConfig.ProcSubset == "all";
+   assert service.serviceConfig.ProtectProc == "invisible";
+   assert service.environment.RELEASE_TMP == "/run/emailjanitor/release";
+   assert service.serviceConfig.RuntimeDirectoryMode == "0700";
    assert host.config.services.postgresql.enableTCPIP == false;
    assert host.config.services.postgresql.settings.listen_addresses == "";
    assert builtins.elem "multi-user.target" service.wantedBy;

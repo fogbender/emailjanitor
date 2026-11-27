@@ -10,7 +10,13 @@
     in {
       packages = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
-        in {
+        in rec {
+          default = emailjanitor;
+          emailjanitor = import ./nix/release.nix {
+            inherit (pkgs) lib coreutils;
+            beam = pkgs.beam.packages.erlang_28;
+            src = ./.;
+          };
           google-auth-bridge = pkgs.buildNpmPackage {
             pname = "emailjanitor-google-token";
             version = "0.1.0";
@@ -58,6 +64,24 @@
               mainProgram = "emailjanitor-google-token";
             };
           };
+        });
+      checks = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          release = pkgs.runCommand "emailjanitor-release-check" {
+            nativeBuildInputs = [ self.packages.${system}.emailjanitor ];
+          } ''
+            export HOME="$TMPDIR"
+            export ERL_CRASH_DUMP=/dev/null
+            export RELEASE_TMP="$TMPDIR/release"
+            email_janitor eval '
+              {:ok, _} = Application.ensure_all_started(:email_janitor)
+              true = is_pid(Process.whereis(EmailJanitor.Supervisor))
+              true = File.regular?(Application.app_dir(:email_janitor, "priv/prompts/classify.txt"))
+              true = Code.ensure_loaded?(EmailJanitor.Mail.SDK)
+            '
+            touch "$out"
+          '';
         });
       devShells = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };

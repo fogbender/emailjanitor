@@ -6,7 +6,13 @@ in {
     enable = lib.mkEnableOption "the single-user Email Janitor service";
     package = lib.mkOption {
       type = lib.types.package;
-      description = "Built Elixir release providing bin/email_janitor. No release is built by this module.";
+      default = import ./release.nix {
+        inherit lib;
+        inherit (pkgs) coreutils;
+        beam = pkgs.beam.packages.erlang_28;
+        src = ../.;
+      };
+      description = "Locked Elixir release providing bin/email_janitor. Host worker startup remains an application integration gate.";
     };
     environmentFile = lib.mkOption {
       type = lib.types.str;
@@ -45,6 +51,7 @@ in {
         JANITOR_DATABASE_NAME = "emailjanitor";
         JANITOR_DATABASE_USER = "emailjanitor";
         ERL_CRASH_DUMP = "/dev/null";
+        RELEASE_TMP = "/run/emailjanitor/release";
         RELEASE_DISTRIBUTION = "none";
         AWS_REGION = "us-east-1";
         JANITOR_MODEL_PROVIDER = "bedrock";
@@ -59,6 +66,8 @@ in {
         WorkingDirectory = "/var/lib/emailjanitor";
         StateDirectory = "emailjanitor";
         StateDirectoryMode = "0700";
+        RuntimeDirectory = "emailjanitor";
+        RuntimeDirectoryMode = "0700";
         UMask = "0077";
         Restart = "on-failure";
         RestartSec = 5;
@@ -72,6 +81,8 @@ in {
         RestrictRealtime = true;
         SystemCallArchitectures = "native";
         ProtectProc = "invisible";
+        # Owner recovery reads boot_id and this application's process-start stat.
+        ProcSubset = "all";
         PrivateTmp = true;
         PrivateDevices = true;
         ProtectHome = true;
