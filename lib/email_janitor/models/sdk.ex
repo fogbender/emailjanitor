@@ -1,5 +1,5 @@
 defmodule EmailJanitor.Models.SDK do
-  @moduledoc "Thin ReqLLM adapter for Azure, OpenAI and Anthropic. No CLI-account authentication or custom wire protocol."
+  @moduledoc "Thin ReqLLM adapter: AWS Bedrock self-hosting and Azure SaaS; no custom wire protocol."
   @behaviour EmailJanitor.Classifier
   alias EmailJanitor.{Content, Decision, HTML, Message}
   alias EmailJanitor.Models.Config
@@ -20,6 +20,19 @@ defmodule EmailJanitor.Models.SDK do
   }
 
   def classify(messages, instructions, opts) do
+    started = System.monotonic_time()
+    result = perform(messages, instructions, opts)
+
+    :telemetry.execute(
+      [:email_janitor, :model, :stop],
+      %{duration: System.monotonic_time() - started},
+      %{status: elem(result, 0)}
+    )
+
+    result
+  end
+
+  defp perform(messages, instructions, opts) do
     %Config{} = config = Keyword.fetch!(opts, :config)
 
     context = [
@@ -31,19 +44,23 @@ defmodule EmailJanitor.Models.SDK do
 
     options =
       [
-        api_key: Content.read(config.api_key),
-        max_tokens: 256,
+        max_tokens: 4096,
+        max_retries: 0,
         receive_timeout: 30_000,
         total_timeout: 35_000,
         telemetry: [payloads: :none],
         output_validation: :strict,
-        req_http_options: Keyword.merge(Keyword.get(opts, :http_options, []), retry: false)
+        req_http_options: Keyword.get(opts, :http_options, [])
       ]
       |> optional(:base_url, config.base_url)
       |> optional(:deployment, config.deployment)
 
+    {:ok, credentials} = credentials(config, opts)
+    options = Keyword.merge(options, credentials)
+    provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
+
     case ReqLLM.generate_object(
-           %{provider: config.provider, id: config.model},
+           %{provider: provider, id: config.model},
            context,
            @schema,
            options
@@ -79,7 +96,9 @@ defmodule EmailJanitor.Models.SDK do
   defp text(%Message{body: nil}), do: ""
 
   defp text(%Message{body: %Content{} = body} = message) do
-    if String.starts_with?(Message.header(message, "content-type") || "", "text/html") do
+    type = Message.header(message, "content-type")
+
+    if is_binary(type) and String.starts_with?(String.downcase(type), "text/html") do
       case HTML.readable(body) do
         {:ok, text} -> Content.read(text)
         _ -> ""
@@ -87,6 +106,16 @@ defmodule EmailJanitor.Models.SDK do
     else
       String.slice(Content.read(body), 0, 16_000)
     end
+  end
+
+  defp credentials(%Config{provider: :azure} = config, _opts),
+    do: {:ok, [api_key: Content.read(config.api_key), provider_options: [store: false]]}
+
+  defp credentials(%Config{provider: :bedrock} = config, opts) do
+    resolver = Keyword.get(opts, :credential_resolver, &EmailJanitor.Models.AWSRole.fetch/1)
+
+    with {:ok, credentials} <- resolver.(config.region),
+         do: {:ok, [provider_options: credentials]}
   end
 
   defp optional(opts, _, nil), do: opts

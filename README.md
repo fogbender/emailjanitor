@@ -38,17 +38,31 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
 
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
-- Validated, tool-free classifier boundary; transient content redaction and HTML
-  extraction. A real model adapter is not connected yet.
+- Validated classifier boundary; transient content redaction and HTML extraction.
+  Thin ReqLLM adapters target AWS Bedrock for the one supported self-host setup
+  and Azure AI for the SaaS. Bedrock uses ExAws's rotating EC2 role credentials,
+  not developer profiles or model API keys. No direct OpenAI/Anthropic adapters.
 - Explicit repository/schema scopes, durable idempotent action intents, exact-ID
   Gmail mutation boundary and restoration protection, tested against PostgreSQL.
 - Pure history-based ambiguous-action reconciliation decisions. Its live Gmail
   history consumer and automatic recovery worker are not implemented yet.
 
-The Gmail adapter in the tests is a fake. There is no OAuth connection, running
+The Gmail adapter in the tests is a fake. Model HTTP tests exercise the real SDK
+against synthetic responses, not live models or credentials. There is no OAuth connection, running
 cleanup service, email transport, chat UI, billing, or cloud deployment yet.
 
 The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
 scopes from model output or HTTP parameters. Query-prefix separation is covered
 here; full SaaS authorization is a later integration gate.
+
+## Model privacy boundary
+
+Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
+duration and a fixed success/error status. Do not export or log ReqLLM's raw
+exception lifecycle events: upstream error objects can contain transient request
+text even with `payloads: :none`. The SDK adapter discards those errors and returns
+fixed categories. Raw payload tracing, SDK debug mode and automatic dotenv loading
+are disabled. Normal tests cover echoed body text in HTTP errors and application
+telemetry. SDK retries are disabled (`max_retries: 0`); the durable job owner controls
+retry/backoff. Never put full SDK responses/errors into job arguments or reports.

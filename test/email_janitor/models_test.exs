@@ -1,62 +1,50 @@
 defmodule EmailJanitor.ModelsTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
   import ExUnit.CaptureLog
   import EmailJanitor.Fixtures
   alias EmailJanitor.{Classifier, Decision}
   alias EmailJanitor.Models.{Config, SDK}
-
   @decision %{"action" => "done", "confidence" => "high", "category" => "cold_outreach"}
 
-  defp config(provider) do
-    opts =
-      if provider == :azure,
-        do: [base_url: "https://janitor-test.openai.azure.com/openai", deployment: "janitor-eval"],
-        else: []
-
+  defp config(:azure) do
     {:ok, config} =
-      Config.new(
-        provider,
-        if(provider == :anthropic, do: "claude-haiku-4-5", else: "gpt-4o-mini"),
-        "TEST_API_KEY_SENTINEL",
-        opts
+      Config.new(:azure, "gpt-4o-mini", "TEST_API_KEY_SENTINEL",
+        base_url: "https://janitor-test.openai.azure.com/openai",
+        deployment: "janitor-eval"
       )
 
     config
   end
 
-  defp run(provider) do
+  defp config(:bedrock) do
+    {:ok, config} = Config.new(:bedrock, "amazon.nova-micro-v1:0", nil, region: "us-east-1")
+    config
+  end
+
+  defp run(provider, messages \\ [message(body: "PRIVATE_BODY_SENTINEL")]) do
+    credentials = fn "us-east-1" ->
+      {:ok,
+       [
+         region: "us-east-1",
+         access_key_id: "TEST_ACCESS_ID",
+         secret_access_key: "TEST_SECRET_KEY_SENTINEL",
+         session_token: "TEST_SESSION_SENTINEL"
+       ]}
+    end
+
     Classifier.propose(
-      {SDK, [config: config(provider), http_options: [plug: {Req.Test, __MODULE__}]]},
-      [message(body: "PRIVATE_BODY_SENTINEL")],
+      {SDK,
+       [
+         config: config(provider),
+         credential_resolver: credentials,
+         http_options: [plug: {Req.Test, __MODULE__}]
+       ]},
+      messages,
       "Keep requested customer conversations."
     )
   end
 
-  defp openai(conn, object) do
-    if String.ends_with?(conn.request_path, "/responses") do
-      Req.Test.json(conn, %{
-        id: "test-response",
-        object: "response",
-        status: "completed",
-        model: "gpt-4o-mini",
-        output: [
-          %{
-            id: "function-1",
-            type: "function_call",
-            call_id: "call-1",
-            name: "structured_output",
-            arguments: Jason.encode!(object),
-            status: "completed"
-          }
-        ],
-        usage: %{input_tokens: 100, output_tokens: 15, total_tokens: 115}
-      })
-    else
-      chat_completion(conn, object)
-    end
-  end
-
-  defp chat_completion(conn, object) do
+  defp azure_response(conn, object) do
     Req.Test.json(conn, %{
       id: "test-completion",
       object: "chat.completion",
@@ -83,66 +71,153 @@ defmodule EmailJanitor.ModelsTest do
     })
   end
 
-  test "OpenAI uses the SDK's structured output and keeps transient body out of results" do
-    Req.Test.stub(__MODULE__, fn conn ->
-      assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer TEST_API_KEY_SENTINEL"]
-      {:ok, body, conn} = Plug.Conn.read_body(conn)
-      assert body =~ "PRIVATE_BODY_SENTINEL"
-      request = Jason.decode!(body)
-      assert [tool] = request["tools"]
-      assert (tool["name"] || get_in(tool, ["function", "name"])) == "structured_output"
-      openai(conn, @decision)
-    end)
-
-    assert {:ok, %Decision{action: :done}} = run(:openai)
-  end
-
-  test "Azure SDK routes through the configured deployment with API-key authentication" do
+  test "Azure SDK routes through configured deployment and keeps body transient" do
     Req.Test.stub(__MODULE__, fn conn ->
       assert conn.host == "janitor-test.openai.azure.com"
-      assert conn.request_path =~ "/deployments/janitor-eval/chat/completions"
+      assert conn.request_path == "/openai/deployments/janitor-eval/chat/completions"
       assert Plug.Conn.get_req_header(conn, "api-key") == ["TEST_API_KEY_SENTINEL"]
-      openai(conn, @decision)
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert body =~ "PRIVATE_BODY_SENTINEL"
+      assert [tool] = Jason.decode!(body)["tools"]
+      assert (tool["name"] || get_in(tool, ["function", "name"])) == "structured_output"
+      azure_response(conn, @decision)
     end)
 
     assert {:ok, %Decision{action: :done}} = run(:azure)
   end
 
-  test "Anthropic SDK extracts a structured tool result without executing user tools" do
+  test "Bedrock uses SDK SigV4 and Nova Converse, not an API key" do
     Req.Test.stub(__MODULE__, fn conn ->
-      assert Plug.Conn.get_req_header(conn, "x-api-key") == ["TEST_API_KEY_SENTINEL"]
+      assert conn.host == "bedrock-runtime.us-east-1.amazonaws.com"
+      assert String.ends_with?(conn.request_path, "/converse")
+      [authorization] = Plug.Conn.get_req_header(conn, "authorization")
+      assert authorization =~ "AWS4-HMAC-SHA256"
+      assert authorization =~ "TEST_ACCESS_ID"
+      assert Plug.Conn.get_req_header(conn, "x-amz-security-token") == ["TEST_SESSION_SENTINEL"]
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert body =~ "PRIVATE_BODY_SENTINEL"
 
       Req.Test.json(conn, %{
-        id: "test-message",
-        type: "message",
-        role: "assistant",
-        model: "claude-haiku-4-5",
-        content: [%{type: "tool_use", id: "tool-1", name: "structured_output", input: @decision}],
-        stop_reason: "tool_use",
-        usage: %{input_tokens: 100, output_tokens: 15}
+        output: %{
+          message: %{
+            role: "assistant",
+            content: [
+              %{toolUse: %{toolUseId: "tool-1", name: "structured_output", input: @decision}}
+            ]
+          }
+        },
+        stopReason: "tool_use",
+        usage: %{inputTokens: 100, outputTokens: 15, totalTokens: 115},
+        metrics: %{latencyMs: 1}
       })
     end)
 
-    assert {:ok, %Decision{action: :done}} = run(:anthropic)
+    assert {:ok, %Decision{action: :done}} = run(:bedrock)
   end
 
-  test "provider failure neither logs echoed email content nor returns raw responses" do
+  for status <- [400, 429, 500] do
+    test "HTTP #{status} sends once and never logs echoed content or secrets" do
+      count = start_supervised!({Agent, fn -> 0 end})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        Agent.update(count, &(&1 + 1))
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          unquote(status),
+          Jason.encode!(%{error: %{message: "PRIVATE_BODY_SENTINEL", type: "server_error"}})
+        )
+      end)
+
+      logs = capture_log(fn -> assert {:error, :model_unavailable} = run(:azure) end)
+      assert Agent.get(count, & &1) == 1
+      refute logs =~ "PRIVATE_BODY_SENTINEL"
+      refute logs =~ "TEST_API_KEY_SENTINEL"
+    end
+  end
+
+  test "transport errors send once and expose no raw request" do
+    count = start_supervised!({Agent, fn -> 0 end})
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Agent.update(count, &(&1 + 1))
+      Req.Test.transport_error(conn, :econnrefused)
+    end)
+
+    assert {:error, :model_unavailable} = run(:azure)
+    assert Agent.get(count, & &1) == 1
+  end
+
+  test "metadata-only application telemetry is safe on failed model calls" do
+    pid = self()
+    id = "janitor-test-model-events"
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:email_janitor, :model, :stop],
+        fn _, measure, meta, target ->
+          send(target, {:safe_event, measure, meta})
+        end,
+        pid
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+
     Req.Test.stub(__MODULE__, fn conn ->
       conn
       |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.send_resp(
-        500,
-        Jason.encode!(%{error: %{message: "PRIVATE_BODY_SENTINEL", type: "server_error"}})
-      )
+      |> Plug.Conn.send_resp(400, Jason.encode!(%{error: %{message: "PRIVATE_BODY_SENTINEL"}}))
     end)
 
-    logs = capture_log(fn -> assert {:error, :model_unavailable} = run(:openai) end)
-    refute logs =~ "PRIVATE_BODY_SENTINEL"
-    refute logs =~ "TEST_API_KEY_SENTINEL"
+    assert {:error, :model_unavailable} = run(:azure)
+    assert_receive {:safe_event, %{duration: duration}, %{status: :error} = meta}
+    assert is_integer(duration)
+    refute inspect(meta) =~ "PRIVATE_BODY_SENTINEL"
   end
 
-  test "model config redacts credentials and rejects malformed or insecure Azure endpoints" do
+  test "HTML cleanup is case-insensitive and includes only the last five messages" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      refute body =~ "OLD_BODY_SENTINEL"
+      refute body =~ "SCRIPT_SENTINEL"
+      assert body =~ "Visible pitch"
+      azure_response(conn, @decision)
+    end)
+
+    recent =
+      for n <- 1..5,
+          do:
+            message(
+              id: "m#{n}",
+              headers: [
+                {"From", "sales@vendor.com"},
+                {"Content-Type", "Text/HTML; charset=UTF-8"}
+              ],
+              body: "<script>SCRIPT_SENTINEL</script><p>Visible pitch</p>"
+            )
+
+    messages = [message(body: "OLD_BODY_SENTINEL") | recent]
+    assert {:ok, %Decision{}} = run(:azure, messages)
+  end
+
+  test "schema-invalid model decisions fail closed" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      azure_response(conn, %{
+        "action" => "done",
+        "confidence" => "high",
+        "category" => "legitimate"
+      })
+    end)
+
+    assert {:error, _} = run(:azure)
+  end
+
+  test "config offers only Bedrock self-host and Azure SaaS, and redacts secrets" do
     refute inspect(config(:azure)) =~ "TEST_API_KEY_SENTINEL"
+    assert {:error, :invalid_model_config} = Config.new(:openai, "model", "key")
+    assert {:error, :invalid_model_config} = Config.new(:anthropic, "model", "key")
 
     for endpoint <- [
           "http://example.com",
@@ -152,6 +227,14 @@ defmodule EmailJanitor.ModelsTest do
         ] do
       assert {:error, :invalid_model_config} =
                Config.new(:azure, "gpt-4o-mini", "key", base_url: endpoint, deployment: "eval")
+    end
+
+    for deployment <- ["eval/other", "eval?x=1", "eval#test"] do
+      assert {:error, :invalid_model_config} =
+               Config.new(:azure, "gpt-4o-mini", "key",
+                 base_url: "https://example.com/openai",
+                 deployment: deployment
+               )
     end
   end
 end
