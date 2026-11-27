@@ -191,23 +191,28 @@ defmodule EmailJanitor.Conversation.Plan do
   end
 
   defp sender_addresses(raw) do
-    # The maintained To parser retains every mailbox; its From parser returns
-    # only the first one. This syntactic identifier check does not require a
-    # public suffix, so reserved fixture domains and local addresses are safe.
-    {"to", parsed} = Mail.Parsers.RFC2822.parse_header("To: " <> raw, [])
+    # The parser retains ordinary mailboxes, while the syntactic scan also
+    # catches carriers folded into display names by malformed quoting/groups.
+    # Neither path depends on the domain having a public suffix.
+    scanned = Regex.scan(~r/[^@\s<>(),:;"\x{0000}-\x{001F}]+@[a-zA-Z0-9.-]+/u, raw)
 
-    parsed
-    |> carrier_values()
+    parsed =
+      try do
+        {"to", values} = Mail.Parsers.RFC2822.parse_header("To: " <> raw, [])
+        carrier_values(values)
+      rescue
+        _ -> []
+      catch
+        _, _ -> []
+      end
+
+    (parsed ++ List.flatten(scanned))
     |> Enum.filter(fn value ->
-      byte_size(value) <= 254 and Regex.match?(~r/\A[^@\s<>(),;"]+@[a-zA-Z0-9.-]+\z/u, value)
+      byte_size(value) <= 254 and Regex.match?(~r/\A[^@\s<>(),:;"]+@[a-zA-Z0-9.-]+\z/u, value)
     end)
     |> Enum.map(&String.downcase/1)
     |> Enum.uniq()
     |> Enum.sort_by(&byte_size/1, :desc)
-  rescue
-    _ -> []
-  catch
-    _, _ -> []
   end
 
   defp carrier_values({_, address}), do: carrier_values(address)
