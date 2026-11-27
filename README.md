@@ -36,6 +36,23 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
 
 ## Implemented foundation
 
+Versioned distilled preferences are available through `Preferences.install/1`
+(migration 3), `snapshot/2`, `text/1` and `replace/5`. The host selects either all
+inboxes or the snapshot's inbox after authenticating the conversation. Only the
+distilled instruction belongs in this store; raw email, chat input and model
+responses do not. Global and local instructions are each capped at 15,000 bytes,
+keeping the composed preference text within the model adapter's budget.
+
+Updates compare the snapshot's namespace, revisions and mailbox instruction
+version, then bump affected inbox versions atomically. UUID effect receipts
+deduplicate retries without retaining conversation text. Registration serializes
+with global updates so a newly connected inbox cannot miss an invalidation. A
+prepared cleanup also checks the current instruction version at its dispatch
+fence; a correction that commits first cancels that old attempt through the
+existing executor/policy path. A request already dispatched may still finish.
+The conversational planner and authenticated email/web teaching workflow are
+still being built; the preference API is its persistence boundary.
+
 Host policy callbacks reserve and settle under database locks. Settlement rereads
 the current durable outcome while excluding reconciliation and transition races;
 retrying settlement cannot overwrite a newer outcome with stale uncertainty.
