@@ -18,7 +18,7 @@ inside an optional module.
 | 9 | Conversation execution ownership and exact action bindings | `Conversation.Ledger.install/1` |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |
 | 11 | Inbox-worker recovery/settlement ledger | Worker installer (in development) |
-| 12 | Pre-dispatch digest header staging | Digest staging installer (in development) |
+| 12 | Staged digest action headers | `Digest.install_staging/1` |
 
 Changes to an already released schema require a new
 version; never alter an existing released migration. The private SaaS application's

@@ -7,7 +7,7 @@ defmodule EmailJanitor.Digest.Event do
   def new(source_id, message_id, kind, sender, subject, %DateTime{} = occurred_at)
       when kind in [:done, :would_have_done] and is_binary(message_id) do
     with {:ok, source_id} <- Ecto.UUID.cast(source_id),
-         true <- Regex.match?(~r/\A[0-9a-f]{1,32}\z/, message_id),
+         true <- EmailJanitor.Gmail.Parser.valid_id?(message_id),
          {:ok, [sender | _]} <- Address.parse(sender),
          {:ok, occurred_at} <- DateTime.shift_zone(occurred_at, "Etc/UTC") do
       subject = normalize_subject(subject)

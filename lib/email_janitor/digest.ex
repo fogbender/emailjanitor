@@ -8,10 +8,17 @@ defmodule EmailJanitor.Digest do
   import Ecto.Query
   alias EmailJanitor.Digest.{Activity, Clock, Event, Migration, Renderer, Schedule, Snapshot}
   alias EmailJanitor.Mail.{Config, Outbox, Outgoing}
-  alias EmailJanitor.Store.{Mailbox, Scope}
+  alias EmailJanitor.Store.{Action, Mailbox, Scope}
 
   def install(%Scope{} = scope),
     do: Ecto.Migrator.up(scope.repo, 5, Migration, prefix: scope.prefix, log: false)
+
+  defdelegate install_staging(scope), to: EmailJanitor.Digest.Staging, as: :install
+  defdelegate stage(scope, inbox_id, event), to: EmailJanitor.Digest.Staging
+
+  defdelegate confirm_staged(scope, inbox_id, action_id),
+    to: EmailJanitor.Digest.Staging,
+    as: :confirm
 
   def configure(%Scope{} = scope, inbox_id, timezone, %DateTime{} = now) do
     with {:ok, _, cutoff} <- Clock.cutoff(now, timezone),
@@ -87,6 +94,37 @@ defmodule EmailJanitor.Digest do
     end
   end
 
+  @doc "Retire unlisted Done metadata only with its exact source action's durable positive restoration proof."
+  def withdraw_pending(%Scope{} = scope, inbox_id, ids) when is_list(ids) do
+    if length(ids) <= 1000 and Enum.all?(ids, &EmailJanitor.Gmail.Parser.valid_id?/1) do
+      case transaction(scope, fn ->
+             lock_mailbox!(scope, inbox_id)
+
+             scope.repo.update_all(
+               from(a in Activity,
+                 join: action in Action,
+                 on: action.id == a.source_id and action.inbox_id == a.inbox_id,
+                 where:
+                   a.inbox_id == ^inbox_id and a.kind == :done and is_nil(a.digest_id) and
+                     a.message_id in ^ids and
+                     fragment("? = ANY(?)", a.message_id, action.restored_message_ids)
+               ),
+               [set: [retired: true]],
+               prefix: scope.prefix
+             )
+
+             :ok
+           end) do
+        {:ok, :ok} -> :ok
+        error -> error
+      end
+    else
+      {:error, :invalid_digest_withdrawal}
+    end
+  end
+
+  def withdraw_pending(_, _, _), do: {:error, :invalid_digest_withdrawal}
+
   def get(%Scope{} = scope, id), do: scope.repo.get(Snapshot, id, prefix: scope.prefix)
 
   @doc "Claim a due frozen snapshot and its outbox intention atomically. Callback is DB-only and shares this Repo transaction."
@@ -136,9 +174,13 @@ defmodule EmailJanitor.Digest do
 
     query =
       from(a in Activity,
+        left_join: action in Action,
+        on: a.kind == :done and action.id == a.source_id and action.inbox_id == a.inbox_id,
         where:
           a.inbox_id == ^schedule.inbox_id and is_nil(a.digest_id) and not a.retired and
-            a.occurred_at <= ^cutoff,
+            a.occurred_at <= ^cutoff and
+            (is_nil(action.id) or
+               not fragment("? = ANY(?)", a.message_id, action.restored_message_ids)),
         order_by: [asc: a.occurred_at, asc: a.id]
       )
 
