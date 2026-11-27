@@ -237,6 +237,16 @@ OAuth refresh or reconsent after revoked credentials resumes the existing
 generation and cursor. It must never be interpreted as deliberate disconnection
 or used to call `reconnect/4` automatically.
 
+Hosts can use `baseline/4`, `reconnect/5` and `activate/4` with
+`on_baseline: fn checkpoint -> :ok end` and `expected_instruction_version:`.
+The bounded database callback runs inside the mailbox-to-checkpoint transaction;
+it binds the private connection epoch and active state to that exact generation.
+A callback error rolls back both host activation and checkpoint/arrival changes.
+`activate/4` resumes an existing generation without changing its cursor or baseline.
+Perform watch/profile requests outside this transaction. Disconnect must lock the
+mailbox and increment its version before changing private connection ownership;
+the host callback rechecks the captured epoch and group/inbox ownership.
+
 `NotificationWorker.poll_once/2` resolves each notification through the host's
 trusted email-to-scope/Inbox router, commits a coalesced history hint, and only then
 acknowledges it. Failed routes or commits remain unacknowledged. A crash after
