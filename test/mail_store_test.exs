@@ -372,4 +372,124 @@ defmodule EmailJanitor.MailStoreTest do
 
     assert TestRepo.get!(Incoming, row.id, prefix: ctx.scope.prefix).outcome == :rejected
   end
+
+  test "uppercase reference UUIDs are normalized before first insert and dedupe", ctx do
+    uuid = Ecto.UUID.generate()
+    dedupe = Ecto.UUID.generate()
+
+    assert {:ok, row} =
+             Outbox.enqueue(ctx.scope, ctx.inbox.id, :digest, [String.upcase(uuid)], dedupe)
+
+    assert row.reference_ids == [uuid]
+    assert {:ok, %{id: id}} = Outbox.enqueue(ctx.scope, ctx.inbox.id, :digest, [uuid], dedupe)
+    assert id == row.id
+  end
+
+  test "expired purge retains a completed workflow outcome, then metadata is retired", ctx do
+    failing =
+      F.config(fn conn ->
+        Plug.Conn.send_resp(conn, if(conn.method == "DELETE", do: 503, else: 200), "PRIVATE-BODY")
+      end)
+
+    {receipt, _} = F.receipt(failing, "ses-retirement")
+    {:ok, row} = Spool.accept(ctx.scope, ctx.inbox.id, receipt)
+    workflow = Ecto.UUID.generate()
+
+    assert {:error, :mail_unavailable} =
+             Spool.process(ctx.scope, row.id, failing, fn _, _ -> {:ok, workflow} end)
+
+    TestRepo.update_all(
+      from(i in Incoming, where: i.id == ^row.id),
+      [set: [expires_at: DateTime.add(DateTime.utc_now(), -1)]],
+      prefix: ctx.scope.prefix
+    )
+
+    working = F.config(fn conn -> Plug.Conn.send_resp(conn, 204, "") end)
+    assert :ok = Spool.sweep(ctx.scope, working)
+    saved = Spool.get(ctx.scope, row.id)
+    assert saved.state == :deleted
+    assert saved.outcome == :processed
+    assert saved.workflow_id == workflow
+
+    TestRepo.update_all(
+      from(i in Incoming, where: i.id == ^row.id),
+      [set: [expires_at: DateTime.add(DateTime.utc_now(), -5401)]],
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok = Spool.sweep(ctx.scope, working)
+    assert Spool.get(ctx.scope, row.id) == nil
+  end
+
+  test "oversized forward records its terminal outcome and is purged immediately", ctx do
+    parent = self()
+
+    config = %{
+      F.config(fn _ -> flunk("GET attempted") end)
+      | test_plug: fn conn ->
+          send(parent, {:method, conn.method})
+
+          case conn.method do
+            "HEAD" ->
+              conn
+              |> Plug.Conn.put_resp_header("content-length", "1048577")
+              |> Plug.Conn.send_resp(200, "")
+
+            "DELETE" ->
+              Plug.Conn.send_resp(conn, 204, "")
+          end
+        end
+    }
+
+    {receipt, _} = F.receipt(config, "ses-too-large")
+    {:ok, row} = Spool.accept(ctx.scope, ctx.inbox.id, receipt)
+
+    assert {:error, :mail_too_large} =
+             Spool.process(ctx.scope, row.id, config, fn _, _ ->
+               flunk("handler saw oversized content")
+             end)
+
+    assert_received {:method, "HEAD"}
+    assert_received {:method, "DELETE"}
+    refute_received {:method, "GET"}
+    assert %{state: :deleted, outcome: :too_large} = Spool.get(ctx.scope, row.id)
+    assert :ok = Spool.process(ctx.scope, row.id, config, fn _, _ -> flunk("terminal retry") end)
+    refute_received {:method, _}
+  end
+
+  test "one poisoned orphan cannot hide the continuation marker for later pages", _ctx do
+    parent = self()
+    past = DateTime.add(DateTime.utc_now(), -3700) |> DateTime.to_iso8601()
+
+    config =
+      F.config(fn conn ->
+        send(parent, {conn.method, conn.request_path, conn.query_string})
+
+        case {conn.method, URI.decode_query(conn.query_string)["marker"]} do
+          {"GET", nil} ->
+            Plug.Conn.send_resp(
+              conn,
+              200,
+              "<ListBucketResult><IsTruncated>true</IsTruncated><NextMarker>incoming/later</NextMarker><Contents><Key>incoming/nested/poison</Key><LastModified>#{past}</LastModified><Size>1</Size></Contents></ListBucketResult>"
+            )
+
+          {"GET", "incoming/later"} ->
+            Plug.Conn.send_resp(
+              conn,
+              200,
+              "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>incoming/tail</Key><LastModified>#{past}</LastModified><Size>1</Size></Contents></ListBucketResult>"
+            )
+
+          {"DELETE", nil} ->
+            Plug.Conn.send_resp(conn, 204, "")
+        end
+      end)
+
+    assert {:error, :spool_cleanup_failed, "incoming/later"} = Spool.sweep_orphans(config)
+    assert {:ok, nil} = Spool.sweep_orphans(config, "incoming/later")
+    assert_received {"GET", "/janitor-spool/", _}
+    assert_received {"GET", "/janitor-spool/", _}
+    assert_received {"DELETE", "/janitor-spool/incoming/tail", _}
+    refute_received {"GET", _, _}
+  end
 end

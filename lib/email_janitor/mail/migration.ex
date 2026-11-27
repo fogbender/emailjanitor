@@ -39,7 +39,13 @@ defmodule EmailJanitor.Mail.Migration do
       timestamps(type: :utc_datetime_usec)
     end
 
-    create(index(:mail_spool, [:expires_at, :state]))
+    create(
+      index(:mail_spool, [:expires_at], name: :mail_spool_cleanup, where: "state <> 'deleted'")
+    )
+
+    create(
+      index(:mail_spool, [:expires_at], name: :mail_spool_retirement, where: "state = 'deleted'")
+    )
 
     create(
       constraint(:mail_spool, :spool_state,
@@ -49,7 +55,8 @@ defmodule EmailJanitor.Mail.Migration do
 
     create(
       constraint(:mail_spool, :spool_outcome,
-        check: "outcome IS NULL OR outcome IN ('processed', 'ignored', 'rejected', 'expired')"
+        check:
+          "outcome IS NULL OR outcome IN ('processed', 'ignored', 'rejected', 'expired', 'too_large')"
       )
     )
   end

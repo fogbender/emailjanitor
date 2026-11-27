@@ -199,4 +199,31 @@ defmodule EmailJanitor.MailSDKTest do
 
     assert {:ok, [%{key: "incoming/last"}], "incoming/last"} = SDK.list(config)
   end
+
+  test "large forward has a typed terminal error without downloading its body" do
+    parent = self()
+
+    config = %{
+      F.config(fn _ -> flunk("body downloaded") end)
+      | test_plug: fn conn ->
+          send(parent, {:method, conn.method})
+          assert conn.method == "HEAD"
+
+          conn
+          |> Plug.Conn.put_resp_header("content-length", "1048577")
+          |> Plug.Conn.send_resp(200, "")
+        end
+    }
+
+    assert {:error, :mail_too_large} = SDK.fetch(config, "incoming/oversized")
+    assert_received {:method, "HEAD"}
+    refute_received {:method, "GET"}
+  end
+
+  test "growth after the size check is still a terminal size error" do
+    config =
+      F.config(fn conn -> Plug.Conn.send_resp(conn, 200, String.duplicate("x", 1_048_577)) end)
+
+    assert {:error, :mail_too_large} = SDK.fetch(config, "incoming/growing")
+  end
 end

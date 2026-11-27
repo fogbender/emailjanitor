@@ -16,7 +16,7 @@ defmodule EmailJanitor.Mail.Outbox do
       when kind in [:digest, :assistant] and is_list(reference_ids) and
              length(reference_ids) in 1..100 do
     with {:ok, dedupe_id} <- Ecto.UUID.cast(dedupe_id),
-         true <- Enum.all?(reference_ids, &match?({:ok, _}, Ecto.UUID.cast(&1))),
+         {:ok, reference_ids} <- cast_ids(reference_ids),
          %Mailbox{} <- scope.repo.get(Mailbox, inbox_id, prefix: scope.prefix) do
       row = %Outgoing{
         inbox_id: inbox_id,
@@ -45,6 +45,15 @@ defmodule EmailJanitor.Mail.Outbox do
   end
 
   def enqueue(_, _, _, _, _), do: {:error, :invalid_outbox_intent}
+
+  defp cast_ids(ids) do
+    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, acc} ->
+      case Ecto.UUID.cast(id) do
+        {:ok, id} -> {:cont, {:ok, acc ++ [id]}}
+        _ -> {:halt, {:error, :invalid_reference}}
+      end
+    end)
+  end
 
   def get(%Scope{} = scope, id), do: scope.repo.get(Outgoing, id, prefix: scope.prefix)
 

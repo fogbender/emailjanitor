@@ -1,3 +1,8 @@
+defmodule EmailJanitor.Mail.HTTP.TooLarge do
+  @moduledoc false
+  defexception message: "mail response exceeded limit"
+end
+
 defmodule EmailJanitor.Mail.HTTP do
   @moduledoc false
   @behaviour ExAws.Request.HttpClient
@@ -34,10 +39,14 @@ defmodule EmailJanitor.Mail.HTTP do
            %{status_code: response.status, headers: Req.get_headers_list(response), body: body}}
         end
 
+      {:error, %__MODULE__.TooLarge{}} ->
+        {:error, %{reason: :mail_response_too_large}}
+
       _ ->
         {:error, %{reason: :mail_http_unavailable}}
     end
   rescue
+    __MODULE__.TooLarge -> {:error, %{reason: :mail_response_too_large}}
     _ -> {:error, %{reason: :mail_http_unavailable}}
   catch
     _, _ -> {:error, %{reason: :mail_http_unavailable}}
@@ -50,7 +59,7 @@ defmodule EmailJanitor.Mail.HTTP do
       {:cont, {request, %{response | body: body <> data}}}
     else
       # Raising is caught before either Req or ExAws can inspect this response.
-      raise "mail response exceeded limit"
+      raise __MODULE__.TooLarge
     end
   end
 end

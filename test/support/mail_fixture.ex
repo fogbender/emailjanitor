@@ -18,7 +18,15 @@ defmodule EmailJanitor.MailFixture do
              security_token: "synthetic-token"
            ]}
         end,
-        test_plug: plug
+        test_plug: fn conn ->
+          if conn.method == "HEAD" do
+            conn
+            |> Plug.Conn.put_resp_header("content-length", "100")
+            |> Plug.Conn.send_resp(200, "")
+          else
+            plug.(conn)
+          end
+        end
       )
 
     config

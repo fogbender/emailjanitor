@@ -15,6 +15,8 @@ defmodule EmailJanitor.Mail.Spool do
   alias EmailJanitor.Mail.{Config, Incoming, Receipt, SDK}
   alias EmailJanitor.Store.{Mailbox, Scope}
 
+  def get(%Scope{} = scope, id), do: scope.repo.get(Incoming, id, prefix: scope.prefix)
+
   def accept(%Scope{} = scope, inbox_id, %Receipt{} = receipt) do
     with %Mailbox{} <- scope.repo.get(Mailbox, inbox_id, prefix: scope.prefix) do
       row = %Incoming{
@@ -94,7 +96,20 @@ defmodule EmailJanitor.Mail.Spool do
 
           purge(scope, row.id, config)
         else
-          _ -> {:error, :mail_processing_failed}
+          {:error, :mail_too_large} ->
+            scope.repo.update_all(
+              from(i in Incoming,
+                where: i.id == ^id and i.claim_id == ^token and i.state == :processing
+              ),
+              [set: [state: :purge, outcome: :too_large, updated_at: DateTime.utc_now()]],
+              prefix: scope.prefix
+            )
+
+            purge(scope, row.id, config)
+            {:error, :mail_too_large}
+
+          _ ->
+            {:error, :mail_processing_failed}
         end
 
       _ ->
@@ -116,7 +131,9 @@ defmodule EmailJanitor.Mail.Spool do
     now = DateTime.utc_now()
 
     scope.repo.update_all(
-      from(i in Incoming, where: i.id == ^id and i.state != :deleted and i.expires_at <= ^now),
+      from(i in Incoming,
+        where: i.id == ^id and i.state not in [:deleted, :purge] and i.expires_at <= ^now
+      ),
       [set: [state: :purge, outcome: :expired, updated_at: now]],
       prefix: scope.prefix
     )
@@ -146,13 +163,17 @@ defmodule EmailJanitor.Mail.Spool do
       {:error, :outer_transaction}
     else
       now = DateTime.utc_now()
+      retire_before = DateTime.add(now, -5400)
+
+      scope.repo.delete_all(
+        from(i in Incoming, where: i.state == :deleted and i.expires_at < ^retire_before),
+        prefix: scope.prefix
+      )
 
       rows =
         scope.repo.all(
           from(i in Incoming,
-            where:
-              i.state == :purge or
-                (i.state != :deleted and i.expires_at <= ^now),
+            where: i.state != :deleted and (i.state == :purge or i.expires_at <= ^now),
             select: i.id,
             limit: 100
           ),
@@ -180,7 +201,9 @@ defmodule EmailJanitor.Mail.Spool do
           end
         end)
 
-      if Enum.all?(results, &(&1 == :ok)), do: {:ok, next}, else: {:error, :spool_cleanup_failed}
+      if Enum.all?(results, &(&1 == :ok)),
+        do: {:ok, next},
+        else: {:error, :spool_cleanup_failed, next}
     end
   end
 end

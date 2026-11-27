@@ -60,8 +60,8 @@ are deliberately not claimed implemented by this transport foundation.
 SES stores MIME in the SSE-KMS temporary bucket. The S3 action's optional SNS
 notification (not a standalone SNS receipt action) sends SES envelope/verdicts
 and the object reference to the restricted SQS queue, excluding MIME content.
-Delivery headers can occur transiently in SNS/SQS; the queue retains messages
-for one day and its encrypted failed-message queue for fourteen days. Headers
+Delivery headers can occur transiently in SNS/SQS; both the incoming and
+encrypted failed-message queues retain messages for ninety minutes. Headers
 and commonHeaders are dropped before database storage. The topic accepts
 publishing only from the exact SES delivery role, whose trust names the exact
 receipt rule. The queue accepts injection only from that topic. This IAM/TLS
@@ -77,6 +77,9 @@ The host must match a known connected identity, authenticate its conversation,
 reject bounces/automatic/bulk replies, and choose the trusted Scope/inbox. Where
 this requires reading MIME first, keep the queue unacknowledged until the host
 has committed its routing decision; do not choose a tenant from MIME From alone.
+Once a receipt is classified as unprocessable, acknowledge it after committing
+its purge decision (or confirming global orphan cleanup covers an unroutable
+object), rather than repeatedly moving rejected notifications into the DLQ.
 
 `Spool.accept(scope, inbox_id, receipt)` durably deduplicates the SES ID and stores
 only the object key, envelope recipients/sender, fixed verdicts, deadline, claim
@@ -88,18 +91,31 @@ again. A crash before that outcome can rerun the handler after its bounded lease
 The handler MUST independently deduplicate Gmail mutations, instruction edits and
 outbox replies by the stable SES receipt ID. It must not directly perform an
 unfenced external side effect and assume exactly-once callback delivery.
+Inbound MIME has an explicit one MiB processing cap. A maintained S3 HeadObject
+size check rejects a larger forward without downloading its body; the streaming
+cap also catches growth after that check. This commits terminal `:too_large`
+metadata and an immediate purge, returning `{:error, :mail_too_large}` to the
+host instead of retrying it as an outage. The host can use the stable receipt ID
+to issue one authenticated, connected-inbox response explaining the cap. Read
+the typed result with `Spool.get/2`; never cache the oversized body as a workaround.
 
 Every accepted receipt expires one hour after SES received it; failure/retries
 never extend the deadline. Run `Spool.sweep/2` at least minutely to purge expired
 rows including failed authentication/parsing. Run `Spool.sweep_orphans/2` globally
 for each spool bucket at least minutely, following each returned marker until nil.
-This lists S3 references/LastModified only and deletes expired setup, malformed,
+On a per-object failure it returns `{:error, :spool_cleanup_failed, next_marker}`;
+continue that marker too so a bad early object cannot block later pages, and
+retry failed objects on the next complete sweep. This lists S3 references/LastModified only and deletes expired setup, malformed,
 unroutable and orphan objects without reading MIME. Callbacks and MIME fetches
 are bounded by a short-lived owner task. Cleanup can lag the hour by the sweep
 interval and cannot delete while the host or AWS is unavailable. The one-day S3
 lifecycle is a delayed emergency fallback, never a hard offline deletion promise.
 No spool versioning, replication, archive or backup may be enabled; account-wide
-backup policies must exclude its temporary-spool tag.
+backup policies must exclude its temporary-spool tag. Completed receipt rows
+(including envelope/verdict metadata) are deleted ninety minutes after their
+processing deadline. Durable workflow/effect deduplication belongs to the host's
+metadata ledger; it must not depend on keeping spool rows forever. Partial
+indexes keep the active cleanup scan independent of completed receipt history.
 
 Feedback/prompt distillation remains a host integration: transient authenticated
 reply → stable workflow UUID → immediate guarded action + persisted instruction

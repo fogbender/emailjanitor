@@ -42,7 +42,7 @@ defmodule EmailJanitor.Mail.Incoming do
     field(:claim_id, Ecto.UUID)
     field(:lease_until, :utc_datetime_usec)
     field(:workflow_id, Ecto.UUID)
-    field(:outcome, Ecto.Enum, values: [:processed, :ignored, :rejected, :expired])
+    field(:outcome, Ecto.Enum, values: [:processed, :ignored, :rejected, :expired, :too_large])
     timestamps(type: :utc_datetime_usec)
   end
 end

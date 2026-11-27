@@ -87,10 +87,27 @@ defmodule EmailJanitor.Mail.SDK do
 
   def fetch(%Config{} = config, key) do
     with true <- valid_key?(key),
+         {:ok, %{headers: headers}} <-
+           operation(config, ExAws.S3.head_object(config.bucket, key)),
+         :ok <- content_length(headers),
          {:ok, %{body: body}} <- operation(config, ExAws.S3.get_object(config.bucket, key), :raw),
          true <- is_binary(body) and byte_size(body) <= 1_048_576 do
       {:ok, Content.new(body)}
     else
+      {:error, :mail_too_large} -> {:error, :mail_too_large}
+      _ -> {:error, :mail_unavailable}
+    end
+  end
+
+  defp content_length(headers) do
+    value =
+      Enum.find_value(headers, fn {name, value} ->
+        if String.downcase(name) == "content-length", do: value
+      end)
+
+    case Integer.parse(value || "") do
+      {size, ""} when size >= 0 and size <= 1_048_576 -> :ok
+      {size, ""} when size > 1_048_576 -> {:error, :mail_too_large}
       _ -> {:error, :mail_unavailable}
     end
   end
@@ -150,6 +167,7 @@ defmodule EmailJanitor.Mail.SDK do
 
       case quietly(fn -> ExAws.request(operation, options) end) do
         {:ok, _} = result -> result
+        {:error, :mail_response_too_large} -> {:error, :mail_too_large}
         _ -> {:error, :mail_unavailable}
       end
     end
