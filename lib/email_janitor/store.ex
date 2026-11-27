@@ -82,6 +82,22 @@ defmodule EmailJanitor.Store do
       if existing do
         {:existing, existing}
       else
+        review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
+
+        # A later review may have blocked a larger batch while this executor was
+        # fetching Gmail history. Never let its older subset bypass that decision.
+        newer_candidate? =
+          scope.repo.exists?(
+            from(c in Candidate,
+              where:
+                c.inbox_id == ^inbox_id and c.updated_at > ^review_started_at and
+                  fragment("? && ?::text[]", c.message_ids, ^proposal.message_ids)
+            ),
+            prefix: scope.prefix
+          )
+
+        if newer_candidate?, do: scope.repo.rollback(:proposal_changed)
+
         ids = Enum.sort(proposal.message_ids)
         message_key = :crypto.hash(:sha256, :erlang.term_to_binary(ids))
 
@@ -111,8 +127,6 @@ defmodule EmailJanitor.Store do
         record = %{record | id: candidate.id}
         policy = Keyword.get(opts, :policy, Policy.unlimited())
         now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
-
-        review_started_at = Keyword.get_lazy(opts, :review_started_at, fn -> clock(scope) end)
 
         case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
           :ok ->
