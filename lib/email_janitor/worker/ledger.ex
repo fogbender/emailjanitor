@@ -206,7 +206,16 @@ defmodule EmailJanitor.Worker.Ledger do
     :ok
   end
 
-  def record_candidate(scope, inbox, id, proposal, generation, now, requested \\ false) do
+  def record_candidate(
+        scope,
+        inbox,
+        id,
+        proposal,
+        generation,
+        now,
+        requested \\ false,
+        source \\ nil
+      ) do
     scope.repo.insert_all(
       Candidate,
       [
@@ -216,6 +225,8 @@ defmodule EmailJanitor.Worker.Ledger do
           generation: generation,
           thread_id: proposal.thread_id,
           message_ids: proposal.message_ids,
+          source_kind: if(source, do: source.source_kind, else: :arrival),
+          authority_id: if(source, do: source.authority_id, else: nil),
           status: :pending,
           requested: requested,
           attempts: 0,
@@ -228,7 +239,17 @@ defmodule EmailJanitor.Worker.Ledger do
       prefix: scope.prefix,
       log: false,
       conflict_target: [:inbox_id, :candidate_id],
-      on_conflict: {:replace, [:generation, :thread_id, :message_ids, :status, :updated_at]}
+      on_conflict:
+        {:replace,
+         [
+           :generation,
+           :thread_id,
+           :message_ids,
+           :source_kind,
+           :authority_id,
+           :status,
+           :updated_at
+         ]}
     )
 
     :ok
@@ -280,6 +301,7 @@ defmodule EmailJanitor.Worker.Ledger do
               attempts: 0,
               invalid_attempts: 0,
               rejected_attempts: 0,
+              contract_blocked: false,
               next_attempt_at: nil
             ]
           ],
@@ -288,6 +310,122 @@ defmodule EmailJanitor.Worker.Ledger do
         )
 
       if count == 1, do: :ok, else: {:error, :ineligible_recheck}
+    else
+      _ -> {:error, :ineligible_recheck}
+    end
+  end
+
+  def queue_manual(scope, inbox, id, thread, ids, options) do
+    authority = Keyword.get(options, :authority_id, id)
+
+    with {:ok, id} <- Ecto.UUID.cast(id),
+         {:ok, authority} <- Ecto.UUID.cast(authority),
+         true <- EmailJanitor.Gmail.Parser.valid_id?(thread) and valid_selection?(ids) do
+      case scope.repo.transaction(fn ->
+             mailbox =
+               scope.repo.one(
+                 from(m in Mailbox,
+                   where: m.id == ^inbox.id,
+                   lock: "FOR NO KEY UPDATE"
+                 ),
+                 prefix: scope.prefix,
+                 log: false
+               )
+
+             if is_nil(mailbox) or mailbox.address != inbox.address,
+               do: scope.repo.rollback(:ineligible_recheck)
+
+             checkpoint =
+               case Ingestion.checkpoint(scope, inbox.id) do
+                 {:ok, %{status: :active, address: address} = cp} when address == inbox.address ->
+                   cp
+
+                 _ ->
+                   scope.repo.rollback(:ineligible_recheck)
+               end
+
+             source = %Candidate{
+               inbox_id: inbox.id,
+               candidate_id: id,
+               thread_id: thread,
+               message_ids: Enum.sort(ids),
+               status: :pending,
+               source_kind: :manual,
+               authority_id: authority
+             }
+
+             if not pending_source?(scope, inbox, source),
+               do: scope.repo.rollback(:ineligible_recheck)
+
+             existing =
+               scope.repo.get_by(Candidate, [inbox_id: inbox.id, candidate_id: id],
+                 prefix: scope.prefix,
+                 log: false
+               )
+
+             cond do
+               existing && existing.status != :pending ->
+                 scope.repo.rollback(:ineligible_recheck)
+
+               existing && existing.source_kind == :arrival ->
+                 # Independently verified arrivals never become a wider manual grant.
+                 if not Enum.all?(ids, &(&1 in existing.message_ids)),
+                   do: scope.repo.rollback(:ineligible_recheck)
+
+               existing ->
+                 if existing.authority_id != authority,
+                   do: scope.repo.rollback(:ineligible_recheck)
+
+                 if Enum.sort(existing.message_ids) != Enum.sort(ids) do
+                   scope.repo.update!(
+                     Ecto.Changeset.change(existing,
+                       message_ids: Enum.sort(ids),
+                       attempts: 0,
+                       invalid_attempts: 0,
+                       rejected_attempts: 0,
+                       contract_blocked: false,
+                       requested: false,
+                       next_attempt_at: nil
+                     ),
+                     prefix: scope.prefix,
+                     log: false
+                   )
+                 end
+
+               true ->
+                 now = DateTime.utc_now()
+
+                 scope.repo.insert!(
+                   %{
+                     source
+                     | generation: checkpoint.generation,
+                       requested: false,
+                       inserted_at: now,
+                       updated_at: now
+                   },
+                   prefix: scope.prefix,
+                   log: false
+                 )
+             end
+
+             # Preserve requested backoff and every cap on repeated host discovery.
+             scope.repo.update_all(
+               from(p in Candidate,
+                 where:
+                   p.inbox_id == ^inbox.id and
+                     p.candidate_id == ^id and p.status == :pending and not p.requested and
+                     not p.contract_blocked and p.invalid_attempts < 8 and p.rejected_attempts < 4
+               ),
+               [set: [requested: true, next_attempt_at: nil]],
+               prefix: scope.prefix,
+               log: false
+             )
+
+             :ok
+           end) do
+        {:ok, :ok} -> :ok
+        _ -> {:error, :ineligible_recheck}
+      end
     else
       _ -> {:error, :ineligible_recheck}
     end
@@ -355,10 +493,22 @@ defmodule EmailJanitor.Worker.Ledger do
         on: a.inbox_id == p.inbox_id and a.id == p.candidate_id,
         where:
           p.inbox_id == ^inbox.id and p.status == :pending and not p.requested and
-            p.invalid_attempts < 8 and p.rejected_attempts < 4 and
-            ((not is_nil(c.id) and c.thread_id == p.thread_id) or
+            p.invalid_attempts < 8 and p.rejected_attempts < 4 and not p.contract_blocked and
+            ((not is_nil(c.id) and c.thread_id == p.thread_id and
+                fragment(
+                  "? <@ COALESCE(?, ?)",
+                  p.message_ids,
+                  c.remaining_message_ids,
+                  c.message_ids
+                )) or
                (a.state == :cancelled and is_nil(a.dispatch_started_at) and
-                  a.thread_id == p.thread_id)),
+                  a.thread_id == p.thread_id and
+                  fragment(
+                    "? <@ COALESCE(?, ?)",
+                    p.message_ids,
+                    a.remaining_metadata_ids,
+                    a.message_ids
+                  ))),
         select: p.candidate_id
       )
 
@@ -367,7 +517,7 @@ defmodule EmailJanitor.Worker.Ledger do
         from(p in Candidate,
           where:
             p.inbox_id == ^inbox.id and not p.requested and p.invalid_attempts < 8 and
-              p.rejected_attempts < 4 and
+              p.rejected_attempts < 4 and not p.contract_blocked and
               p.candidate_id in subquery(candidates)
         ),
         [
@@ -388,6 +538,18 @@ defmodule EmailJanitor.Worker.Ledger do
 
   def finish_candidate(scope, inbox, candidate, result, now) do
     case result do
+      :unsupported_policy ->
+        scope.repo.update_all(
+          from(c in Candidate,
+            where:
+              c.inbox_id == ^inbox.id and
+                c.candidate_id == ^candidate.candidate_id
+          ),
+          [set: [requested: false, contract_blocked: true, next_attempt_at: nil]],
+          prefix: scope.prefix,
+          log: false
+        )
+
       status when status in [:retry, :unreadable, :invalid_decision, :model_rejected] ->
         attempts = min(candidate.attempts + 1, 16)
 
@@ -516,11 +678,11 @@ defmodule EmailJanitor.Worker.Ledger do
     source =
       cond do
         pending && pending.thread_id == candidate.thread_id ->
-          pending.message_ids
+          pending.remaining_message_ids || pending.message_ids
 
         action && action.state == :cancelled && is_nil(action.dispatch_started_at) &&
             action.thread_id == candidate.thread_id ->
-          action.message_ids
+          action.remaining_metadata_ids || action.message_ids
 
         true ->
           []

@@ -28,6 +28,9 @@ defmodule EmailJanitor.Worker do
     :invalid_activation,
     :model_rejected,
     :policy_unavailable,
+    :partial_retirement_unsupported,
+    :manual_recheck_unsupported,
+    :manual_authorization_changed,
     :gmail_unavailable,
     :unreadable_content,
     :invalid_thread_snapshot
@@ -41,6 +44,11 @@ defmodule EmailJanitor.Worker do
 
   @doc "Queue known pending and proven-unapplied candidate provenance after a host-authorized upgrade."
   def queue_backlog(scope, inbox), do: protect(fn -> Ledger.queue_backlog(scope, inbox) end)
+
+  @doc "Trusted host only: enqueue an authenticated explicit Done selection backed by a host-owned durable grant."
+  def queue_manual(scope, inbox, candidate_id, thread_id, ids, options \\ []),
+    do:
+      protect(fn -> Ledger.queue_manual(scope, inbox, candidate_id, thread_id, ids, options) end)
 
   def step(%Config{} = config) do
     if config.scope.repo.in_transaction?() do
@@ -270,6 +278,8 @@ defmodule EmailJanitor.Worker do
             ],
        do: true
 
+  defp inbox_failure?({:deferred, _, {:settlement_pending, _, _}}), do: true
+  defp inbox_failure?({:deferred, _, result}), do: inbox_failure?(result)
   defp inbox_failure?(_), do: false
 
   defp review_targets(config, checkpoint, id, snapshot, instructions, version, now) do
@@ -392,6 +402,40 @@ defmodule EmailJanitor.Worker do
       {:done, _} ->
         processed(config, checkpoint, targets, :done)
 
+      {:deferred, covering_id, _} = deferred ->
+        # A terminal covering action may own only part of this new selection.
+        # Retire only its confirmed applied IDs so the uncovered arrivals can
+        # form a fresh subset next time instead of repeating the same overlap.
+        covered =
+          case Store.get(config.scope, config.inbox.id, covering_id) do
+            %Store.Action{state: state, applied_message_ids: ids}
+            when state in [:done, :restored] and is_list(ids) ->
+              Enum.filter(targets, &(&1 in ids))
+
+            _ ->
+              []
+          end
+
+        with :existing <-
+               if(covered == [],
+                 do: :existing,
+                 else: processed(config, checkpoint, covered, :existing)
+               ) do
+          Ledger.defer(
+            config.scope,
+            config.inbox,
+            checkpoint.generation,
+            eligible.thread_id,
+            snapshot.fingerprint,
+            version,
+            eligible.message_ids -- covered,
+            :transient,
+            now
+          )
+
+          if inbox_failure?(deferred), do: deferred, else: :deferred
+        end
+
       {:blocked, reason} when reason in [:already_reserved, :action_settled] ->
         Ledger.defer(
           config.scope,
@@ -407,7 +451,8 @@ defmodule EmailJanitor.Worker do
 
         :deferred
 
-      {:error, :partial_admission_unsupported} ->
+      {:error, reason}
+      when reason in [:partial_admission_unsupported, :partial_retirement_unsupported] ->
         Ledger.defer(
           config.scope,
           config.inbox,
@@ -476,6 +521,7 @@ defmodule EmailJanitor.Worker do
         capped -> :blocked
         error == {:error, :invalid_decision} -> :invalid
         error == {:error, :model_rejected} -> :rejected
+        error == {:error, :partial_retirement_unsupported} -> :blocked
         true -> :transient
       end,
       now
@@ -488,7 +534,7 @@ defmodule EmailJanitor.Worker do
     {gmail, options} = config.gmail
 
     with :ok <- authorized(config),
-         :ok <- config.allow_recheck.(candidate.candidate_id),
+         :ok <- Config.recheck(config, candidate),
          :ok <-
            Ledger.candidate_available?(
              config.scope,
@@ -540,6 +586,11 @@ defmodule EmailJanitor.Worker do
       {:blocked, :upgrade_required} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :blocked
+
+      {:error, reason}
+      when reason in [:manual_recheck_unsupported, :manual_authorization_changed] ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :unsupported_policy, now)
+        {:deferred, reason}
 
       {:error, :not_found} ->
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
@@ -595,7 +646,7 @@ defmodule EmailJanitor.Worker do
 
     result =
       with :ok <- authorized(config),
-           :ok <- config.allow_recheck.(candidate.candidate_id),
+           :ok <- Config.recheck(config, candidate),
            :ok <-
              Ledger.authorize_candidate(
                config.scope,
@@ -626,8 +677,9 @@ defmodule EmailJanitor.Worker do
         Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
         :skipped
 
-      {:error, :partial_admission_unsupported} ->
-        Ledger.finish_candidate(config.scope, config.inbox, candidate, :done, now)
+      {:error, reason}
+      when reason in [:partial_admission_unsupported, :partial_retirement_unsupported] ->
+        Ledger.finish_candidate(config.scope, config.inbox, candidate, :unsupported_policy, now)
         :blocked
 
       {:blocked, reason} when reason not in [:already_reserved, :action_settled] ->
@@ -643,6 +695,7 @@ defmodule EmailJanitor.Worker do
   defp finish_recheck(config, _checkpoint, candidate, _snapshot, _version, now, error) do
     reason =
       case error do
+        {:error, :partial_retirement_unsupported} -> :unsupported_policy
         {:error, reason} when reason in [:invalid_decision, :model_rejected] -> reason
         _ -> :retry
       end
@@ -746,6 +799,11 @@ defmodule EmailJanitor.Worker do
   defp status({result, more}) when is_boolean(more), do: status(result)
 
   defp status({:deferred, reason}) when is_atom(reason), do: :deferred
+
+  defp status({:deferred, _, {:settlement_pending, _, _}}), do: :policy_unavailable
+
+  defp status({:deferred, _, result}),
+    do: if(inbox_failure?(result), do: status(result), else: :deferred)
 
   defp status(value)
        when value in [

@@ -1056,7 +1056,7 @@ defmodule EmailJanitor.WorkerTest do
     Agent.update(ctx.state, &%{&1 | model: :keep})
     config = %{ctx.config | policy: %Policy{adapter: __MODULE__.WholeOnlyPolicy, context: self()}}
 
-    assert {:error, :policy_unavailable} =
+    assert {:error, :partial_retirement_unsupported} =
              EmailJanitor.Executor.review(
                ctx.scope,
                ctx.box,
@@ -1078,6 +1078,369 @@ defmodule EmailJanitor.WorkerTest do
 
     assert remaining == ids
     assert read(ctx.state).mutations == []
+  end
+
+  test "unsupported partial retirement pauses arrival work instead of retrying its classifier",
+       ctx do
+    two = [Fixtures.message(), Fixtures.message(id: "message-2")]
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: two,
+          arrivals: %{"100" => %{through: "101", ids: ["message-1", "message-2"]}}
+      }
+    )
+
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+
+    Agent.update(ctx.state, fn state ->
+      messages = [
+        Fixtures.message(labels: ["UNREAD"]),
+        Fixtures.message(id: "message-2"),
+        Fixtures.message(id: "message-3")
+      ]
+
+      %{
+        state
+        | messages: messages,
+          model: :keep,
+          revision: "revision-2",
+          arrivals: %{"101" => %{through: "102", ids: ["message-3"]}}
+      }
+    end)
+
+    owner = self()
+
+    config = %{
+      ctx.config
+      | report: &send(owner, {:report, &1}),
+        policy: %Policy{adapter: __MODULE__.WholeOnlyPolicy, context: owner}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert_received {:report, :partial_retirement_unsupported}
+    assert [%Deferral{status: :blocked}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
+    before = read(ctx.state)
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert read(ctx.state).model_inputs == before.model_inputs
+
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) ==
+             Enum.count(before.calls, &(&1 == :full_thread))
+
+    refute_received {:legacy_whole_retired, _}
+
+    assert [%{remaining_message_ids: ["message-1", "message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    assert {:ok, [%{message_id: "message-3"}]} = pending(ctx)
+  end
+
+  test "manual prebaseline upgrade work requires an explicit scoped grant and retains old siblings",
+       ctx do
+    id = manual_candidate(ctx)
+    assert Repo.all(Candidate, prefix: ctx.scope.prefix) == []
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+    assert {:ok, []} = pending(ctx)
+    owner = self()
+
+    config = %{
+      ctx.config
+      | allow_manual_recheck: fn authority, ids ->
+          send(owner, {:manual_proof, authority, ids})
+          :ok
+        end
+    }
+
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert_received {:manual_proof, ^id, ["message-1"]}
+    assert read(ctx.state).mutations == [["message-1"]]
+    [first, second] = read(ctx.state).messages
+    assert first.labels == ["UNREAD", "IMPORTANT"]
+    assert "INBOX" in second.labels
+    assert {:ok, []} = pending(ctx)
+  end
+
+  test "manual grant absence and partial revocation fail closed before reading message bodies",
+       ctx do
+    id = manual_candidate(ctx)
+
+    assert :ok =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1", "message-2"])
+
+    before = read(ctx.state)
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+
+    assert [%Candidate{contract_blocked: true, requested: false}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx.state).calls == before.calls ++ [{:history, "100"}]
+    assert read(ctx.state).model_inputs == before.model_inputs
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+    owner = self()
+
+    config = %{
+      ctx.config
+      | allow_manual_recheck: fn authority, ids ->
+          send(owner, {:grant_ids, authority, ids})
+          if Enum.all?(ids, &(&1 == "message-2")), do: :ok, else: {:error, :withdrawn}
+        end
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert_received {:grant_ids, ^id, ["message-1", "message-2"]}
+    assert read(ctx.state).model_inputs == before.model_inputs
+    assert read(ctx.state).mutations == []
+    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-2"])
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert read(ctx.state).mutations == [["message-2"]]
+  end
+
+  test "manual authority is checked again inside final admission after classification", ctx do
+    id = manual_candidate(ctx)
+    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+    grant = start_supervised!({Agent, fn -> true end}, id: :manual_grant)
+
+    config = %{
+      ctx.config
+      | classifier:
+          {Classifier,
+           [state: ctx.state, after_model: fn -> Agent.update(grant, fn _ -> false end) end]},
+        allow_manual_recheck: fn _, _ ->
+          if Agent.get(grant, & &1), do: :ok, else: {:error, :withdrawn}
+        end
+    }
+
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+    reservations = read(ctx.quota).calls
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert read(ctx.quota).calls == reservations
+    assert read(ctx.state).mutations == []
+    assert Repo.all(Action, prefix: ctx.scope.prefix) == []
+  end
+
+  test "manual queuing validates scope, exact pending IDs and stable authority without reviving retries",
+       ctx do
+    id = manual_candidate(ctx)
+    authority = Ecto.UUID.generate()
+
+    assert {:error, :ineligible_recheck} =
+             Worker.queue_manual(ctx.scope, ctx.box, Ecto.UUID.generate(), "thread-1", [
+               "message-1"
+             ])
+
+    assert {:error, :ineligible_recheck} =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "wrong-thread", ["message-1"])
+
+    assert {:error, :ineligible_recheck} =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["unrelated-id"])
+
+    wrong_box = %{ctx.box | address: "somebody@else.example"}
+
+    assert {:error, :ineligible_recheck} =
+             Worker.queue_manual(ctx.scope, wrong_box, id, "thread-1", ["message-1"])
+
+    assert :ok =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"],
+               authority_id: authority
+             )
+
+    config = %{ctx.config | allow_manual_recheck: fn ^authority, ["message-1"] -> :ok end}
+    Agent.update(ctx.state, &%{&1 | model: :error})
+    assert {:ok, %{status: :model_unavailable}} = Worker.step(config)
+    [before] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert :ok =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"],
+               authority_id: authority
+             )
+
+    assert [^before] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+
+    assert {:error, :ineligible_recheck} =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+
+    Repo.update!(Ecto.Changeset.change(before, requested: false, invalid_attempts: 8),
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok =
+             Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"],
+               authority_id: authority
+             )
+
+    assert [%Candidate{requested: false, invalid_attempts: 8}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+
+    assert [%Candidate{requested: true, invalid_attempts: 0}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "a manual cancelled action carries original authority across reconnect and fresh admission",
+       ctx do
+    id = manual_candidate(ctx)
+    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+    owner = self()
+
+    config = %{
+      ctx.config
+      | allow_manual_recheck: fn authority, ids ->
+          send(owner, {:manual_proof, authority, ids})
+          :ok
+        end
+    }
+
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+
+    Agent.update(
+      ctx.quota,
+      &Map.put(&1, :reserve_hook, fn ->
+        Repo.update_all(EmailJanitor.Store.Mailbox, [inc: [instruction_version: 1]],
+          prefix: ctx.scope.prefix,
+          log: false
+        )
+      end)
+    )
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Action{state: :cancelled, dispatch_started_at: nil, id: cancelled_id}] =
+             Repo.all(Action, prefix: ctx.scope.prefix)
+
+    assert %Candidate{source_kind: :manual, authority_id: ^id} =
+             Repo.get_by!(Candidate, [candidate_id: cancelled_id], prefix: ctx.scope.prefix)
+
+    assert {:ok, previous} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+
+    assert {:ok, _} =
+             Ingestion.reconnect(ctx.scope, ctx.box, previous.generation, %{
+               history_id: "500",
+               expires_at: DateTime.add(DateTime.utc_now(), 604_800)
+             })
+
+    Agent.update(ctx.quota, &Map.delete(&1, :reserve_hook))
+    assert {:ok, _} = Worker.queue_backlog(ctx.scope, ctx.box)
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :done}} = Worker.step(config)
+    assert_received {:manual_proof, ^id, ["message-1"]}
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "unsupported manual partial retirement remains paused across ordinary upgrade discovery",
+       ctx do
+    id = manual_candidate(ctx)
+    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+    Agent.update(ctx.state, &%{&1 | model: :keep})
+    owner = self()
+
+    config = %{
+      ctx.config
+      | allow_manual_recheck: fn _, _ -> :ok end,
+        policy: %Policy{adapter: __MODULE__.WholeOnlyPolicy, context: owner}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{contract_blocked: true, requested: false}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+    assert :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"])
+    before = read(ctx.state)
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :idle}} = Worker.step(config)
+    assert read(ctx.state).model_inputs == before.model_inputs
+    refute_received {:legacy_whole_retired, _}
+
+    assert [%{remaining_message_ids: ["message-1", "message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+
+    assert [%Candidate{contract_blocked: false, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "a settled covering action retires only its confirmed arrival IDs so uncovered work progresses",
+       ctx do
+    assert {:ok, proposal} =
+             EmailJanitor.Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               ctx.config.gmail,
+               ctx.config.classifier,
+               "Synthetic instructions",
+               1,
+               cleanup_target_ids: ["message-1"]
+             )
+
+    assert {:done, _} =
+             EmailJanitor.Executor.execute(ctx.scope, ctx.box, proposal, ctx.config.gmail,
+               policy: ctx.config.policy
+             )
+
+    # Simulate an external label move; a new history batch still includes B.
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [Fixtures.message(), Fixtures.message(id: "message-2")],
+          arrivals: %{"100" => %{through: "101", ids: ["message-1", "message-2"]}}
+      }
+    )
+
+    Agent.update(ctx.quota, &%{&1 | failures: 10})
+    assert {:ok, %{status: :policy_unavailable}} = Worker.step(ctx.config)
+    assert {:ok, [%{message_id: "message-2"}]} = pending(ctx)
+    assert read(ctx.state).mutations == [["message-1"]]
+    Agent.update(ctx.quota, &%{&1 | failures: 0})
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :done}} = Worker.step(ctx.config)
+    assert read(ctx.state).mutations == [["message-1"], ["message-2"]]
+    assert {:ok, []} = pending(ctx)
+    [covered, new] = read(ctx.state).messages
+    assert "INBOX" in covered.labels
+    refute "INBOX" in new.labels
+  end
+
+  defp manual_candidate(ctx) do
+    Agent.update(
+      ctx.state,
+      &%{&1 | arrivals: %{}, messages: [Fixtures.message(), Fixtures.message(id: "message-2")]}
+    )
+
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+
+    assert {:ok, proposal} =
+             EmailJanitor.Executor.review(
+               ctx.scope,
+               ctx.box,
+               "thread-1",
+               ctx.config.gmail,
+               ctx.config.classifier,
+               "Synthetic instructions",
+               1,
+               policy: ctx.config.policy,
+               cleanup_target_ids: ["message-1", "message-2"]
+             )
+
+    assert {:blocked, :cap} =
+             EmailJanitor.Executor.execute(ctx.scope, ctx.box, proposal, ctx.config.gmail,
+               policy: ctx.config.policy
+             )
+
+    Repo.one!(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix).id
   end
 
   defp await_blocked(_backend, 0),

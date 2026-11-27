@@ -34,7 +34,8 @@ defmodule EmailJanitor.Worker.Gate do
           proposal,
           generation,
           now,
-          Map.has_key?(context, :source)
+          Map.has_key?(context, :source),
+          Map.get(context, :source)
         )
       end
 
@@ -45,7 +46,7 @@ defmodule EmailJanitor.Worker.Gate do
   end
 
   defp proof(%{config: config, source: source, proposal: proposal, generation: generation}) do
-    with :ok <- config.allow_recheck.(source.candidate_id),
+    with :ok <- EmailJanitor.Worker.Config.recheck(config, source),
          do: Ledger.authorize_candidate(config.scope, config.inbox, source, proposal, generation)
   end
 

@@ -12,6 +12,10 @@ defmodule EmailJanitor.Worker.Config do
   provenance. Transient errors leave that request retryable. The host requeues
   backlog after upgrade. `self_mail` verifies headers against scoped successful
   outgoing-mail evidence, never merely a sender/domain match.
+  `allow_manual_recheck(authority_id, all_source_ids)` verifies every source ID
+  against a host-owned authenticated grant, current Google identity and current
+  paid/unlimited access; it runs before reading bodies and inside admission.
+  It defaults to failure and must never infer authority from core candidates.
   """
   alias EmailJanitor.{Inbox, Policy, Store.Scope}
   @enforce_keys [:scope, :inbox, :gmail, :classifier, :preferences, :authorize, :topic]
@@ -24,6 +28,7 @@ defmodule EmailJanitor.Worker.Config do
                 lifecycle: :resume,
                 on_baseline: nil,
                 allow_recheck: nil,
+                allow_manual_recheck: nil,
                 self_mail: nil
               ]
 
@@ -39,6 +44,10 @@ defmodule EmailJanitor.Worker.Config do
          clock when is_function(clock, 0) <- Keyword.get(opts, :clock, &DateTime.utc_now/0),
          self_mail when is_function(self_mail, 1) <-
            Keyword.get(opts, :self_mail, fn _ -> {:ok, false} end),
+         manual when is_function(manual, 2) <-
+           Keyword.get(opts, :allow_manual_recheck, fn _, _ ->
+             {:error, :manual_recheck_unsupported}
+           end),
          recheck when is_function(recheck, 1) <-
            Keyword.get(opts, :allow_recheck, fn _ -> :ok end),
          callback when is_function(callback, 1) <-
@@ -61,6 +70,7 @@ defmodule EmailJanitor.Worker.Config do
          lifecycle: lifecycle,
          on_baseline: callback,
          allow_recheck: recheck,
+         allow_manual_recheck: manual,
          self_mail: self_mail
        }}
     else
@@ -69,4 +79,28 @@ defmodule EmailJanitor.Worker.Config do
   end
 
   def new(_, _, _), do: {:error, :invalid_worker_config}
+
+  @doc false
+  def recheck(config, %{source_kind: :manual, authority_id: authority, message_ids: ids}) do
+    case config.allow_manual_recheck.(authority, ids) do
+      :ok ->
+        :ok
+
+      {:blocked, :upgrade_required} = blocked ->
+        blocked
+
+      {:error, reason} = error
+      when reason in [:policy_unavailable, :connection_changed, :manual_recheck_unsupported] ->
+        error
+
+      _ ->
+        {:error, :manual_authorization_changed}
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  catch
+    _, _ -> {:error, :policy_unavailable}
+  end
+
+  def recheck(config, source), do: config.allow_recheck.(source.candidate_id)
 end

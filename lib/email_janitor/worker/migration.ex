@@ -51,8 +51,11 @@ defmodule EmailJanitor.Worker.Migration do
       add(:generation, :uuid, null: false)
       add(:thread_id, :text, null: false)
       add(:message_ids, {:array, :text}, null: false)
+      add(:source_kind, :text, null: false, default: "arrival")
+      add(:authority_id, :uuid)
       add(:status, :text, null: false, default: "pending")
       add(:requested, :boolean, null: false, default: false)
+      add(:contract_blocked, :boolean, null: false, default: false)
       add(:attempts, :integer, null: false, default: 0)
       add(:invalid_attempts, :integer, null: false, default: 0)
       add(:rejected_attempts, :integer, null: false, default: 0)
@@ -63,7 +66,7 @@ defmodule EmailJanitor.Worker.Migration do
     create(
       constraint(:janitor_worker_candidates, :worker_candidate_status,
         check:
-          "status IN ('pending', 'retired') AND attempts >= 0 AND invalid_attempts >= 0 AND rejected_attempts >= 0"
+          "status IN ('pending', 'retired') AND attempts >= 0 AND invalid_attempts >= 0 AND rejected_attempts >= 0 AND ((source_kind = 'arrival' AND authority_id IS NULL) OR (source_kind = 'manual' AND authority_id IS NOT NULL))"
       )
     )
 
@@ -140,9 +143,12 @@ defmodule EmailJanitor.Worker.Candidate do
     field(:candidate_id, Ecto.UUID, primary_key: true)
     field(:generation, Ecto.UUID)
     field(:thread_id, :string)
+    field(:source_kind, Ecto.Enum, values: [:arrival, :manual], default: :arrival)
+    field(:authority_id, Ecto.UUID)
     field(:message_ids, {:array, :string})
     field(:status, Ecto.Enum, values: [:pending, :retired], default: :pending)
     field(:requested, :boolean, default: false)
+    field(:contract_blocked, :boolean, default: false)
     field(:attempts, :integer, default: 0)
     field(:invalid_attempts, :integer, default: 0)
     field(:rejected_attempts, :integer, default: 0)

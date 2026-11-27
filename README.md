@@ -436,8 +436,8 @@ model output stops automatic candidate retries after eight consecutive invalid a
 provenance for an explicit requeue. Unsupported policy contracts stay pending and
 probe only revision metadata until content/instruction versions change; hosts must
 bump the mailbox version when correcting a policy/configuration incompatibility.
-Request-specific400/413/422 model rejections defer only that conversation;
-authentication,429,5xx, quota/policy and transport outages preserve inbox-wide backoff.
+Request-specific 400/413/422 model rejections defer only that conversation;
+authentication, 429, 5xx, quota/policy and transport outages preserve inbox-wide backoff.
 Four distinct rejected/invalid conversations without a successful classification
 trip inbox backoff too, bounding misconfiguration-induced400 bursts. Four repeated
 rejections for unchanged content switch to metadata-only probes; candidate caps
@@ -462,6 +462,21 @@ for current paid/unlimited access; `{:blocked, :upgrade_required}` leaves
 provenance intact without repeatedly classifying unpaid requests. Requeue known
 backlog after an upgrade. Previously identified candidates can be rechecked after
 an explicit reconnect without making unknown pre-baseline mail eligible.
+`Worker.queue_manual(scope, inbox, candidate_uuid, thread_id, exact_ids,
+ authority_id: original_grant_uuid)` is a trusted host-only bridge for explicit
+chat selections that predate the arrival baseline. The host must first verify
+its durable authenticated manual-selection grant and current paid/unlimited
+access. This API only binds existing scoped pending/cancelled-no-dispatch core
+metadata; it never grants arbitrary archives or creates arrival records. The
+host supplies `allow_manual_recheck(authority_uuid, all_source_ids)`, which
+defaults to failure. It must verify every ID against active original grants,
+current account identity and authorization, both before message fetch and at
+admission. Original authority survives fresh actions and deliberate reconnect;
+partial withdrawal must reject a source containing any withdrawn ID. Repeated
+discovery preserves retry deadlines and caps. A missing exact partial-retirement
+capability pauses the affected candidate until explicit repair/recheck, without
+repeated classifier calls or fallback to a whole-candidate withdrawal.
+
 ## Google workload token helper
 
 The isolated `google-auth-bridge` Nix package uses Google’s official Node SDK
