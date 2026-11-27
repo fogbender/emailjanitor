@@ -87,6 +87,48 @@ defmodule EmailJanitor.DigestStagingTest do
 
   defp rows(ctx, schema), do: TestRepo.all(schema, prefix: ctx.scope.prefix)
 
+  test "opaque SDK message IDs survive guarded cleanup admission and durable confirmation", ctx do
+    id = "message-1_opaque"
+    messages = [message(id: id, from: "sender@example.com")]
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    ctx = %{
+      ctx
+      | proposal: proposal,
+        headers: %{id => %{sender: "sender@example.com", subject: "Opaque ID"}}
+    }
+
+    assert {:settlement_pending, action, :done} = execute(ctx)
+    assert :ok = Digest.confirm_staged(ctx.scope, ctx.inbox.id, action)
+    assert [%Activity{message_id: ^id}] = rows(ctx, Activity)
+
+    for invalid <- ["bad/id", "id\r\n", String.duplicate("a", 201)] do
+      assert {:error, :invalid_digest_event} =
+               Event.new(
+                 action,
+                 invalid,
+                 :done,
+                 "sender@example.com",
+                 "Subject",
+                 DateTime.utc_now()
+               )
+    end
+
+    assert {:ok, _} =
+             Event.new(
+               action,
+               String.duplicate("a", 200),
+               :done,
+               "sender@example.com",
+               "Subject",
+               DateTime.utc_now()
+             )
+  end
+
   test "crash-safe metadata survives failed settlement and retry needs no headers or Gmail",
        ctx do
     assert {:settlement_pending, action_id, :done} = execute(ctx)

@@ -25,8 +25,10 @@ config :tzdata, :autoupdate, :disabled
 
 `Event.new(action_or_candidate_uuid, gmail_message_id, :done | :would_have_done,
 sender_header, subject, occurred_at)` validates a stable typed source ID, exact
-Gmail ID, the first parsed sender address and bounded UTF-8 subject. Multiple
-addresses in the From header are accepted like the cleanup identity parser. It stores only
+Gmail ID, the first parsed sender address and bounded UTF-8 subject. The message
+ID uses the shared Gmail parser's opaque-ID validation, so admission and metadata
+settlement accept exactly the same provider IDs. Multiple addresses in the From
+header are accepted like the cleanup identity parser. It stores only
 minimal sender/subject metadata, never a thread, body, reply or rendered email.
 `Digest.record(scope, inbox_id, event)` is idempotent and transaction-compatible.
 It does not require a schedule: an unavailable browser timezone or delayed
