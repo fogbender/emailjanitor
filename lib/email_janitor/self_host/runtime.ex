@@ -4,20 +4,38 @@ defmodule EmailJanitor.SelfHost.Runtime do
   alias EmailJanitor.Gmail.Ingestion
   alias EmailJanitor.SelfHost.{ActivityPolicy, Adapters, Authority, Binding, Store}
 
-  def ready? do
+  def ready?(config) do
     worker = EmailJanitor.Worker.Config
 
     modules = [
       {EmailJanitor.Worker.Server, :start_link, 1},
       {EmailJanitor.Conversation, :respond, 3},
       {EmailJanitor.Restore, :apply, 7},
-      {Digest, :withdraw_pending, 3}
+      {Digest, :withdraw_pending, 3},
+      {EmailJanitor.Mail.Feedback, :accept, 3},
+      {EmailJanitor.Mail.Feedback, :tick, 1}
     ]
 
-    Code.ensure_loaded?(worker) and Map.has_key?(struct(worker), :policy_for_messages) and
+    runtime_configured?(config) and Code.ensure_loaded?(worker) and
+      Map.has_key?(struct(worker), :policy_for_messages) and
       Enum.all?(modules, fn {module, function, arity} ->
         Code.ensure_loaded?(module) and function_exported?(module, function, arity)
       end)
+  end
+
+  defp runtime_configured?(config) do
+    with true <- not is_nil(config.google_oauth),
+         path when is_binary(path) <- config.reply_parser_executable,
+         {:ok, %{type: :regular, mode: mode}} <- File.stat(path),
+         true <- Bitwise.band(mode, 0o111) != 0,
+         {:ok, _} <- Adapters.mail(config),
+         {:ok, _} <- Adapters.pubsub(config) do
+      true
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
   end
 
   def respond(owner, inbox, conversation, request, %Content{} = message) do

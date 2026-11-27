@@ -29,6 +29,11 @@ in {
       default = "/run/secrets/emailjanitor/google-client.json";
       description = "Runtime Google Web OAuth client JSON with the exact public /auth/google/callback redirect.";
     };
+    publicHostname = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "[a-z0-9]([a-z0-9.-]*[a-z0-9])?");
+      default = null;
+      description = "Public HTTPS hostname for the reference Nginx/ACME proxy. Null leaves web access closed for the SSH pilot; no DNS or cloud firewall is changed by this option.";
+    };
     bedrockModelId = lib.mkOption {
       type = lib.types.str;
       default = "amazon.nova-micro-v1:0";
@@ -51,6 +56,28 @@ in {
       ensureDatabases = [ "emailjanitor" ];
       ensureUsers = [{ name = "emailjanitor"; ensureDBOwnership = true; }];
     };
+    services.nginx = lib.mkIf (cfg.publicHostname != null) {
+      enable = true;
+      virtualHosts.${cfg.publicHostname} = {
+        forceSSL = true;
+        enableACME = true;
+        locations."/".extraConfig = ''
+          proxy_pass http://127.0.0.1:4000;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          # Replace attacker-supplied values; the app trusts this header only
+          # from its loopback proxy. Never append a forwarded chain.
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For "";
+          proxy_set_header Forwarded "";
+          proxy_set_header Connection "";
+          proxy_read_timeout 120s;
+        '';
+      };
+    };
+    security.acme.acceptTerms = lib.mkIf (cfg.publicHostname != null) true;
+    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.publicHostname != null) [ 80 443 ];
     systemd.services.emailjanitor = {
       description = "Single-user Email Janitor";
       wantedBy = [ "multi-user.target" ];
@@ -62,6 +89,7 @@ in {
         JANITOR_DATABASE_NAME = "emailjanitor";
         JANITOR_DATABASE_USER = "emailjanitor";
         JANITOR_ENABLE_SELF_HOST = "1";
+        JANITOR_WEB_PORT = "4000";
         JANITOR_CREDENTIAL_KEY_FILE = "%d/credential-key";
         JANITOR_SECRET_KEY_BASE_FILE = "%d/web-secret";
         JANITOR_GOOGLE_CLIENT_JSON_FILE = "%d/google-client.json";

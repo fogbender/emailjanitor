@@ -1,3 +1,10 @@
+defmodule EmailJanitor.SelfHostSyntheticHoldPolicy do
+  @behaviour EmailJanitor.Policy
+  def reserve(_, _, _, _, _), do: {:blocked, :synthetic_hold}
+  def settle(_, _, _, _), do: :ok
+  def retire_candidate(_, _, _, _), do: :ok
+end
+
 defmodule EmailJanitor.SelfHostAdaptersTest do
   use ExUnit.Case, async: false
   import EmailJanitor.Fixtures
@@ -40,6 +47,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       EmailJanitor.Mail.Store.install(scope)
       Digest.install(scope)
       EmailJanitor.Gmail.Ingestion.install(scope)
+      EmailJanitor.Worker.install(scope)
       Digest.install_staging(scope)
       HostStore.install(scope)
       Ecto.Migrator.up(Repo, 102, SelfHost.AuthorityMigration, prefix: scope.prefix, log: false)
@@ -241,5 +249,83 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     }
 
     assert {:error, :transport_unavailable} = SelfHost.Transport.install(changed)
+  end
+
+  test "exact partial retirement preserves the remaining arrival candidate's executable proof",
+       ctx do
+    alias EmailJanitor.Gmail.Ingestion
+    alias EmailJanitor.Worker.{Candidate, Ledger}
+
+    {:ok, checkpoint} =
+      Ingestion.baseline(ctx.scope, ctx.box, %{
+        history_id: "100",
+        expires_at: DateTime.add(DateTime.utc_now(), 3600)
+      })
+
+    messages = [
+      message(id: "m1", from: "sender@vendor.com"),
+      message(id: "m2", from: "sender@vendor.com")
+    ]
+
+    {:ok, proposal} = proposal(messages, ctx)
+    hold = %EmailJanitor.Policy{adapter: EmailJanitor.SelfHostSyntheticHoldPolicy, context: nil}
+
+    assert {:ok, {:blocked, :synthetic_hold}} =
+             CoreStore.intent(ctx.scope, ctx.box.id, proposal, "100", policy: hold)
+
+    pending = Repo.one!(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    :ok =
+      Ledger.record_candidate(
+        ctx.scope,
+        ctx.box,
+        pending.id,
+        proposal,
+        checkpoint.generation,
+        DateTime.utc_now(),
+        true
+      )
+
+    policy = ActivityPolicy.settlement(ctx.ref, ctx.box)
+
+    assert {:ok, :retired} =
+             CoreStore.retire_ineligible(
+               ctx.scope,
+               ctx.box.id,
+               proposal.thread_id,
+               1,
+               DateTime.add(DateTime.utc_now(), 1),
+               policy: policy,
+               evaluated_message_ids: ["m1"],
+               inbox_message_ids: ["m1", "m2"]
+             )
+
+    assert Repo.get!(EmailJanitor.Store.Candidate, pending.id, prefix: ctx.scope.prefix).remaining_message_ids ==
+             ["m2"]
+
+    source =
+      Repo.get_by!(Candidate, [inbox_id: ctx.box.id, candidate_id: pending.id],
+        prefix: ctx.scope.prefix
+      )
+
+    assert source.message_ids == ["m2"]
+    assert source.status == :pending and source.source_kind == :arrival
+    assert :ok = Ledger.candidate_available?(ctx.scope, ctx.box, source, checkpoint.generation)
+    {:ok, fresh} = proposal([List.last(messages)], ctx)
+
+    assert :ok =
+             Ledger.authorize_candidate(ctx.scope, ctx.box, source, fresh, checkpoint.generation)
+
+    # Gate double-forwarding is idempotent and cannot reintroduce the removed ID.
+    assert {:ok, :ok} =
+             Repo.transaction(fn ->
+               ActivityPolicy.retire_candidate_messages(policy.context, ctx.box.id, pending.id, [
+                 "m1"
+               ])
+             end)
+
+    assert Repo.get_by!(Candidate, [inbox_id: ctx.box.id, candidate_id: pending.id],
+             prefix: ctx.scope.prefix
+           ).message_ids == ["m2"]
   end
 end

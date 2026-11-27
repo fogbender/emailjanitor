@@ -11,7 +11,7 @@ defmodule EmailJanitor.SelfHost.Supervisor do
   def init(config) do
     web = EmailJanitor.SelfHost.Web
 
-    if Runtime.ready?() and (not config.enable_web or Code.ensure_loaded?(web)) do
+    if Runtime.ready?(config) and (not config.enable_web or Code.ensure_loaded?(web)) do
       Application.put_env(:email_janitor, :self_host_config, config)
       children = [{Repo, config.database}, {SelfHost.Services, config}]
       children = if config.enable_web, do: children ++ [{web, config}], else: children

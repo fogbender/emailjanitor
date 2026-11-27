@@ -79,7 +79,21 @@ defmodule EmailJanitor.SelfHost.ActivityPolicy do
   def settle(_context, inbox, action, _result),
     do: Digest.confirm_staged(SelfHost.scope(), inbox, action)
 
-  def retire_candidate(_, _, _, _), do: :ok
+  # Restore calls this base policy outside Worker.Gate. Keep its provenance IDs
+  # synchronized under the core caller's existing mailbox transaction. The
+  # Gate's second forwarding is intentionally harmless and never widens IDs.
+  def retire_candidate(context, inbox, candidate, ids),
+    do: retire_candidate_messages(context, inbox, candidate, ids)
+
+  def retire_candidate_messages(context, inbox, candidate, ids) do
+    scope = SelfHost.scope()
+
+    if context.inbox.id == inbox and scope.repo.in_transaction?() do
+      EmailJanitor.Worker.Ledger.retire_candidate(scope, context.inbox, candidate, ids)
+    else
+      {:error, :policy_unavailable}
+    end
+  end
 
   defp header(headers, name),
     do:

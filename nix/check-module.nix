@@ -48,6 +48,10 @@ let
     }; }];
   };
   tokenService = tokenHost.config.systemd.services.emailjanitor-google-token;
+  webHost = host.extendModules {
+    modules = [{ services.emailjanitor.publicHostname = "janitor.example.com"; }];
+  };
+  proxy = webHost.config.services.nginx.virtualHosts."janitor.example.com";
 in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/environment";
    assert host.config.services.emailjanitor.package.drvPath == outputs.packages.x86_64-linux.emailjanitor.drvPath;
    assert differentHost.pkgs.coreutils.drvPath != pkgs.coreutils.drvPath;
@@ -71,6 +75,11 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert tokenService.serviceConfig.RuntimeDirectoryPreserve == "yes";
    assert builtins.elem "-/run/credentials" tokenService.serviceConfig.InaccessiblePaths;
    assert tokenHost.config.systemd.timers.emailjanitor-google-token.timerConfig.OnUnitActiveSec == "60s";
+   assert proxy.forceSSL && proxy.enableACME;
+   assert pkgs.lib.hasInfix "proxy_set_header X-Real-IP $remote_addr;" proxy.locations."/".extraConfig;
+   assert !(pkgs.lib.hasInfix "$http_x_real_ip" proxy.locations."/".extraConfig);
+   assert builtins.elem 443 webHost.config.networking.firewall.allowedTCPPorts;
+   assert builtins.all (a: a.assertion) webHost.config.assertions;
    assert service.serviceConfig.RuntimeDirectoryMode == "0700";
    assert host.config.services.postgresql.enableTCPIP == false;
    assert host.config.services.postgresql.settings.listen_addresses == "";
@@ -83,4 +92,5 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
      postgres = host.config.systemd.units."postgresql.service".text;
      token = tokenHost.config.systemd.units."emailjanitor-google-token.service".text;
      tokenTimer = tokenHost.config.systemd.units."emailjanitor-google-token.timer".text;
+     nginx = webHost.config.systemd.units."nginx.service".text;
    } { valid = true; unit = service.serviceConfig.ExecStart; }
