@@ -209,7 +209,6 @@ defmodule EmailJanitor.SelfHost.Email do
          {:ok, request} <- Ecto.UUID.cast(request),
          %Receipt{completed: true} = receipt <-
            Ledger.get(SelfHost.scope(), id, conversation, request),
-         true <- reconstructible?(receipt),
          {:ok, snapshot} <- Preferences.snapshot(SelfHost.scope(), id) do
       {:ok, Outcome.render(receipt, snapshot)}
     else
@@ -222,14 +221,6 @@ defmodule EmailJanitor.SelfHost.Email do
   rescue
     _ -> {:error, :feedback_answer_unavailable}
   end
-
-  # Read-only model prose is intentionally transient. Effect/preference receipts
-  # can be rendered again, but an answer with no such effects cannot be recovered.
-  defp reconstructible?(%Receipt{operation: operation}) when operation in [:done, :restore],
-    do: true
-
-  defp reconstructible?(%Receipt{preference_target: target, preference_status: status}),
-    do: target in [:all, :inbox] and status in [:updated, :unchanged, :failed]
 
   defp current_ref(id) do
     with {:ok, refs} <- Store.refs(),

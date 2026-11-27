@@ -1244,7 +1244,7 @@ defmodule EmailJanitor.ConversationTest do
     end
 
     assert {:ok, reply} = Conversation.respond(%{ctx | guard: guard}, id, Content.new("Retry."))
-    assert Content.read(reply) == "No email or instruction changes were made."
+    assert Content.read(reply) =~ "could not recover that conversational answer"
     assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id).completed
     assert Agent.get(t.state, & &1.calls) == []
   end
@@ -1632,5 +1632,39 @@ defmodule EmailJanitor.ConversationTest do
     assert {:ok, restored} = Conversation.respond(second, id, Content.new("Retry."))
     assert Content.read(restored) =~ "returned 1 email"
     assert Agent.get(t.state, & &1.calls) == [["message-1"], {:restore, ["message-1"]}]
+  end
+
+  test "retry after a completed read-only receipt asks to resend instead of inventing the lost answer",
+       t do
+    observer = self()
+
+    script = fn _, _, _ ->
+      send(observer, :read_only_model_called)
+
+      {:ok,
+       %Plan{
+         operation: :answer,
+         references: [],
+         preference_target: :none,
+         instruction: Content.new(""),
+         query: Content.new(""),
+         reply: Content.new("PRIVATE_UNRETAINED_ANSWER"),
+         search_complete: true
+       }}
+    end
+
+    ctx = %{t.ctx | model: [script: script]}
+    id = Ecto.UUID.generate()
+    assert {:ok, first} = Conversation.respond(ctx, id, Content.new("How does Janitor work?"))
+    assert Content.read(first) == "PRIVATE_UNRETAINED_ANSWER"
+    assert_receive :read_only_model_called
+    assert {:ok, retry} = Conversation.respond(ctx, id, Content.new("retry"))
+    assert Content.read(retry) =~ "could not recover that conversational answer"
+    refute Content.read(retry) =~ "No email or instruction changes"
+    refute_receive :read_only_model_called
+    receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, id)
+    assert receipt.completed
+    refute inspect(receipt) =~ "PRIVATE_UNRETAINED_ANSWER"
+    assert Agent.get(t.state, & &1.calls) == []
   end
 end

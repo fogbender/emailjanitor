@@ -9,6 +9,22 @@ defmodule EmailJanitor.Conversation.Outcome do
       else: Content.new("I could not verify this request's inbox context.")
   end
 
+  # Answers are transient. This path is used both by an outgoing reply retry
+  # and by a repeated workflow whose result receipt was saved before its reply.
+  defp verified(
+         %Receipt{
+           completed: true,
+           operation: :answer,
+           preference_target: :none,
+           preference_status: :none
+         },
+         _snapshot
+       ) do
+    Content.new(
+      "I could not recover that conversational answer. Please reply again with the sender or subject and what you need."
+    )
+  end
+
   defp verified(receipt, snapshot) do
     preferences = preference(receipt, snapshot)
     results = receipt.results
