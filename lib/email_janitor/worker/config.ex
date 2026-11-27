@@ -2,6 +2,10 @@ defmodule EmailJanitor.Worker.Config do
   @moduledoc """
   Trusted host-owned per-inbox worker dependencies. No ambient active account.
 
+  `policy_for_messages` optionally derives {:ok, Policy} from fresh transient
+  messages. Keep only needed ID/sender/subject metadata; do not retain bodies.
+  The derived policy is used for Keep retirement, admission and settlement;
+  durable recovery uses the base `policy` without fetching message content.
   `preferences` returns {:ok, redacted_instruction_content, mailbox_version}.
   `authorize` is bounded database-only work: it also runs inside policy admission.
   The host must bump that mailbox version atomically on disconnect/binding changes
@@ -23,6 +27,7 @@ defmodule EmailJanitor.Worker.Config do
   defstruct @enforce_keys ++
               [
                 policy: nil,
+                policy_for_messages: nil,
                 report: nil,
                 clock: nil,
                 lifecycle: :resume,
@@ -40,6 +45,8 @@ defmodule EmailJanitor.Worker.Config do
          authorize when is_function(authorize, 0) <- opts[:authorize],
          topic when is_binary(topic) and byte_size(topic) in 1..512 <- opts[:topic],
          %Policy{} = policy <- Keyword.get(opts, :policy, Policy.unlimited()),
+         factory = Keyword.get(opts, :policy_for_messages),
+         true <- is_nil(factory) or is_function(factory, 1),
          report when is_function(report, 1) <- Keyword.get(opts, :report, fn _ -> :ok end),
          clock when is_function(clock, 0) <- Keyword.get(opts, :clock, &DateTime.utc_now/0),
          self_mail when is_function(self_mail, 1) <-
@@ -65,6 +72,7 @@ defmodule EmailJanitor.Worker.Config do
          authorize: authorize,
          topic: topic,
          policy: policy,
+         policy_for_messages: factory,
          report: report,
          clock: clock,
          lifecycle: lifecycle,
@@ -79,6 +87,24 @@ defmodule EmailJanitor.Worker.Config do
   end
 
   def new(_, _, _), do: {:error, :invalid_worker_config}
+
+  @doc "Derive a transient host policy from already fetched messages, without altering other capabilities."
+  def with_message_policy(config, messages) do
+    case config.policy_for_messages do
+      nil ->
+        {:ok, config}
+
+      factory ->
+        case factory.(messages) do
+          {:ok, %Policy{} = policy} -> {:ok, %{config | policy: policy}}
+          _ -> {:error, :policy_unavailable}
+        end
+    end
+  rescue
+    _ -> {:error, :policy_unavailable}
+  catch
+    _, _ -> {:error, :policy_unavailable}
+  end
 
   @doc false
   def recheck(config, %{source_kind: :manual, authority_id: authority, message_ids: ids}) do
