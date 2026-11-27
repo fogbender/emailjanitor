@@ -1,5 +1,9 @@
 # Email Janitor
 
+AWS self-host operators can start with the [setup CLI](docs/setup.md): private
+key initialization, local configuration checks, official Google WIF config
+generation, and the SOPS/OAuth/SES handoff. Setup leaves cleanup disabled.
+
 The [SES transport foundation](docs/mail-transport.md) documents the metadata-only
 outbox, trusted inbound receipts, short-lived spool and remaining host contracts.
 The [daily digest library](docs/daily-digests.md) adds local-21:00 scheduling,

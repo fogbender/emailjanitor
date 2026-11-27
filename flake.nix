@@ -33,6 +33,18 @@
             beam = pkgs.beam.packages.erlang_28;
             src = ./.;
           };
+          setup = pkgs.writeShellApplication {
+            name = "emailjanitor-setup";
+            runtimeInputs = [ pkgs.jq pkgs.google-cloud-sdk ];
+            text = ''
+              JANITOR_ENABLE_SELF_HOST=0
+              export JANITOR_ENABLE_SELF_HOST
+              EMAILJANITOR_SETUP_ARGS=$(jq -cn --args '$ARGS.positional' -- "$@")
+              export EMAILJANITOR_SETUP_ARGS
+              exec ${emailjanitor}/bin/email_janitor eval \
+                'System.halt(EmailJanitor.Setup.CLI.main_json(System.fetch_env!("EMAILJANITOR_SETUP_ARGS")))'
+            '';
+          };
           reply-parser = pkgs.buildNpmPackage {
             pname = "emailjanitor-reply-parser";
             version = "0.1.0";
@@ -146,6 +158,37 @@
       checks = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
         in {
+          setup = pkgs.runCommand "emailjanitor-setup-check" {
+            nativeBuildInputs = [ self.packages.${system}.setup pkgs.jq ];
+          } ''
+            export HOME="$TMPDIR"
+            export ERL_CRASH_DUMP=/dev/null
+            export RELEASE_TMP="$TMPDIR/release"
+            JANITOR_ENABLE_SELF_HOST=1 emailjanitor-setup --help > help.txt
+            grep -q 'workers remain disabled' help.txt
+            emailjanitor-setup init --directory "$TMPDIR/private" \
+              --owner owner@example.com --public-url https://janitor.example.com > init.json
+            test "$(stat -c %a "$TMPDIR/private")" = 700
+            test "$(stat -c %s "$TMPDIR/private/credential-key")" = 32
+            jq -e '.JANITOR_ENABLE_SELF_HOST == "0"' "$TMPDIR/private/settings.json"
+            if emailjanitor-setup doctor --settings "$TMPDIR/private/settings.json" > doctor.json; then
+              exit 1
+            else
+              janitor_setup_doctor_status=$?
+            fi
+            test "$janitor_setup_doctor_status" -eq 2
+            jq -e '.checks.database == "unavailable" and .local_ready == false and .processing_ready == false' doctor.json
+            emailjanitor-setup wif-config \
+              --provider projects/123456789012/locations/global/workloadIdentityPools/janitor-pool/providers/aws-provider \
+              --service-account janitor-service@emailjanitor-fixture.iam.gserviceaccount.com \
+              --output "$TMPDIR/aws-google.json" > wif.json
+            jq -e '.credential_source.environment_id == "aws1" and .credential_source.imdsv2_session_token_url == "http://169.254.169.254/latest/api/token"' "$TMPDIR/aws-google.json"
+            if emailjanitor-setup init --directory "$TMPDIR/private" \
+              --owner owner@example.com --public-url https://janitor.example.com; then
+              exit 1
+            fi
+            touch "$out"
+          '';
           release = pkgs.runCommand "emailjanitor-release-check" {
             nativeBuildInputs = [ self.packages.${system}.emailjanitor self.packages.${system}.reply-parser self.packages.${system}.google-auth-bridge pkgs.python3 pkgs.postgresql_17 pkgs.curl ];
           } ''
