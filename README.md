@@ -61,8 +61,10 @@ retry; configure provider request deadlines within that budget.
 
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
-- Validated, tool-free classifier boundary; transient content redaction and HTML
-  extraction. A real model adapter is not connected yet.
+- Validated classifier boundary; transient content redaction and HTML extraction.
+  Thin ReqLLM adapters target AWS Bedrock for the one supported self-host setup
+  and Azure AI for the SaaS. Bedrock uses ExAws's rotating EC2 role credentials,
+  not developer profiles or model API keys. No direct OpenAI/Anthropic adapters.
 - Explicit repository/schema scopes, durable idempotent action intents, exact-ID
   Gmail mutation boundary and restoration protection, tested against PostgreSQL.
 - Dedicated short-lived execution owners, single-host Linux identity, bounded
@@ -86,6 +88,10 @@ The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
 has separate HTTP-transport tests; no live Gmail account is connected yet. There
 is no running cleanup service, email transport, chat UI, billing, or cloud
 deployment yet.
+
+The Gmail adapter in the tests is a fake. Model HTTP tests exercise the real SDK
+against synthetic responses, not live models or credentials. There is no OAuth connection, running
+cleanup service, email transport, chat UI, billing, or cloud deployment yet.
 
 The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
@@ -193,6 +199,41 @@ Google's generated connection currently omits the decompression bound required
 by Tesla 1.23. A small connection middleware supplies an 8 MiB cap to that SDK
 middleware and also limits uncompressed responses before JSON decoding. This
 preserves the SDK protocol implementation without downgrading HTTP security fixes.
+
+## Model privacy boundary
+
+Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
+duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
+that never reach a model). The adapter removes the pinned SDK's
+request lifecycle telemetry before dispatch, including the upstream exception
+event that can otherwise contain raw text despite `payloads: :none`. Provider
+preparation, signing and decoding still use the SDK. Tests attach an upstream
+exporter and exercise failures for both providers. Raw payload tracing and dotenv
+loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
+are disabled (`max_retries: 0`); the durable job owner controls
+retry/backoff. Never put full SDK responses/errors into job arguments or reports.
+
+Finch, the underlying HTTP client, publishes raw bodies and credential headers in
+its own telemetry. Do not attach handlers/exporters to `[:finch, ...]` events or
+enable runtime HTTP tracing. The model adapter checks for Finch handlers before
+each call and fails closed if any are present; hosts must keep observer settings
+fixed during calls. Only the metadata-only Janitor event above is supported.
+Provider preparation also runs with logging disabled for that caller only,
+restoring its prior logger setting afterward. A first request step disables
+logging inside the SDK's separate short-lived dispatch/decoding task. This prevents the
+pinned Bedrock Converse decoder's malformed-tool warning from persisting raw
+model text; ordinary application logging in other processes stays available.
+Oversized or structurally excessive HTML is kept as `:unreadable_content` rather
+than retried as a model outage. `Classifier.propose/4` requires the selected Inbox;
+normal callers should use `Reviewer.review` to include safeguards and context.
+
+Every actionable INBOX message is included in model context, with recent
+already-done messages filling remaining context slots. More than five actionable
+messages keeps the entire thread. Each header is capped at 4096 bytes and each
+readable body at 16000 bytes, preserving UTF-8 boundaries. Ambiguous/unsupported
+MIME, preferences above 32000 bytes, and complete encoded system/user context
+above 96000 bytes keep the conversation rather
+than submitting an incomplete or oversized review.
 
 ## Self-host infrastructure foundation
 
