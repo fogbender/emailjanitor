@@ -3,6 +3,8 @@ defmodule EmailJanitor.Application do
   use Application
 
   def start(_, _) do
+    EmailJanitor.Jobs.attach_telemetry()
+
     children = [
       {Registry, keys: :unique, name: EmailJanitor.JobRegistry},
       {Task.Supervisor, name: EmailJanitor.ExecutorSupervisor}

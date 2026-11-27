@@ -54,7 +54,30 @@ defmodule EmailJanitor.Jobs do
       {:ok, _} = enqueue(name, task)
     end
 
+    recover_wakes(name, Map.keys(tasks))
     :ignore
+  end
+
+  defp recover_wakes(name, tasks) do
+    conf = Oban.config(name)
+
+    args =
+      conf.repo.all(
+        from(j in Oban.Job,
+          where:
+            j.worker == ^Oban.Worker.to_string(Worker) and
+              j.args["task"] in ^tasks and j.args["wake"] == true and j.state in ^@active,
+          select: j.args
+        ),
+        prefix: conf.prefix,
+        log: false
+      )
+
+    for arg <- args, valid_args?(arg) do
+      :ok = wake(name, arg["task"], arg["key"], repair?: arg["repair"])
+    end
+
+    :ok
   end
 
   def enqueue(name, task, metadata \\ nil, opts \\ []) do
@@ -157,6 +180,49 @@ defmodule EmailJanitor.Jobs do
 
   @doc "Failure count of this task's previous durable attempts, available inside its callback."
   def failure_count, do: Process.get(@failure_key, 0)
+
+  @doc false
+  def attach_telemetry do
+    case :telemetry.attach(
+           {__MODULE__, :pending_wake},
+           [:oban, :job, :stop],
+           &__MODULE__.after_ack/4,
+           nil
+         ) do
+      :ok -> :ok
+      {:error, :already_exists} -> :ok
+    end
+  end
+
+  # Oban emits :stop after persisting its acknowledgement. A wake arriving after
+  # our checkpoint but before that acknowledgement must not inherit the old delay.
+  @doc false
+  def after_ack(
+        _,
+        _,
+        %{state: :snoozed, job: %Oban.Job{conf: conf, worker: worker, args: args}},
+        _
+      )
+      when worker == "EmailJanitor.Jobs.Worker" do
+    if Registry.lookup(EmailJanitor.JobRegistry, conf.name) != [] and valid_args?(args) do
+      locked(conf.name, args["task"], args["key"], fn current ->
+        if current.args["wake"] and
+             (current.args["repair"] or current.args["failures"] == 0) do
+          Oban.retry_job(conf.name, current)
+        end
+
+        :ok
+      end)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  def after_ack(_, _, _, _), do: :ok
 
   @doc false
   def execute(%Oban.Job{conf: conf, args: args} = job) do

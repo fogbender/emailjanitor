@@ -239,6 +239,42 @@ defmodule EmailJanitor.JobsTest do
         )
   end
 
+  test "a repair between checkpoint and Oban acknowledgement escapes the old failure delay" do
+    start_jobs(%{"late_wake" => definition(fn _ -> {:retry, 120_000} end)})
+    attempted_at = DateTime.utc_now()
+    job = %{one() | conf: Oban.config(@name), attempted_at: attempted_at, attempt: 1}
+
+    TestRepo.update_all(
+      from(j in Oban.Job, where: j.id == ^job.id),
+      [set: [state: "executing", attempted_at: attempted_at, attempt: 1]],
+      prefix: @prefix,
+      log: false
+    )
+
+    assert {:snooze, 120} = Worker.perform(job)
+    assert :ok = Jobs.wake(@name, "late_wake", "late_wake", repair?: true)
+    assert one().state == "executing"
+    assert :ok = Oban.Engine.snooze_job(job.conf, job, 120)
+    assert one().state == "scheduled"
+    :telemetry.execute([:oban, :job, :stop], %{}, %{state: :snoozed, job: job})
+    assert one().state == "available"
+    assert one().args["repair"]
+    # Simulate process death after the acknowledgement but before the telemetry
+    # handler. The durable pending wake is applied during the next host boot.
+    assert :ok = stop_supervised({Jobs, @name})
+
+    TestRepo.update_all(
+      from(j in Oban.Job, where: j.id == ^job.id),
+      [set: [state: "scheduled", scheduled_at: DateTime.add(DateTime.utc_now(), 120)]],
+      prefix: @prefix,
+      log: false
+    )
+
+    start_jobs(%{"late_wake" => definition(fn _ -> {:retry, 120_000} end)})
+    assert one().state == "available"
+    assert one().id == job.id
+  end
+
   test "wake received while running is persisted and consumed without losing the cursor" do
     observer = self()
 
