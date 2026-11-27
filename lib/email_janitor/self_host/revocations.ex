@@ -67,6 +67,7 @@ defmodule EmailJanitor.SelfHost.Revocation do
     field(:request_id, Ecto.UUID)
     field(:google_subject, :string)
     field(:token_ciphertext, :binary, redact: true)
+    field(:grant_fingerprint, :binary, redact: true)
     field(:state, Ecto.Enum, values: [:pending, :processing, :manual_required, :complete])
 
     field(:outcome, Ecto.Enum,
@@ -99,7 +100,7 @@ defmodule EmailJanitor.SelfHost.Revocations do
   import Ecto.Query
   alias EmailJanitor.{Owner, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.{Binding, Revocation, Store}
+  alias EmailJanitor.SelfHost.{Binding, Grants, Refreshes, Revocation, Store}
 
   @owner_keys [
     :owner_token,
@@ -129,26 +130,92 @@ defmodule EmailJanitor.SelfHost.Revocations do
         log: false
       )
 
+  @doc false
+  def note_capture!(scope, inbox_id) do
+    case scope.repo.get(Revocation, inbox_id, prefix: scope.prefix, log: false) do
+      %Revocation{state: :manual_required} = row ->
+        scope.repo.update!(Ecto.Changeset.change(row, request_id: Ecto.UUID.generate()),
+          prefix: scope.prefix,
+          log: false
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
+  @doc false
+  def stage_unbound!(scope, inbox_id, subject) do
+    existing = scope.repo.get(Revocation, inbox_id, prefix: scope.prefix, log: false)
+
+    if existing && existing.state != :complete do
+      if existing.google_subject != subject, do: scope.repo.rollback(:connection_changed)
+      :revoking
+    else
+      grant =
+        Grants.next(scope, inbox_id) || scope.repo.rollback(:credential_retention_unavailable)
+
+      row = existing || %Revocation{inbox_id: inbox_id}
+
+      scope.repo.insert_or_update!(
+        Ecto.Changeset.change(
+          row,
+          Map.merge(clear_owner(), %{
+            request_id: Ecto.UUID.generate(),
+            google_subject: subject,
+            token_ciphertext: grant.token_ciphertext,
+            grant_fingerprint: grant.fingerprint,
+            state: :pending,
+            outcome: :none,
+            attempts: 0,
+            next_attempt_at: nil
+          })
+        ),
+        prefix: scope.prefix,
+        log: false
+      )
+
+      :revoking
+    end
+  end
+
   @doc "Called only under the scoped mailbox lock in the disconnect transaction."
-  def stage!(scope, binding) do
+  def stage!(scope, binding, options \\ []) do
     if not scope.repo.in_transaction?(),
       do: raise(ArgumentError, "retirement requires mailbox transaction")
 
+    Grants.retain_cipher!(scope, binding.id, binding.token_ciphertext)
     existing = scope.repo.get(Revocation, binding.id, prefix: scope.prefix, log: false)
 
     if existing && existing.state != :complete do
       if existing.google_subject != binding.google_subject,
         do: scope.repo.rollback(:connection_changed)
 
-      if existing.state == :manual_required, do: :revocation_required, else: :revoking
+      existing = retain_current!(scope, existing)
+
+      if existing.state == :manual_required do
+        # A fresh callback invalidates an old local attestation's request ID.
+        if Keyword.get(options, :new_grant, false) do
+          scope.repo.update!(Ecto.Changeset.change(existing, request_id: Ecto.UUID.generate()),
+            prefix: scope.prefix,
+            log: false
+          )
+        end
+
+        :revocation_required
+      else
+        :revoking
+      end
     else
-      present = is_binary(binding.token_ciphertext)
+      grant = Grants.next(scope, binding.id)
+      present = not is_nil(grant)
       unusable = not present and binding.state == :reauthorization_required
 
       fields = %{
         request_id: Ecto.UUID.generate(),
         google_subject: binding.google_subject,
-        token_ciphertext: binding.token_ciphertext,
+        token_ciphertext: if(grant, do: grant.token_ciphertext),
+        grant_fingerprint: if(grant, do: grant.fingerprint),
         state:
           cond do
             present -> :pending
@@ -205,6 +272,9 @@ defmodule EmailJanitor.SelfHost.Revocations do
           row.state == :manual_required and is_nil(row.token_ciphertext) and
             Enum.all?(@owner_keys, &is_nil(Map.get(row, &1))) and
             binding.state == :revocation_required and is_nil(binding.token_ciphertext) ->
+            Refreshes.confirmed_project_removed!(scope, inbox_id)
+            Grants.confirm_all_removed!(scope, inbox_id)
+
             scope.repo.update!(
               Ecto.Changeset.change(row,
                 state: :complete,
@@ -256,22 +326,10 @@ defmodule EmailJanitor.SelfHost.Revocations do
   def tick(config, options \\ []) do
     Owner.run(
       fn ->
-        case claim(Keyword.get(options, :now, DateTime.utc_now())) do
-          {:ok, :idle} ->
-            {:ok, :idle}
-
-          {:ok, row} ->
-            revoke = Keyword.get(options, :revoke, &OAuth.revoke/2)
-
-            result =
-              with {:ok, token} <-
-                     SelfHost.open("gmail-token", row.inbox_id, row.token_ciphertext),
-                   do: revoke.(config, token)
-
-            finish(row, result)
-
-          _ ->
-            {:error, :revocation_unavailable}
+        case Refreshes.quarantine_one() do
+          :quarantined -> {:ok, :refresh_quarantined}
+          :unavailable -> {:error, :revocation_unavailable}
+          :idle -> revoke_one(config, options)
         end
       end,
       60_000
@@ -280,6 +338,26 @@ defmodule EmailJanitor.SelfHost.Revocations do
     _ -> {:error, :revocation_unavailable}
   catch
     _, _ -> {:error, :revocation_unavailable}
+  end
+
+  defp revoke_one(config, options) do
+    case claim(Keyword.get(options, :now, DateTime.utc_now())) do
+      {:ok, :idle} ->
+        {:ok, :idle}
+
+      {:ok, row} ->
+        revoke = Keyword.get(options, :revoke, &OAuth.revoke/2)
+
+        result =
+          with {:ok, token} <-
+                 SelfHost.open("gmail-token", row.inbox_id, row.token_ciphertext),
+               do: revoke.(config, token)
+
+        finish(row, result)
+
+      _ ->
+        {:error, :revocation_unavailable}
+    end
   end
 
   defp claim(now) do
@@ -316,8 +394,11 @@ defmodule EmailJanitor.SelfHost.Revocations do
         due? = is_nil(row.next_attempt_at) or DateTime.compare(row.next_attempt_at, now) != :gt
 
         cond do
+          not Refreshes.ready?(scoped, id) ->
+            :idle
+
           row.state == :pending and due? ->
-            take_claim(scoped, row)
+            take_claim(scoped, retain_current!(scoped, row))
 
           row.state == :processing and due? and Owner.proof(row) == :dead ->
             {:quarantine, row.request_id, row.owner_token}
@@ -340,7 +421,7 @@ defmodule EmailJanitor.SelfHost.Revocations do
 
           if current.state == :processing and current.request_id == request and
                current.owner_token == token and Owner.proof(current) == :dead,
-             do: take_claim(scoped, current),
+             do: take_claim(scoped, retain_current!(scoped, current)),
              else: :idle
         end)
 
@@ -372,10 +453,11 @@ defmodule EmailJanitor.SelfHost.Revocations do
                 not Owner.owns?(current),
               do: scope.repo.rollback(:revocation_changed)
 
-           binding = scope.repo.get!(Binding, row.inbox_id, prefix: scope.prefix, log: false)
+           binding = scope.repo.get(Binding, row.inbox_id, prefix: scope.prefix, log: false)
 
-           if binding.google_subject != row.google_subject or
-                binding.state not in [:revoking, :revocation_required],
+           if binding &&
+                (binding.google_subject != row.google_subject or
+                   binding.state not in [:revoking, :revocation_required]),
               do: scope.repo.rollback(:revocation_changed)
 
            {fields, state, outcome} =
@@ -408,20 +490,75 @@ defmodule EmailJanitor.SelfHost.Revocations do
                   }, :revoking, :retry_scheduled}
              end
 
+           {fields, state, outcome} =
+             if result in [:ok, {:error, :refresh_token_invalid}] do
+               if result == :ok, do: Refreshes.confirmed_project_removed!(scope, row.inbox_id)
+
+               Grants.forget!(
+                 scope,
+                 row.inbox_id,
+                 current.grant_fingerprint,
+                 current.token_ciphertext
+               )
+
+               case Grants.next(scope, row.inbox_id) do
+                 nil ->
+                   if Refreshes.uncertain?(scope, row.inbox_id) do
+                     {%{
+                        state: :manual_required,
+                        outcome: :missing_token,
+                        token_ciphertext: nil,
+                        grant_fingerprint: nil,
+                        next_attempt_at: nil
+                      }, :revocation_required, :manual_confirmation_required}
+                   else
+                     {Map.put(fields, :grant_fingerprint, nil), state, outcome}
+                   end
+
+                 next ->
+                   {%{
+                      state: :pending,
+                      outcome: :none,
+                      token_ciphertext: next.token_ciphertext,
+                      grant_fingerprint: next.fingerprint,
+                      next_attempt_at: nil,
+                      attempts: 0
+                    }, :revoking, :retirement_continues}
+               end
+             else
+               {fields, state, outcome}
+             end
+
            scope.repo.update!(Ecto.Changeset.change(current, Map.merge(clear_owner(), fields)),
              prefix: scope.prefix,
              log: false
            )
 
-           scope.repo.update!(Ecto.Changeset.change(binding, state: state),
-             prefix: scope.prefix,
-             log: false
-           )
+           if binding do
+             scope.repo.update!(Ecto.Changeset.change(binding, state: state),
+               prefix: scope.prefix,
+               log: false
+             )
+           end
 
            outcome
          end) do
       {:ok, value} -> {:ok, value}
       _ -> {:error, :revocation_unavailable}
+    end
+  end
+
+  # Upgrade a legacy in-flight retirement without losing its encrypted capability.
+  defp retain_current!(scope, row) do
+    if is_binary(row.token_ciphertext) and is_nil(row.grant_fingerprint) do
+      fingerprint = Grants.retain_cipher!(scope, row.inbox_id, row.token_ciphertext)
+
+      scope.repo.update!(Ecto.Changeset.change(row, grant_fingerprint: fingerprint),
+        prefix: scope.prefix,
+        log: false
+      )
+    else
+      row
     end
   end
 

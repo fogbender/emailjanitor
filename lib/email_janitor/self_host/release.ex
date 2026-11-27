@@ -64,6 +64,9 @@ defmodule EmailJanitor.SelfHost.Release do
            ) not in [:ok, :already_up],
            do: raise("Email Janitor background migrations failed.")
 
+        if SelfHost.Grants.install(scope) not in [:ok, :already_up],
+          do: raise("Email Janitor grant-retention migrations failed.")
+
         if SelfHost.Transport.install(config) != :ok,
           do: raise("Email Janitor mail transport is not configured.")
 
