@@ -144,7 +144,7 @@ defmodule EmailJanitor.WorkerTest do
     )
 
     Agent.update(ctx.state, &%{&1 | model: :error})
-    assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
     assert {:ok, [_]} = pending(ctx)
 
     assert [%Deferral{status: :transient, instruction_version: 2}] =
@@ -281,7 +281,7 @@ defmodule EmailJanitor.WorkerTest do
 
     logs =
       capture_log(fn ->
-        assert {:ok, %{status: :self_mail_unavailable}} = Worker.step(config)
+        assert {:ok, %{status: :deferred}} = Worker.step(config)
       end)
 
     refute logs =~ "PRIVATE_RECEIPT_FAILURE"
@@ -402,7 +402,7 @@ defmodule EmailJanitor.WorkerTest do
 
     Agent.update(ctx.quota, &Map.put(&1, :reserve_hook, hook))
     assert {:ok, %{status: status}} = Worker.step(ctx.config)
-    assert status == :proposal_changed
+    assert status == :deferred
     assert_receive :disconnected, 1_000
     assert read(ctx.state).mutations == []
 
@@ -475,7 +475,7 @@ defmodule EmailJanitor.WorkerTest do
       }
     )
 
-    assert {:ok, %{status: :model_unavailable, more?: false}} = Worker.step(ctx.config)
+    assert {:ok, %{status: :deferred, more?: false}} = Worker.step(ctx.config)
     assert length(read(ctx.state).model_inputs) == 1
     assert {:ok, %{status: :idle, more?: false}} = Worker.step(ctx.config)
     assert length(read(ctx.state).model_inputs) == 1
@@ -539,7 +539,7 @@ defmodule EmailJanitor.WorkerTest do
     Agent.update(ctx.state, &%{&1 | model: :invalid})
 
     for _ <- 1..8 do
-      assert {:ok, %{status: :invalid_decision}} = Worker.step(ctx.config)
+      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
       advance(ctx.clock, 901)
     end
 
@@ -648,12 +648,12 @@ defmodule EmailJanitor.WorkerTest do
     Agent.update(ctx.state, &%{&1 | model: :error})
 
     for _ <- 1..7 do
-      assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
+      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
       advance(ctx.clock, 901)
     end
 
     Agent.update(ctx.state, &%{&1 | model: :invalid})
-    assert {:ok, %{status: :invalid_decision}} = Worker.step(ctx.config)
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
 
     assert [%Deferral{status: :invalid, attempts: 1}] =
              Repo.all(Deferral, prefix: ctx.scope.prefix)
@@ -675,6 +675,48 @@ defmodule EmailJanitor.WorkerTest do
 
     assert [%Candidate{requested: true, attempts: 8, invalid_attempts: 1}] =
              Repo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "real scheduler passes thread-specific model rejection without delaying healthy mail",
+       ctx do
+    observer = self()
+
+    messages =
+      Enum.map(1..3, &Fixtures.message(id: "bad-#{&1}", thread_id: "bad-thread-#{&1}")) ++
+        [Fixtures.message(id: "z-new", thread_id: "healthy-thread")]
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    config = %{
+      ctx.config
+      | classifier:
+          {Classifier, [state: ctx.state, failed_threads: Enum.map(1..3, &"bad-thread-#{&1}")]},
+        report: fn status ->
+          send(observer, {:reported_model_step, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted-inbox"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    assert_receive {:reported_model_step, :done}, 2_000
+    assert read(ctx.state).mutations == [["z-new"]]
+    assert {:ok, pending} = pending(ctx)
+    assert Enum.sort(Enum.map(pending, & &1.message_id)) == ["bad-1", "bad-2", "bad-3"]
+    assert length(read(ctx.state).model_inputs) == 4
   end
 
   defp await_blocked(_backend, 0),

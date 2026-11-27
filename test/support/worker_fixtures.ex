@@ -116,7 +116,14 @@ defmodule EmailJanitor.WorkerTest.Classifier do
     result =
       Agent.get_and_update(options[:state], fn state ->
         result =
-          case state.model do
+          case if(
+                 Enum.any?(
+                   messages,
+                   &(&1.thread_id in Keyword.get(options, :failed_threads, []))
+                 ),
+                 do: :error,
+                 else: state.model
+               ) do
             :unreadable ->
               {:keep, :unreadable_content}
 

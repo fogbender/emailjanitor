@@ -419,7 +419,7 @@ defmodule EmailJanitor.Worker do
           now
         )
 
-        result
+        if inbox_failure?(result), do: result, else: :deferred
     end
   end
 
@@ -447,7 +447,7 @@ defmodule EmailJanitor.Worker do
       now
     )
 
-    error
+    if inbox_failure?(error), do: error, else: :deferred
   end
 
   defp recheck_candidate(config, checkpoint, candidate, instructions, version, now) do

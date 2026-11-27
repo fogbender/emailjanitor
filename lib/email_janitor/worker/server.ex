@@ -80,8 +80,12 @@ defmodule EmailJanitor.Worker.Server do
 
       entries =
         case Map.fetch(state.entries, ref) do
-          {:ok, _} -> Map.put(state.entries, ref, %{due: now, attempts: 0})
-          :error -> state.entries
+          {:ok, _} ->
+            busy = Enum.any?(state.running, fn {_, running} -> running.key == ref end)
+            Map.put(state.entries, ref, %{due: now, attempts: 0, repair: busy})
+
+          :error ->
+            state.entries
         end
 
       # New refs are accepted only from the next trusted list refresh.
@@ -185,10 +189,12 @@ defmodule EmailJanitor.Worker.Server do
         state
 
       entry ->
-        attempts = if outcome == :failed, do: min(entry.attempts + 1, 8), else: 0
+        repaired = Map.get(entry, :repair, false)
+        attempts = if outcome == :failed and not repaired, do: min(entry.attempts + 1, 8), else: 0
 
         delay =
           cond do
+            repaired -> 0
             outcome == :more -> 100
             outcome == :failed -> min(state.interval_ms * Integer.pow(2, attempts), 300_000)
             true -> state.interval_ms

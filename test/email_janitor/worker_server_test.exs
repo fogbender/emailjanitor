@@ -196,6 +196,35 @@ defmodule EmailJanitor.WorkerServerTest do
     refute_receive {:attempted, "not-in-trusted-list"}, 100
   end
 
+  test "explicit repair arriving mid-step runs fresh configuration immediately afterward" do
+    owner = self()
+    repaired = start_supervised!({Agent, fn -> false end})
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, ["a"]} end,
+         resolve: fn ref ->
+           {:ok,
+            %{config(ref) | topic: if(Agent.get(repaired, & &1), do: "repaired", else: "old")}}
+         end,
+         step: fn cfg ->
+           send(owner, {:started_config, cfg.topic, self()})
+           if cfg.topic == "old", do: receive(do: (:release -> :ok))
+           {:ok, %{status: if(cfg.topic == "old", do: :rate_limited, else: :idle), more?: false}}
+         end,
+         interval_ms: 5_000,
+         timeout_ms: 5_000}
+      )
+
+    assert_receive {:started_config, "old", first}, 1_000
+    Agent.update(repaired, fn _ -> true end)
+    Server.wake(server, "a")
+    assert :sys.get_state(server).entries["a"].repair
+    send(first, :release)
+    assert_receive {:started_config, "repaired", _}, 1_000
+  end
+
   defp wait_failed_refs(_server, _refs, 0), do: flunk("references did not enter backoff")
 
   defp wait_failed_refs(server, refs, left) do

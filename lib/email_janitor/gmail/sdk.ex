@@ -25,6 +25,7 @@ defmodule EmailJanitor.Gmail.SDK do
            true <- Enum.all?(converted, &(&1.thread_id == thread_id)) do
         {:ok, converted}
       else
+        {:error, :response_too_large} -> {:error, :invalid_thread}
         {:error, _} = error -> error
         _ -> {:error, :invalid_thread}
       end
@@ -578,6 +579,7 @@ defmodule EmailJanitor.Gmail.SDK do
       {:error, %Tesla.Env{status: 403, body: body}} -> {:error, forbidden_reason(body)}
       {:error, %Tesla.Env{status: 404}} -> {:error, :not_found}
       {:error, %Tesla.Env{status: 429}} -> {:error, :rate_limited}
+      {:error, :response_too_large} -> {:error, :response_too_large}
       _ -> {:error, :gmail_unavailable}
     end
   rescue

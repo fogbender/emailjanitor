@@ -149,7 +149,7 @@ here; full SaaS authorization is a later integration gate.
 ## Model privacy boundary
 
 Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
-duration and a fixed status (`:ok`, `:error`, or `:keep`, including preflight keeps
+duration and a fixed status (`:ok`, `:error`, `:invalid`, or `:keep`, including preflight keeps
 that never reach a model). The adapter removes the pinned SDK's
 request lifecycle telemetry before dispatch, including the upstream exception
 event that can otherwise contain raw text despite `payloads: :none`. Provider

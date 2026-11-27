@@ -833,6 +833,24 @@ defmodule EmailJanitor.GmailSDKTest do
     refute log =~ "PRIVATE_BODY_SENTINEL"
   end
 
+  test "oversized full thread bodies are stable unreadable content, including compressed replies" do
+    body = String.duplicate("PRIVATE_BODY_SENTINEL", 450_000)
+
+    for response <- [
+          %Tesla.Env{status: 200, body: body},
+          %Tesla.Env{status: 200, body: :zlib.gzip(body), headers: [{"content-encoding", "gzip"}]}
+        ] do
+      mock(fn _ -> response end)
+
+      logs =
+        capture_log(fn ->
+          assert {:error, :invalid_thread} = SDK.thread("inbox-1", "thread-1", options())
+        end)
+
+      refute logs =~ "PRIVATE_BODY_SENTINEL"
+    end
+  end
+
   test "compressed and uncompressed oversized responses stop before SDK JSON decoding" do
     body =
       Jason.encode!(%{
