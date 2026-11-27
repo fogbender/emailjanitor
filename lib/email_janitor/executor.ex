@@ -14,9 +14,11 @@ defmodule EmailJanitor.Executor do
   }
 
   def execute(scope, %Inbox{} = inbox, %Proposal{} = proposal, {gmail, options}, opts \\ []) do
-    if scope.repo.in_transaction?(),
-      do: {:error, :outer_transaction},
-      else: Owner.run(fn -> do_execute(scope, inbox, proposal, gmail, options, opts) end)
+    cond do
+      scope.repo.in_transaction?() -> {:error, :outer_transaction}
+      not valid_proposal_ids?(proposal) -> {:skip, :proposal_changed}
+      true -> Owner.run(fn -> do_execute(scope, inbox, proposal, gmail, options, opts) end)
+    end
   end
 
   @doc "Fetch and review a thread; known keep decisions retire obsolete pending work."
@@ -50,10 +52,13 @@ defmodule EmailJanitor.Executor do
                   classifier,
                   instructions,
                   version,
-                  restored
+                  restored,
+                  context.opts
                 )
 
           case result do
+            {:ok, proposal} -> {:ok, %{proposal | review_started_at: context.started_at}}
+            {:keep, :unreadable_content} -> result
             {:keep, reason} -> retire_keep(context, reason)
             result -> result
           end
@@ -68,6 +73,20 @@ defmodule EmailJanitor.Executor do
          {:ok, current} <- safe(fn -> gmail.thread(inbox.id, thread_id, options) end),
          true <-
            is_list(current) and Enum.all?(current, &match?(%Message{thread_id: ^thread_id}, &1)) do
+      inbox_ids = exact_inbox_ids(current)
+
+      opts =
+        opts
+        |> Keyword.put(:inbox_message_ids, inbox_ids)
+        |> Keyword.put(:observed_message_ids, Enum.map(current, & &1.id))
+        |> Keyword.put(
+          :evaluated_message_ids,
+          case Keyword.fetch(opts, :cleanup_target_ids) do
+            {:ok, ids} when is_list(ids) -> Enum.filter(ids, &(&1 in inbox_ids))
+            _ -> inbox_ids
+          end
+        )
+
       {:ok,
        {%{
           scope: scope,
@@ -121,6 +140,8 @@ defmodule EmailJanitor.Executor do
   end
 
   defp do_execute(scope, inbox, proposal, gmail, options, opts) do
+    opts = Keyword.put(opts, :cleanup_target_ids, Proposal.evaluated_ids(proposal))
+
     with {:ok, {context, current}} <-
            fetch_review(
              scope,
@@ -169,7 +190,10 @@ defmodule EmailJanitor.Executor do
 
   defp execute_current(scope, inbox, proposal, current, gmail, options, opts) do
     with true <- Message.fingerprint(current) == proposal.fingerprint,
-         true <- exact_inbox_ids(current) == Enum.sort(proposal.message_ids),
+         true <- valid_proposal_ids?(proposal),
+         true <- exact_inbox_ids(current) == Enum.sort(Proposal.inbox_ids(proposal)),
+         {:ok, started_at} <- proposal_start(proposal, opts[:review_started_at]),
+         opts = Keyword.put(opts, :review_started_at, started_at),
          {:ok, history_id} <- safe(fn -> gmail.history_id(inbox.id, options) end),
          {:ok, mutation} <- Gmail.prepare(gmail, inbox.id, proposal.message_ids, options),
          :ok <- Owner.dispatch_window(),
@@ -184,6 +208,27 @@ defmodule EmailJanitor.Executor do
       {:error, reason} when is_atom(reason) -> {:error, reason}
       _ -> {:error, :gmail_unavailable}
     end
+  end
+
+  defp valid_proposal_ids?(proposal) do
+    done = proposal.message_ids
+    evaluated = Proposal.evaluated_ids(proposal)
+    inbox = Proposal.inbox_ids(proposal)
+
+    Enum.all?([done, evaluated, inbox], fn ids ->
+      is_list(ids) and ids != [] and length(ids) == length(Enum.uniq(ids)) and
+        Enum.all?(ids, &is_binary/1)
+    end) and Enum.all?(done, &(&1 in evaluated)) and Enum.all?(evaluated, &(&1 in inbox)) and
+      Proposal.valid_categories?(proposal) and
+      (is_nil(proposal.review_started_at) or match?(%DateTime{}, proposal.review_started_at))
+  end
+
+  defp proposal_start(%Proposal{review_started_at: nil}, current), do: {:ok, current}
+
+  defp proposal_start(%Proposal{review_started_at: original}, current) do
+    if DateTime.compare(original, current) in [:lt, :eq],
+      do: {:ok, original},
+      else: {:error, :proposal_changed}
   end
 
   defp apply_intent(scope, inbox, action, mutation, opts) do

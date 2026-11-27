@@ -99,6 +99,34 @@ Review has a 60-second budget covering Gmail reads, classification and metadata
 retirement. A timeout returns `:executor_unavailable` and keeps pending work for
 retry; configure provider request deadlines within that budget.
 
+Hosts may pass `cleanup_target_ids:` to `Executor.review/8` from a verified
+new-arrival eligibility proof. `Message.cleanup_target` separates that selection
+from raw Gmail INBOX state. The model receives the remaining conversation as
+context and returns one constrained decision per target in a single request;
+missing, duplicate or context-only IDs invalidate the whole response. The model
+budget remains at most five targets, 32KB preferences and 96KB complete context.
+Unreadable/oversized content preserves pending work for retry, not retirement.
+Existing correspondence, sent/draft and manual-restoration guards still protect
+the full conversation before review and again before execution.
+
+`Proposal.message_ids` are the Done subset; `evaluated_message_ids` also includes
+kept targets; `inbox_message_ids` is the full reviewed raw INBOX snapshot. Execution
+checks the exact full snapshot and full-thread fingerprint before mutating only
+Done IDs. `Policy.reserve/6` receives the full snapshot in `Policy.Admission` so
+the private SaaS can enforce its free whole-thread rule while paid and default
+single-user deployments admit eligible subsets. Legacy five-argument policy
+adapters reject partial admission without reserving quota. Partial retirement
+withdraws evaluated or now-archived IDs only; unevaluated INBOX context keeps its
+pending metadata and stable marker. Remaining IDs shrink durably on each partial
+retirement, and the marker disappears when every member is accounted for.
+Per-message review fences survive marker removal, so newer Keep decisions fence
+older Done work, including a cached proposal whose execution starts later.
+Scoped reviews carry their original database timestamp; a blocked cached proposal
+must be reviewed afresh before another admission. Mixed Done categories retain
+their per-ID enums in `message_categories`; the batch category is `mixed`.
+These additions use [instance migration 6](docs/migrations.md); no body text is
+part of this metadata.
+
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
 - Validated classifier boundary; transient content redaction and HTML extraction.
@@ -310,14 +338,21 @@ ambiguous-action reconciliation; recovery still requires complete `history/3`.
 Independent-connection tests cover commits, rollback and competing snapshots.
 
 Pending work contains IDs, cursors and timestamps only. `eligible_thread/5` reads
-thread content transiently and preserves the whole conversation if any current
-INBOX message lacks same-generation post-baseline eligibility. It returns only a
-metadata eligibility proof. `authorize_proposal/4` rejects proposals outside that
-proof and rejects proofs from a previous connection generation. Hosts must also
-honor connection-generation fencing at final execution, retain the engine's
-instruction/manual-restoration guards, and use the Executor's fresh fingerprint
-and exact-ID checks. This slice does not dispatch classification or mutations,
-and it does not implement a partial-message mask for mixed old/new conversations.
+thread content transiently and returns only the known current-generation INBOX
+subset as a metadata eligibility proof. Older or unknown INBOX messages remain
+context and never gain cleanup eligibility from sharing a conversation.
+`authorize_proposal/4` requires nonempty distinct Done IDs within the nonempty
+set of evaluated targets, including eligible messages classified Keep. Every
+evaluated ID must remain in that proof and in durable same-generation discovery
+records. Legacy proposals with no evaluated set use their Done IDs. Empty,
+malformed, stale-generation and unknown-ID masks fail closed.
+
+Hosts must carry that proof into the guarded review target mask and recheck it
+before execution, retain connection-generation, instruction and manual-restore
+guards, and use the Executor's fresh fingerprint and exact-ID checks. Free-plan
+all-INBOX admission is a separate host-policy requirement; this proof itself does
+not permit removing older context or bypassing the free quota. This slice supplies
+the ingestion selection boundary and does not dispatch classification/mutations.
 
 Expired history enters `:gap` and pauses discovery/eligibility. This deliberately
 does **not** recover arrivals missed after Gmail's history retention expires.

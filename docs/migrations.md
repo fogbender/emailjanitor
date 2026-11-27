@@ -12,7 +12,7 @@ inside an optional module.
 | 3 | Conversational preferences/receipts | `Preferences.install/1` |
 | 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` (in development) |
 | 5 | Daily digest metadata | Digest installer (in development) |
-| 6 | Per-message review fences/categories | Target-review installer (in development) |
+| 6 | Target categories, remaining candidates and review fences | `Store.install/1` |
 | 7 | Exact-message restoration protection/receipts | Restore installer (in development) |
 | 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
 | 10 | Gmail ingestion checkpoints/arrival IDs | Ingestion installer |

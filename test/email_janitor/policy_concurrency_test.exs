@@ -243,6 +243,133 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     end
   end
 
+  for latest <- [:blocked, :keep], phase <- [:in_flight, :cached_review] do
+    test "a newer #{latest} evaluation fences an older Done (#{phase})", ctx do
+      messages = [message(), message(id: "message-2")]
+      Agent.update(ctx.state, &%{&1 | messages: messages})
+      parent = self()
+      ids = ["message-1", "message-2"]
+
+      assert {:ok, old} =
+               database(fn ->
+                 Executor.review(
+                   ctx.scope,
+                   ctx.inbox,
+                   "thread-1",
+                   {TestGmail, [state: ctx.state]},
+                   {EmailJanitor.TargetClassifier, []},
+                   "",
+                   1,
+                   cleanup_target_ids: ["message-1"]
+                 )
+               end)
+
+      paused = fn ->
+        send(parent, {:evaluated_pause, self()})
+
+        receive do
+          :continue_evaluated -> :ok
+        after
+          5_000 -> raise "Synthetic evaluation barrier timed out"
+        end
+      end
+
+      running =
+        if unquote(phase) == :in_flight do
+          {pid, monitor} =
+            spawn_monitor(fn ->
+              result =
+                database(fn ->
+                  Executor.execute(
+                    ctx.scope,
+                    ctx.inbox,
+                    old,
+                    {TestGmail, [state: ctx.state, history_hook: paused]}
+                  )
+                end)
+
+              send(parent, {:evaluated_old_result, result})
+            end)
+
+          on_exit(fn -> Process.exit(pid, :kill) end)
+          assert_receive {:evaluated_pause, owner}, 5_000
+          on_exit(fn -> Process.exit(owner, :kill) end)
+          {pid, monitor, owner}
+        end
+
+      keep_ids = if unquote(latest) == :keep, do: ids, else: ["message-1"]
+
+      newer =
+        database(fn ->
+          Executor.review(
+            ctx.scope,
+            ctx.inbox,
+            "thread-1",
+            {TestGmail, [state: ctx.state]},
+            {EmailJanitor.TargetClassifier, [keep_ids: keep_ids]},
+            "",
+            1,
+            cleanup_target_ids: ids
+          )
+        end)
+
+      if unquote(latest) == :blocked do
+        assert {:ok, newer} = newer
+        assert newer.message_ids == ["message-2"]
+
+        blocked = %Policy{
+          adapter: EmailJanitor.TargetPolicy,
+          context: %{scope: ctx.scope, mode: :block}
+        }
+
+        assert {:blocked, :upgrade_required} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]},
+                     policy: blocked
+                   )
+                 end)
+      else
+        assert {:keep, :classifier_kept} = newer
+      end
+
+      if running do
+        {pid, monitor, owner} = running
+        send(owner, :continue_evaluated)
+        assert_receive {:evaluated_old_result, {:error, :proposal_changed}}, 5_000
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+      else
+        assert {:error, :proposal_changed} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, old, {TestGmail, [state: ctx.state]})
+                 end)
+      end
+
+      assert [] = Agent.get(ctx.state, & &1.calls)
+
+      # New work can proceed after a genuinely fresh review of the same labels.
+      assert {:ok, fresh} =
+               database(fn ->
+                 Executor.review(
+                   ctx.scope,
+                   ctx.inbox,
+                   "thread-1",
+                   {TestGmail, [state: ctx.state]},
+                   {EmailJanitor.TargetClassifier, []},
+                   "",
+                   1,
+                   cleanup_target_ids: ["message-1"]
+                 )
+               end)
+
+      assert {:done, _} =
+               database(fn ->
+                 Executor.execute(ctx.scope, ctx.inbox, fresh, {TestGmail, [state: ctx.state]})
+               end)
+
+      assert [["message-1"]] = Agent.get(ctx.state, & &1.calls)
+    end
+  end
+
   for entry <- [:settle_action, :execute] do
     test "#{entry} cannot overwrite terminal reconciliation with stale unresolved settlement",
          ctx do

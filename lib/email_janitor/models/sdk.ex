@@ -1,23 +1,10 @@
 defmodule EmailJanitor.Models.SDK do
   @moduledoc "Thin ReqLLM adapter: AWS Bedrock self-hosting and Azure SaaS; no custom wire protocol."
   @behaviour EmailJanitor.Classifier
-  alias EmailJanitor.{Content, Decision, HTML, Inbox, Message}
+  alias EmailJanitor.{Content, Decision, HTML, Inbox, Message, TargetDecisions}
   alias EmailJanitor.Models.Config
   @external_resource Path.expand("../../../priv/prompts/classify.txt", __DIR__)
   @prompt File.read!(@external_resource)
-  @schema %{
-    "type" => "object",
-    "additionalProperties" => false,
-    "required" => ["action", "confidence", "category"],
-    "properties" => %{
-      "action" => %{"type" => "string", "enum" => ["keep", "done"]},
-      "confidence" => %{"type" => "string", "enum" => ["high", "low"]},
-      "category" => %{
-        "type" => "string",
-        "enum" => ["cold_outreach", "legitimate", "uncertain", "user_instruction"]
-      }
-    }
-  }
 
   def classify(messages, instructions, opts) do
     started = System.monotonic_time()
@@ -38,6 +25,11 @@ defmodule EmailJanitor.Models.SDK do
     if not is_binary(instructions) or byte_size(instructions) > 32_000,
       do: throw(:invalid_content)
 
+    target_ids = Keyword.get(opts, :target_ids)
+    if not is_nil(target_ids) and (not is_list(target_ids) or length(target_ids) not in 1..5),
+      do: throw(:invalid_content)
+    schema = if is_nil(target_ids), do: Decision.schema(), else: TargetDecisions.schema()
+
     payload = messages |> selected_messages() |> Enum.map(&payload/1) |> Jason.encode!()
     if byte_size(payload) > 96_000, do: throw(:invalid_content)
 
@@ -49,9 +41,9 @@ defmodule EmailJanitor.Models.SDK do
 
     user_text = "UNTRUSTED_EMAIL_JSON:\n" <> payload
 
-    with {:ok, object} <- object(Content.new(system_text), Content.new(user_text), @schema, opts),
+    with {:ok, object} <- object(Content.new(system_text), Content.new(user_text), schema, opts),
          {:ok, value} <- Jason.decode(Content.read(object)),
-         {:ok, _} <- Decision.parse(value) do
+         {:ok, _} <- parse(value, target_ids) do
       {:ok, value}
     else
       {:error, :invalid_model_content} -> {:keep, :unreadable_content}
@@ -66,6 +58,9 @@ defmodule EmailJanitor.Models.SDK do
     _, _ ->
       {:error, :model_unavailable}
   end
+
+  defp parse(object, nil), do: Decision.parse(object)
+  defp parse(object, ids), do: TargetDecisions.parse(object, ids)
 
   @doc """
   Generate a bounded structured object with the same private SDK transport used
@@ -223,7 +218,9 @@ defmodule EmailJanitor.Models.SDK do
 
   defp payload(message) do
     %{
+      "message_id" => message.id,
       "in_inbox" => Message.in_inbox?(message),
+      "cleanup_target" => Message.cleanup_target?(message),
       "from" => header(message, "from"),
       "reply_to" => header(message, "reply-to"),
       "to" => header(message, "to"),
@@ -240,7 +237,7 @@ defmodule EmailJanitor.Models.SDK do
     {actionable, context} =
       messages
       |> Enum.with_index()
-      |> Enum.split_with(fn {message, _index} -> Message.in_inbox?(message) end)
+      |> Enum.split_with(fn {message, _index} -> Message.cleanup_target?(message) end)
 
     if length(actionable) > 5, do: throw(:invalid_content)
 

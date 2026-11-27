@@ -6,6 +6,7 @@ defmodule EmailJanitor.Store.Action do
     field(:inbox_id, :string)
     field(:thread_id, :string)
     field(:message_ids, {:array, :string})
+    field(:message_categories, :map, default: %{})
     field(:applied_message_ids, {:array, :string}, default: [])
     field(:restored_message_ids, {:array, :string}, default: [])
     field(:fingerprint, :string)
@@ -23,7 +24,7 @@ defmodule EmailJanitor.Store.Action do
     field(:recovered_at, :utc_datetime_usec)
 
     field(:category, Ecto.Enum,
-      values: [:cold_outreach, :legitimate, :uncertain, :user_instruction]
+      values: [:cold_outreach, :legitimate, :uncertain, :user_instruction, :mixed]
     )
 
     field(:state, Ecto.Enum, values: [:intent, :done, :restored, :cancelled, :unresolved])
