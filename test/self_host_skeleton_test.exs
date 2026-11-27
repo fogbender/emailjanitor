@@ -229,9 +229,69 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert reconnected.epoch > before.epoch
     assert {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
     assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
-    assert :ok = Store.activate({box.id, reconnected.epoch})
-    refute Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
-    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).state == :active
+    assert {:error, :baseline_activation_required} = Store.activate({box.id, reconnected.epoch})
+    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
+  end
+
+  test "reconnect checkpoint and binding activation recover atomically after a failed callback",
+       ctx do
+    alias EmailJanitor.Gmail.Ingestion
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    first = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    watch = %{history_id: "100", expires_at: DateTime.add(DateTime.utc_now(), 3600)}
+
+    assert {:ok, original} =
+             Ingestion.baseline(ctx.scope, box, watch,
+               on_baseline: fn _ -> Store.activate({box.id, first.epoch}) end
+             )
+
+    :ok = SelfHost.disconnect(owner, box.id)
+    {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    fresh = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    ref = {box.id, fresh.epoch}
+    {:ok, version} = EmailJanitor.Store.instruction_version(ctx.scope, box.id)
+    new_watch = %{watch | history_id: "200"}
+
+    assert {:error, :activation_failed} =
+             Ingestion.reconnect(ctx.scope, box, original.generation, new_watch,
+               expected_instruction_version: version,
+               on_baseline: fn _ ->
+                 :ok = Store.activate(ref)
+                 raise "simulated process failure before commit"
+               end
+             )
+
+    assert {:ok, checkpoint} = Ingestion.checkpoint(ctx.scope, box.id)
+    assert checkpoint.generation == original.generation
+    assert checkpoint.cursor == "100"
+
+    assert %{state: :pending, reset_baseline: true} =
+             Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+
+    assert {:ok, next} =
+             Ingestion.reconnect(ctx.scope, box, original.generation, new_watch,
+               expected_instruction_version: version,
+               on_baseline: fn _ -> Store.activate(ref) end
+             )
+
+    refute next.generation == original.generation
+    assert next.cursor == "200"
+
+    assert %{state: :active, reset_baseline: false} =
+             Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+
+    assert {:ok, :ok} = Ingestion.record_signal(ctx.scope, box, "201")
+
+    assert {:ok, resumed} =
+             Ingestion.activate(ctx.scope, box, next.generation,
+               expected_instruction_version: version,
+               on_baseline: fn _ -> Store.activate(ref) end
+             )
+
+    assert resumed.generation == next.generation
+    assert resumed.cursor == "200"
+    assert resumed.requested_id == "201"
   end
 
   test "late refresh cannot overwrite newer consent even when the connection epoch is preserved",

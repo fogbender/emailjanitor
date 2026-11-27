@@ -76,9 +76,11 @@ defmodule EmailJanitor.SelfHost.Config do
          fragment: nil
        }}
       when is_binary(host) and host != "" and path in [nil, "/"] and port in 1..65_535 ->
-        if scheme == "https" or (scheme == "http" and host in ["localhost", "127.0.0.1", "::1"]),
-          do: {:ok, String.trim_trailing(value, "/")},
-          else: :error
+        if not Regex.match?(~r/:(?:0[0-9]*|)\/?\z/, value) and
+             (scheme == "https" or
+                (scheme == "http" and host in ["localhost", "127.0.0.1", "::1"])),
+           do: {:ok, String.trim_trailing(value, "/")},
+           else: :error
 
       _ ->
         :error

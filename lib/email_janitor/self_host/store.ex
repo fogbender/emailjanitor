@@ -300,11 +300,18 @@ defmodule EmailJanitor.SelfHost.Store do
 
   @doc false
   def activate({id, _} = ref) do
+    # A deliberate reconnect must publish its new checkpoint and clear this
+    # marker in the caller's SAME transaction, via Ingestion.on_baseline.
+    outer_transaction? = SelfHost.scope().repo.in_transaction?()
+
     case transaction(fn scope ->
            lock_mailbox(scope, id)
 
            case fetch_binding(ref) do
              {:ok, binding, _} ->
+               if binding.reset_baseline and not outer_transaction?,
+                 do: scope.repo.rollback(:baseline_activation_required)
+
                scope.repo.update!(
                  Ecto.Changeset.change(binding, state: :active, reset_baseline: false),
                  prefix: scope.prefix

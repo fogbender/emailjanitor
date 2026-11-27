@@ -58,6 +58,8 @@ defmodule EmailJanitor.SelfHostConfigTest do
           "https://janitor.example.com:0",
           "https://janitor.example.com:65536",
           "https://janitor.example.com:99999",
+          "https://janitor.example.com:",
+          "https://janitor.example.com:0443",
           "https://user@janitor.example.com",
           "https://janitor.example.com/path",
           "https://janitor.example.com?token=secret",
