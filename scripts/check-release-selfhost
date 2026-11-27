@@ -59,7 +59,7 @@ email_janitor eval 'EmailJanitor.SelfHost.Release.migrate()' >"$janitor_fixture_
 email_janitor eval 'EmailJanitor.SelfHost.Release.migrate()' >>"$janitor_fixture_dir/migrate.log" 2>&1
 # The local repair entrypoint must use only Repo, never start providers/web.
 email_janitor eval '
-  {:error, _} = EmailJanitor.SelfHost.Release.confirm_google_access_removed(
+  {:error, :inbox_unavailable} = EmailJanitor.SelfHost.Release.confirm_google_access_removed(
     "missing-inbox", "00000000-0000-4000-8000-000000000001", "synthetic-subject", :google_access_removed)
   nil = Process.whereis(EmailJanitor.SelfHost.Supervisor)
   nil = Process.whereis(EmailJanitor.SelfHost.Repo)
