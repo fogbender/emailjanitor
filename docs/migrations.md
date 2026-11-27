@@ -10,8 +10,8 @@ inside an optional module.
 | 1 | Core inboxes/actions | `Store.install/1` |
 | 2 | Core action candidates | `Store.install/1` |
 | 3 | Conversational preferences/receipts | `Preferences.install/1` |
-| 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` (in development) |
-| 5 | Daily digest metadata | Digest installer (in development) |
+| 4 | Mail outbox/temporary spool metadata | `Mail.Store.install/1` |
+| 5 | Daily digest metadata | `Digest.install/1` |
 | 6 | Per-message review fences/categories | Target-review installer (in development) |
 | 7 | Exact-message restoration protection/receipts | Restore installer (in development) |
 | 8 | Body-free conversational effect/context receipts | `Conversation.Ledger.install/1` |
