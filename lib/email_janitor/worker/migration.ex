@@ -150,6 +150,7 @@ defmodule EmailJanitor.Worker.Candidate do
   use Ecto.Schema
   @primary_key false
   schema "janitor_worker_candidates" do
+    field(:read_started_at, :utc_datetime_usec, virtual: true)
     field(:inbox_id, :string, primary_key: true)
     field(:candidate_id, Ecto.UUID, primary_key: true)
     field(:generation, Ecto.UUID)

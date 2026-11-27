@@ -536,6 +536,206 @@ defmodule EmailJanitor.WorkerTest do
     assert read(ctx.state).mutations == []
   end
 
+  for {phase, options} <- [
+        {:snapshot, [snapshot_error: :thread_not_found]},
+        {:review, [full_thread_error_at: 1]},
+        {:execute, [full_thread_error_at: 2]}
+      ] do
+    test "confirmed deleted #{phase} retires core and host provenance without backlog churn",
+         ctx do
+      Agent.update(ctx.quota, &%{&1 | block: :cap})
+      assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+      assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+      Agent.update(ctx.state, &Map.put(&1, :full_thread_count, 0))
+      before = read(ctx.quota).calls
+      config = %{ctx.config | gmail: {Gmail, [state: ctx.state] ++ unquote(options)}}
+      assert {:ok, %{status: :skipped}} = Worker.step(config)
+      assert Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix) == []
+
+      assert [%Candidate{status: :retired, message_ids: [], requested: false}] =
+               Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+      assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+      assert read(ctx.quota).calls -- before == [{:retire_whole, ["message-1"]}]
+      assert read(ctx.state).mutations == []
+    end
+  end
+
+  test "deleted manual subset retires exact metadata and preserves unrelated siblings", ctx do
+    id = manual_candidate(ctx)
+    :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"], authority_id: id)
+    before = read(ctx.quota).calls
+
+    config = %{
+      ctx.config
+      | gmail: {Gmail, [state: ctx.state, snapshot_error: :thread_not_found]},
+        allow_manual_recheck: fn _, _ -> :ok end
+    }
+
+    assert {:ok, %{status: :skipped}} = Worker.step(config)
+
+    assert [%EmailJanitor.Store.Candidate{remaining_message_ids: ["message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    assert read(ctx.quota).calls -- before == [{:retire_exact, ["message-1"]}]
+    assert read(ctx.state).mutations == []
+  end
+
+  test "a newer explicit recheck cannot be retired by an older deletion snapshot", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    [source] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn ->
+               :ok = Worker.queue_recheck(ctx.scope, ctx.box, source.candidate_id)
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true, request_version: version}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert version == source.request_version + 1
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+  end
+
+  test "new per-ID authority after the source fetch preserves metadata even before a new worker row",
+       ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn ->
+               {:ok, :ok} =
+                 Repo.transaction(fn ->
+                   Store.fence_recheck(ctx.scope, ctx.box.id, ["message-1"])
+                 end)
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+  end
+
+  test "a connection generation change prevents deletion metadata retirement", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+
+    config = %{
+      ctx.config
+      | gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn ->
+               {:ok, cp} = Ingestion.checkpoint(ctx.scope, ctx.box.id)
+
+               {:ok, _} =
+                 Ingestion.reconnect(ctx.scope, ctx.box, cp.generation, %{
+                   history_id: "900",
+                   expires_at: DateTime.add(DateTime.utc_now(), 604_800)
+                 })
+             end
+           ]}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+  end
+
+  test "unsupported partial deletion retirement pauses without whole-candidate withdrawal", ctx do
+    id = manual_candidate(ctx)
+    :ok = Worker.queue_manual(ctx.scope, ctx.box, id, "thread-1", ["message-1"], authority_id: id)
+
+    config = %{
+      ctx.config
+      | gmail: {Gmail, [state: ctx.state, snapshot_error: :thread_not_found]},
+        allow_manual_recheck: fn _, _ -> :ok end,
+        policy: %Policy{adapter: __MODULE__.WholeOnlyPolicy, context: self()}
+    }
+
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+
+    assert [%Candidate{requested: false, contract_blocked: true, message_ids: ["message-1"]}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert [%EmailJanitor.Store.Candidate{remaining_message_ids: ["message-1", "message-2"]}] =
+             Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)
+
+    refute_received {:legacy_whole_retired, _}
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+  end
+
+  test "authorization revoked during the missing-thread read preserves all provenance", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    auth = start_supervised!({Agent, fn -> true end}, id: :deleted_auth)
+
+    config = %{
+      ctx.config
+      | authorize: fn -> if Agent.get(auth, & &1), do: :ok, else: {:error, :disconnected} end,
+        gmail:
+          {Gmail,
+           [
+             state: ctx.state,
+             snapshot_error: :thread_not_found,
+             snapshot_hook: fn -> Agent.update(auth, fn _ -> false end) end
+           ]}
+    }
+
+    assert {:ok, %{status: :connection_changed}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+    assert read(ctx.state).mutations == []
+  end
+
+  test "failed host retirement rolls back deleted source metadata for retry", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.quota, &Map.put(&1, :retire_error, true))
+    config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_error: :thread_not_found]}}
+    assert {:ok, %{status: :policy_unavailable}} = Worker.step(config)
+
+    assert [%Candidate{status: :pending, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(Repo.all(EmailJanitor.Store.Candidate, prefix: ctx.scope.prefix)) == 1
+    assert read(ctx.state).mutations == []
+  end
+
   for {reason, expected, requested} <- [
         {:thread_not_found, :skipped, false},
         {:not_found, :gmail_unavailable, true}
