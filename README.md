@@ -592,6 +592,13 @@ UUIDs bind the action and exact selection; duplicate or ambiguous effects never
 auto-dispatch again. Proven dead owners with no dispatch marker may be cancelled,
 allowing a fresh explicit request UUID. Overlapping unresolved effects stay blocked.
 
+`Restore.outcome/3` reads an effect without network access: positive wire proof
+is `{:done, id}`, a live owner is `{:prepared, id}`, proven dead pre-dispatch
+owners are `{:cancelled, id}`, and dispatched or unknown-owner ambiguity remains
+`{:unresolved, id}`. `Restore.overlap_outcome/4` distinguishes live overlapping
+requests from permanent ambiguity; a completed wire awaiting only reporting does
+not block a new explicit request. These reads do not dispatch or settle effects.
+
 Hosts must pass `authorize: fn -> :ok | {:error, atom} end` and the current
 `expected_instruction_version:`. Authorization is bounded DB-only work and runs
 again under the final mailbox fence; disconnect must atomically increment that
@@ -626,3 +633,5 @@ the positive effect timestamp and per-ID review fences, preserves unrelated IDs
 and newer accepted requests, and never constructs an invented review snapshot.
 Explicit rechecks and changed manual selections atomically fence older reviews;
 ordinary scheduler discovery does not refresh that authority.
+The 30s mutation watchdog ends after the provider call; positive proof and
+reporting use the remaining overall 60s owner budget, including database waits.

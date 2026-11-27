@@ -13,6 +13,7 @@ defmodule EmailJanitor.RestoreTest do
        username: System.fetch_env!("USER"),
        port: 5432,
        pool_size: 10,
+       timeout: 45_000,
        log: false}
     )
 
@@ -279,10 +280,69 @@ defmodule EmailJanitor.RestoreTest do
 
     task = Task.async(fn -> restore(%{ctx | gmail: gmail}) end)
     assert_receive {:dispatch_waiting, worker}, 2_000
-    assert {:existing, :unresolved, _} = restore(ctx)
+    assert {:existing, :intent, id} = restore(ctx)
+    assert {:prepared, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
+    assert {:prepared, ^id} = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"])
+    assert :none = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"], id)
     assert {:error, :restore_pending} = restore(%{ctx | effect_id: Ecto.UUID.generate()})
     send(worker, :continue)
     assert {:done, _} = Task.await(task)
+    assert read(ctx).restores == [["message-1"]]
+    assert {:done, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
+    assert :none = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"])
+  end
+
+  test "post-wire DB contention has its own remaining owner budget", ctx do
+    parent = self()
+
+    gmail =
+      {__MODULE__.Gmail,
+       [
+         state: ctx.state,
+         before_wire: fn -> Process.sleep(15_100) end,
+         after_wire: fn ->
+           wire_owner = self()
+
+           locker =
+             spawn(fn ->
+               Repo.transaction(fn ->
+                 Ecto.Adapters.SQL.query!(
+                   Repo,
+                   ~s|SELECT id FROM "#{ctx.scope.prefix}".inboxes WHERE id = $1 FOR UPDATE|,
+                   [ctx.box.id],
+                   log: false
+                 )
+
+                 send(wire_owner, :mailbox_locked)
+                 send(parent, {:mailbox_locked, self()})
+
+                 receive do
+                   :release -> :ok
+                 after
+                   45_000 -> :ok
+                 end
+               end)
+             end)
+
+           receive do
+             :mailbox_locked -> :ok
+           after
+             5_000 -> Process.exit(locker, :kill)
+           end
+         end
+       ]}
+
+    task = Task.async(fn -> send(parent, {:restore_finished, restore(%{ctx | gmail: gmail})}) end)
+    assert_receive {:mailbox_locked, locker}, 20_000
+    on_exit(fn -> send(locker, :release) end)
+    # Wire consumed 15s. Old code killed this owner at 30s while it was waiting
+    # to record positive proof; the mutation-only watchdog must already be off.
+    refute_receive {:restore_finished, _}, 16_000
+    send(locker, :release)
+    assert_receive {:restore_finished, {:done, id}}, 5_000
+    assert id == ctx.effect_id
+    Task.await(task)
+    assert {:done, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
     assert read(ctx).restores == [["message-1"]]
   end
 
@@ -299,6 +359,60 @@ defmodule EmailJanitor.RestoreTest do
     assert {:existing, :cancelled, _} = restore(ctx)
     assert {:done, _} = restore(%{ctx | effect_id: Ecto.UUID.generate()})
     assert read(ctx).restores == [["message-1"]]
+  end
+
+  test "metadata outcomes distinguish absent, cancelled, positive and permanent ambiguous effects",
+       ctx do
+    assert :none = Restore.outcome(ctx.scope, ctx.box, ctx.effect_id)
+    assert :none = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"])
+    assert {:error, :invalid_restore_selection} = Restore.outcome(ctx.scope, ctx.box, "bad")
+    assert {:error, :invalid_restore_selection} = Restore.overlap_outcome(ctx.scope, ctx.box, [])
+
+    assert {:error, :wrong_inbox} =
+             Restore.outcome(ctx.scope, %{ctx.box | address: "wrong@acme.com"}, ctx.effect_id)
+
+    assert {:unresolved, id} = restore(ctx, on_restored: fn _, _ -> {:error, :retry} end)
+    assert {:done, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
+    assert :none = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"])
+    # A new explicit request may act after a completed wire even if old report
+    # bookkeeping awaits retry. The same effect UUID remains DB-only.
+    assert {:done, _} = restore(%{ctx | effect_id: Ecto.UUID.generate()})
+
+    effect = Repo.get!(Effect, id, prefix: ctx.scope.prefix)
+
+    Repo.update!(
+      Ecto.Changeset.change(effect,
+        applied_at: nil,
+        state: :unresolved
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:unresolved, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
+    assert {:unresolved, ^id} = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"])
+
+    effect = Repo.get!(Effect, id, prefix: ctx.scope.prefix)
+    unknown = %{EmailJanitor.Owner.capture() | owner_runtime: "unknown-runtime", owner_host: nil}
+
+    Repo.update!(
+      Ecto.Changeset.change(
+        effect,
+        Map.merge(unknown, %{state: :intent, dispatch_started_at: nil})
+      ),
+      prefix: ctx.scope.prefix
+    )
+
+    assert {:unresolved, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
+
+    dead = spawn(fn -> :ok end)
+    monitor = Process.monitor(dead)
+    assert_receive {:DOWN, ^monitor, :process, ^dead, _}
+    effect = Repo.get!(Effect, id, prefix: ctx.scope.prefix)
+    owner = %{EmailJanitor.Owner.capture() | owner_beam_pid: :erlang.term_to_binary(dead)}
+    Repo.update!(Ecto.Changeset.change(effect, owner), prefix: ctx.scope.prefix)
+    assert {:cancelled, ^id} = Restore.outcome(ctx.scope, ctx.box, id)
+    assert :none = Restore.overlap_outcome(ctx.scope, ctx.box, ["message-1"])
+    assert read(ctx).restores == [["message-1"], ["message-1"]]
   end
 
   test "expired budgets stop both before intent and after reservation without any mutation",
@@ -779,25 +893,29 @@ defmodule EmailJanitor.RestoreTest.Gmail do
      fn ->
        if callback = opts[:before_wire], do: callback.()
 
-       Agent.get_and_update(opts[:state], fn state ->
-         rejected? = match?({:rejected, _}, state.mode)
+       result =
+         Agent.get_and_update(opts[:state], fn state ->
+           rejected? = match?({:rejected, _}, state.mode)
 
-         messages =
-           Enum.map(state.messages, fn message ->
-             if message.id in ids and not rejected?,
-               do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
-               else: message
-           end)
+           messages =
+             Enum.map(state.messages, fn message ->
+               if message.id in ids and not rejected?,
+                 do: %{message | labels: Enum.uniq(["INBOX" | message.labels])},
+                 else: message
+             end)
 
-         result =
-           case state.mode do
-             :timeout -> {:error, :timeout}
-             {:rejected, _} = rejected -> rejected
-             _ -> :ok
-           end
+           result =
+             case state.mode do
+               :timeout -> {:error, :timeout}
+               {:rejected, _} = rejected -> rejected
+               _ -> :ok
+             end
 
-         {result, %{state | messages: messages, restores: state.restores ++ [ids]}}
-       end)
+           {result, %{state | messages: messages, restores: state.restores ++ [ids]}}
+         end)
+
+       if callback = opts[:after_wire], do: callback.()
+       result
      end}
   end
 end

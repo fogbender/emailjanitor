@@ -37,6 +37,76 @@ defmodule EmailJanitor.Restore do
 
   def install(scope), do: normalize_install(Store.install(scope))
 
+  @doc "Read a scoped effect's durable/owner outcome without contacting Gmail. Positive wire proof counts as done."
+  def outcome(scope, %Inbox{} = inbox, effect_id) do
+    safe(fn ->
+      with {:ok, id} <- Ecto.UUID.cast(effect_id),
+           :ok <- readable_inbox(scope, inbox) do
+        scope.repo.get_by(Effect, [id: id, inbox_id: inbox.id],
+          prefix: scope.prefix,
+          log: false
+        )
+        |> effect_outcome()
+      else
+        {:error, :wrong_inbox} = error -> error
+        _ -> {:error, :invalid_restore_selection}
+      end
+    end)
+  end
+
+  @doc "Read unresolved overlapping effects. Live owners are retryable; unknown/dead dispatched effects remain protected."
+  def overlap_outcome(scope, %Inbox{} = inbox, ids, excluding_effect_id \\ nil) do
+    safe(fn ->
+      with true <- valid_ids?(ids),
+           {:ok, excluded} <- optional_uuid(excluding_effect_id),
+           :ok <- readable_inbox(scope, inbox) do
+        query =
+          from(e in Effect,
+            where:
+              e.inbox_id == ^inbox.id and e.state in [:intent, :unresolved] and
+                is_nil(e.applied_at) and fragment("? && ?::text[]", e.message_ids, ^ids),
+            order_by: [asc: e.inserted_at, asc: e.id]
+          )
+
+        query = if excluded, do: from(e in query, where: e.id != ^excluded), else: query
+
+        outcomes =
+          scope.repo.all(query, prefix: scope.prefix, log: false)
+          |> Enum.map(&effect_outcome/1)
+
+        Enum.find(outcomes, &match?({:unresolved, _}, &1)) ||
+          Enum.find(outcomes, &match?({:prepared, _}, &1)) || :none
+      else
+        {:error, :wrong_inbox} = error -> error
+        _ -> {:error, :invalid_restore_selection}
+      end
+    end)
+  end
+
+  defp optional_uuid(nil), do: {:ok, nil}
+  defp optional_uuid(id), do: Ecto.UUID.cast(id)
+
+  defp readable_inbox(scope, inbox) do
+    case scope.repo.get(Mailbox, inbox.id, prefix: scope.prefix, log: false) do
+      %Mailbox{address: address} when address == inbox.address -> :ok
+      _ -> {:error, :wrong_inbox}
+    end
+  end
+
+  defp effect_outcome(nil), do: :none
+  defp effect_outcome(%Effect{applied_at: %DateTime{}, id: id}), do: {:done, id}
+  defp effect_outcome(%Effect{state: :done, id: id}), do: {:done, id}
+  defp effect_outcome(%Effect{state: :cancelled, id: id}), do: {:cancelled, id}
+  defp effect_outcome(%Effect{state: :unresolved, id: id}), do: {:unresolved, id}
+
+  defp effect_outcome(%Effect{state: :intent, id: id} = effect) do
+    case {Owner.proof(effect), effect.dispatch_started_at} do
+      {:alive, _} -> {:prepared, id}
+      {:dead, nil} -> {:cancelled, id}
+      _ -> {:unresolved, id}
+    end
+  end
+
   def apply(
         scope,
         %Inbox{} = inbox,
@@ -172,6 +242,7 @@ defmodule EmailJanitor.Restore do
              where:
                e.inbox_id == ^inbox.id and
                  e.state in [:intent, :unresolved] and
+                 is_nil(e.applied_at) and
                  fragment("? && ?::text[]", e.message_ids, ^ids)
            ),
            prefix: scope.prefix,
@@ -221,34 +292,32 @@ defmodule EmailJanitor.Restore do
     result =
       Owner.bounded(fn ->
         case begin_dispatch(scope, inbox, effect, authorize) do
-          :ok ->
-            case safe(mutation) do
-              :ok ->
-                case record_applied(scope, inbox, effect) do
-                  :ok -> settle_effect(scope, inbox, effect.id, authorize, on_restored, policy)
-                  _ -> {:unresolved, effect.id}
-                end
-
-              {:rejected, reason}
-              when reason in [:authorization_required, :forbidden, :rate_limited] ->
-                case finish(scope, effect, :cancelled) do
-                  :ok -> {:error, reason}
-                  _ -> {:unresolved, effect.id}
-                end
-
-              _ ->
-                finish(scope, effect, :unresolved)
-                {:unresolved, effect.id}
-            end
-
-          {:error, reason} ->
-            cancel_prepared(scope, inbox, effect)
-            {:error, reason}
+          :ok -> {:wire_result, safe(mutation)}
+          error -> error
         end
       end)
 
+    # The mutation-only watchdog ends before potentially contended DB locks.
+    # Positive proof and reporting retain the owner's overall 60s deadline.
     case result do
-      {:error, :dispatch_window_exhausted} ->
+      {:wire_result, :ok} ->
+        case record_applied(scope, inbox, effect) do
+          :ok -> settle_effect(scope, inbox, effect.id, authorize, on_restored, policy)
+          _ -> {:unresolved, effect.id}
+        end
+
+      {:wire_result, {:rejected, reason}}
+      when reason in [:authorization_required, :forbidden, :rate_limited] ->
+        case finish(scope, effect, :cancelled) do
+          :ok -> {:error, reason}
+          _ -> {:unresolved, effect.id}
+        end
+
+      {:wire_result, _} ->
+        finish(scope, effect, :unresolved)
+        {:unresolved, effect.id}
+
+      {:error, _} ->
         cancel_prepared(scope, inbox, effect)
         result
 
@@ -482,9 +551,11 @@ defmodule EmailJanitor.Restore do
           end
 
         state =
-          if effect.state == :intent && not is_nil(effect.dispatch_started_at),
-            do: :unresolved,
-            else: effect.state
+          case effect_outcome(effect) do
+            {:prepared, _} -> :intent
+            {:unresolved, _} -> :unresolved
+            _ -> effect.state
+          end
 
         {:existing, state, id}
 
