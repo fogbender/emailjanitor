@@ -15,8 +15,9 @@ one user can connect multiple Google inboxes. The hosted application's tenancy
 and billing live separately in `fogbender/emailjanitor-saas`.
 
 **Under development.** No integrated production service yet. A
-[locked Nix release](docs/release-packaging.md) now builds the reviewed library;
-host startup and live provider verification remain integration gates. The
+[locked Nix release](docs/release-packaging.md) builds the opt-in single-user host,
+including its browser and background services. Installed startup is tested with
+isolated synthetic providers; live provider verification remains a launch gate. The
 existing personal Janitor remains independent until a verified cutover.
 
 The [implementation plan](docs/implementation-plan.md) records the agreed product
@@ -195,9 +196,10 @@ part of this metadata.
 
 The executor uses a fake Gmail adapter in its unit tests. The Gmail SDK adapter
 has separate HTTP-transport tests; model tests exercise both real SDK pipelines
-against synthetic responses. No live Gmail account or model credentials are connected yet. There
-is no running cleanup service, email transport, chat UI, billing, or cloud
-deployment yet.
+against synthetic responses. The opt-in host includes cleanup, email feedback,
+digests and its browser UI; installed startup is tested locally. No live Gmail
+account or model credentials are connected and no production deployment has run.
+SaaS billing, tenancy and the fresh TNA LiveView foundation live in the private repo.
 
 The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage

@@ -76,7 +76,8 @@ defmodule EmailJanitor.SelfHost.Revocation do
         :refresh_token_invalid,
         :missing_token,
         :revoked,
-        :credential_unusable
+        :credential_unusable,
+        :operator_confirmed
       ]
     )
 
@@ -178,6 +179,63 @@ defmodule EmailJanitor.SelfHost.Revocations do
       end
     end
   end
+
+  @doc """
+  Trusted LOCAL operator attestation after removing ALL former Janitor access in
+  the affected Google account. This does not verify or invoke Google. Never expose
+  it to HTTP, a model, or an automatic retry. Exact request/subject matching and
+  the mailbox lock prevent a stale confirmation from clearing a newer grant.
+  """
+  def confirm_manual(inbox_id, request_id, subject, :google_access_removed) do
+    with {:ok, request_id} <- Ecto.UUID.cast(request_id),
+         true <- is_binary(inbox_id) and is_binary(subject) do
+      Store.transaction(fn scope ->
+        Store.lock_mailbox(scope, inbox_id)
+        row = scope.repo.get(Revocation, inbox_id, prefix: scope.prefix, log: false)
+        binding = scope.repo.get(Binding, inbox_id, prefix: scope.prefix, log: false)
+
+        unless row && binding && row.request_id == request_id && row.google_subject == subject &&
+                 binding.google_subject == subject,
+               do: scope.repo.rollback(:confirmation_changed)
+
+        cond do
+          row.state == :complete and row.outcome == :operator_confirmed ->
+            :already_confirmed
+
+          row.state == :manual_required and is_nil(row.token_ciphertext) and
+            Enum.all?(@owner_keys, &is_nil(Map.get(row, &1))) and
+            binding.state == :revocation_required and is_nil(binding.token_ciphertext) ->
+            scope.repo.update!(
+              Ecto.Changeset.change(row,
+                state: :complete,
+                outcome: :operator_confirmed,
+                next_attempt_at: nil
+              ),
+              prefix: scope.prefix,
+              log: false
+            )
+
+            scope.repo.update!(Ecto.Changeset.change(binding, state: :disconnected),
+              prefix: scope.prefix,
+              log: false
+            )
+
+            :operator_confirmed
+
+          true ->
+            scope.repo.rollback(:manual_confirmation_unavailable)
+        end
+      end)
+    else
+      _ -> {:error, :invalid_confirmation}
+    end
+  rescue
+    _ -> {:error, :manual_confirmation_unavailable}
+  catch
+    _, _ -> {:error, :manual_confirmation_unavailable}
+  end
+
+  def confirm_manual(_, _, _, _), do: {:error, :invalid_confirmation}
 
   def tasks(config) do
     %{

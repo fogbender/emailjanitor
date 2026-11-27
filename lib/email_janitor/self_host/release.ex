@@ -75,4 +75,25 @@ defmodule EmailJanitor.SelfHost.Release do
       _ -> raise "Email Janitor host migrations are unavailable or not configured."
     end
   end
+
+  @doc "Local operator entrypoint; loads only configuration and Repo, never web or background jobs."
+  def confirm_google_access_removed(inbox_id, request_id, subject, :google_access_removed) do
+    with {:ok, config} <- Config.load(),
+         {:ok, _} <- Application.ensure_all_started(:ecto_sql),
+         {:ok, _} <- Application.ensure_all_started(:postgrex),
+         :ok <- Application.put_env(:email_janitor, :self_host_config, config),
+         {:ok, repo} <- Repo.start_link(config.database) do
+      try do
+        SelfHost.Revocations.confirm_manual(inbox_id, request_id, subject, :google_access_removed)
+      after
+        Supervisor.stop(repo)
+      end
+    else
+      _ -> {:error, :manual_confirmation_unavailable}
+    end
+  rescue
+    _ -> {:error, :manual_confirmation_unavailable}
+  end
+
+  def confirm_google_access_removed(_, _, _, _), do: {:error, :invalid_confirmation}
 end

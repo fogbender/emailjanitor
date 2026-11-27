@@ -271,4 +271,88 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
                revoke: fn _, _ -> flunk("no token to revoke") end
              )
   end
+
+  test "only an exact local operator attestation releases a missing-token fence; stale repeats preserve new consent",
+       ctx do
+    Repo.update!(Ecto.Changeset.change(host_binding(ctx), token_ciphertext: nil),
+      prefix: ctx.scope.prefix
+    )
+
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.inbox.id)
+    row = saved(ctx)
+    assert row.state == :manual_required
+
+    assert {:error, :confirmation_changed} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               Ecto.UUID.generate(),
+               row.google_subject,
+               :google_access_removed
+             )
+
+    assert {:error, :confirmation_changed} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               row.request_id,
+               "another-subject",
+               :google_access_removed
+             )
+
+    assert {:error, :invalid_confirmation} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               row.request_id,
+               row.google_subject,
+               :assume_removed
+             )
+
+    assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
+
+    assert {:ok, :operator_confirmed} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               row.request_id,
+               row.google_subject,
+               :google_access_removed
+             )
+
+    assert saved(ctx).outcome == :operator_confirmed
+    assert host_binding(ctx).state == :disconnected
+    assert {:ok, _} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
+    fresh = host_binding(ctx)
+
+    assert {:ok, :already_confirmed} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               row.request_id,
+               row.google_subject,
+               :google_access_removed
+             )
+
+    assert host_binding(ctx) == fresh
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.inbox.id)
+
+    assert {:error, :confirmation_changed} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               row.request_id,
+               row.google_subject,
+               :google_access_removed
+             )
+  end
+
+  test "operator confirmation never overrides a recoverable pending revocation", ctx do
+    assert :ok = SelfHost.disconnect(ctx.owner, ctx.inbox.id)
+    row = saved(ctx)
+
+    assert {:error, :manual_confirmation_unavailable} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               row.request_id,
+               row.google_subject,
+               :google_access_removed
+             )
+
+    assert saved(ctx) == row
+  end
 end

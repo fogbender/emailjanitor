@@ -1,10 +1,10 @@
 # Single-user host control plane
 
-`EmailJanitor.SelfHost` is the opt-in AWS host's fixed-owner facade. This slice
-provides configuration, encrypted Google grants and connection lifecycle storage.
-Browser setup, cleanup/conversation worker startup and inbound email integration
-are separate integration gates; this storage slice alone is not a running host.
-The shared library's ordinary application startup remains unchanged.
+`EmailJanitor.SelfHost` is the opt-in AWS host's fixed-owner facade. Its release
+includes encrypted Google grants, browser setup, cleanup/conversation workers,
+revocation, digest and inbound feedback services. Installed startup/migrations are
+tested against isolated synthetic services; real provider readiness and cutover
+remain launch gates. Embedding the shared engine alone starts none of this host.
 
 The concrete `SelfHost.Repo` uses a Unix-socket PostgreSQL connection. Its scope
 is always `ej_selfhost`; browser parameters and model output cannot select a repo
@@ -71,6 +71,38 @@ pending. An unexplained missing capability is displayed as requiring manual
 cleanup rather than falsely claiming success. Use a new isolated Google Cloud
 project: revocation affects every OAuth client and scope in that project, so
 reusing the old personal Janitor/Inbox Zero project is unsafe for live tests.
+
+### Missing-token operator recovery
+
+A `manual_required` retirement never clears itself: Janitor has no capability to
+prove the old Google grant was removed. Stop the self-host service first. Using
+its local PostgreSQL credentials, inspect only the exact pending metadata:
+
+```sql
+SELECT r.inbox_id, r.request_id, r.google_subject, a.address, r.state
+FROM ej_selfhost.self_host_revocations r
+JOIN ej_selfhost.inboxes a ON a.id = r.inbox_id
+WHERE r.state = 'manual_required';
+```
+
+In the **affected Google account**, remove all former Email Janitor app access
+from Google's third-party connections settings, including every previous Janitor
+OAuth project/client. Confirm the actual account/profile and app/project; do not
+attest if the former project cannot be identified. This is a manual provider
+operation, not something the local command verifies. Keep the fence if uncertain.
+Then, with the service still stopped and its same trusted runtime environment,
+run the installed release with the exact metadata read above:
+
+```sh
+email_janitor eval 'EmailJanitor.SelfHost.Release.confirm_google_access_removed("INBOX_ID", "REQUEST_UUID", "GOOGLE_SUBJECT", :google_access_removed) |> IO.inspect()'
+```
+
+The local-only command records `operator_confirmed`, distinct from an SDK-proven
+revocation. It cannot override pending/processing work, a changed subject/request,
+or a newer consent. It loads only configuration/Repo and makes no network request;
+it is never exposed to browser/model APIs. Restart the service and reconnect the
+Google account. Keep all other inbox/action/history/restoration records; do not
+wipe the database or clear the fence with ad-hoc SQL.
 
 Ordinary refresh/reconsent preserves the epoch/cursor;
 reauthorization after a revoked grant keeps the newly fenced epoch. A durable `reset_baseline`
