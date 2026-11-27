@@ -121,6 +121,8 @@ defmodule EmailJanitor.Executor do
     end
   end
 
+  defp retire_keep(_context, :unreadable_content), do: {:keep, :unreadable_content}
+
   defp retire_keep(context, reason) do
     case Store.retire_ineligible(
            context.scope,

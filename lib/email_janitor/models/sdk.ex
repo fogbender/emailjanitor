@@ -246,6 +246,11 @@ defmodule EmailJanitor.Models.SDK do
 
     case type do
       "text/html" ->
+        source = Content.read(body)
+
+        if byte_size(source) > 262_144 or length(:binary.matches(source, "<")) > 4096,
+          do: throw(:invalid_html)
+
         case HTML.readable(body) do
           {:ok, text} -> bounded(Content.read(text), 16_000)
           _ -> throw(:invalid_html)
