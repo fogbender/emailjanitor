@@ -227,6 +227,7 @@ defmodule EmailJanitor.SelfHost.Store do
                    Ecto.Changeset.change(binding,
                      state: :disconnected,
                      reset_baseline: true,
+                     reset_generation: checkpoint_generation(scope, id),
                      token_ciphertext: nil,
                      epoch: binding.epoch + 1,
                      token_version: binding.token_version + 1
@@ -309,11 +310,17 @@ defmodule EmailJanitor.SelfHost.Store do
 
            case fetch_binding(ref) do
              {:ok, binding, _} ->
-               if binding.reset_baseline and not outer_transaction?,
-                 do: scope.repo.rollback(:baseline_activation_required)
+               if binding.reset_baseline and
+                    (not outer_transaction? or
+                       checkpoint_generation(scope, id) in [nil, binding.reset_generation]),
+                  do: scope.repo.rollback(:baseline_activation_required)
 
                scope.repo.update!(
-                 Ecto.Changeset.change(binding, state: :active, reset_baseline: false),
+                 Ecto.Changeset.change(binding,
+                   state: :active,
+                   reset_baseline: false,
+                   reset_generation: nil
+                 ),
                  prefix: scope.prefix
                )
 
@@ -374,6 +381,13 @@ defmodule EmailJanitor.SelfHost.Store do
     end
   end
 
+  defp checkpoint_generation(scope, id) do
+    case scope.repo.get(EmailJanitor.Gmail.Ingestion.Checkpoint, id, prefix: scope.prefix) do
+      nil -> nil
+      checkpoint -> checkpoint.generation
+    end
+  end
+
   defp retire_replaced_subjects(scope, subject, address) do
     bindings =
       scope.repo.all(
@@ -382,7 +396,7 @@ defmodule EmailJanitor.SelfHost.Store do
           on: m.id == b.id,
           where:
             m.address == ^address and b.google_subject != ^subject and
-              b.state in [:pending, :active],
+              b.state in [:pending, :active, :reauthorization_required],
           order_by: b.id,
           select: b
         ),
@@ -396,6 +410,7 @@ defmodule EmailJanitor.SelfHost.Store do
         Ecto.Changeset.change(binding,
           state: :disconnected,
           reset_baseline: true,
+          reset_generation: checkpoint_generation(scope, binding.id),
           token_ciphertext: nil,
           epoch: binding.epoch + 1,
           token_version: binding.token_version + 1

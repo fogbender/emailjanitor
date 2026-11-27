@@ -24,6 +24,7 @@ defmodule EmailJanitor.SelfHost.Binding do
 
     field(:epoch, :integer, default: 1)
     field(:reset_baseline, :boolean, default: false)
+    field(:reset_generation, Ecto.UUID)
     field(:token_version, :integer, default: 1)
     field(:token_ciphertext, :binary, redact: true)
     timestamps(type: :utc_datetime_usec)

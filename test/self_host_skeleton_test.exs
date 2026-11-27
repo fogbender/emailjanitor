@@ -251,6 +251,17 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     fresh = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
     ref = {box.id, fresh.epoch}
     {:ok, version} = EmailJanitor.Store.instruction_version(ctx.scope, box.id)
+
+    assert {:error, :activation_failed} =
+             Ingestion.activate(ctx.scope, box, original.generation,
+               expected_instruction_version: version,
+               on_baseline: fn _ -> Store.activate(ref) end
+             )
+
+    assert %{state: :pending, reset_baseline: true, reset_generation: generation} =
+             Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+
+    assert generation == original.generation
     new_watch = %{watch | history_id: "200"}
 
     assert {:error, :activation_failed} =
