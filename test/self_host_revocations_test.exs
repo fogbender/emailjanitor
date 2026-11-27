@@ -2,7 +2,17 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
   use ExUnit.Case, async: false
   alias EmailJanitor.{Content, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.{Binding, Config, Credentials, Repo, Revocation, Revocations, Store}
+
+  alias EmailJanitor.SelfHost.{
+    Binding,
+    Config,
+    Credentials,
+    GoogleGrant,
+    Repo,
+    Revocation,
+    Revocations,
+    Store
+  }
 
   setup_all do
     start_supervised!(
@@ -131,7 +141,8 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
              )
 
     send(owner, :complete)
-    assert {:ok, :revoked} = Task.await(task, 5_000)
+    assert {:ok, :retirement_continues} = Task.await(task, 5_000)
+    assert {:ok, :revoked} = Revocations.tick(ctx.config.google_oauth, revoke: fn _, _ -> :ok end)
     assert saved(ctx).state == :complete and saved(ctx).outcome == :revoked
     assert saved(ctx).token_ciphertext == nil and saved(ctx).owner_token == nil
     assert host_binding(ctx).state == :disconnected
@@ -161,9 +172,14 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
                revoke: fn _, _ -> flunk("must preserve backoff") end
              )
 
-    assert {:ok, :credential_unusable} =
+    assert {:ok, :retirement_continues} =
              Revocations.tick(ctx.config.google_oauth,
                now: DateTime.add(DateTime.utc_now(), 61),
+               revoke: fn _, _ -> {:error, :refresh_token_invalid} end
+             )
+
+    assert {:ok, :credential_unusable} =
+             Revocations.tick(ctx.config.google_oauth,
                revoke: fn _, _ -> {:error, :refresh_token_invalid} end
              )
 
@@ -218,7 +234,8 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
 
     refute_receive :recovery_provider_call, 100
     assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
-    assert {:ok, :revoked} = Task.await(recovery, 25_000)
+    assert {:ok, :retirement_continues} = Task.await(recovery, 25_000)
+    assert {:ok, :revoked} = Revocations.tick(ctx.config.google_oauth, revoke: fn _, _ -> :ok end)
     assert_receive :recovery_provider_call
     assert System.monotonic_time(:millisecond) - started >= 20_000
 
@@ -244,6 +261,8 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
 
   test "already-rejected erased credentials can finish locally, while unexplained missing capabilities stay explicit",
        ctx do
+    Repo.delete_all(GoogleGrant, prefix: ctx.scope.prefix)
+
     Repo.update!(
       Ecto.Changeset.change(host_binding(ctx),
         state: :reauthorization_required,
@@ -256,6 +275,8 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
     assert saved(ctx).state == :complete and saved(ctx).outcome == :credential_unusable
     assert host_binding(ctx).state == :disconnected
     assert {:ok, _} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
+
+    Repo.delete_all(GoogleGrant, prefix: ctx.scope.prefix)
 
     Repo.update!(Ecto.Changeset.change(host_binding(ctx), token_ciphertext: nil),
       prefix: ctx.scope.prefix
@@ -274,6 +295,8 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
 
   test "only an exact local operator attestation releases a missing-token fence; stale repeats preserve new consent",
        ctx do
+    Repo.delete_all(GoogleGrant, prefix: ctx.scope.prefix)
+
     Repo.update!(Ecto.Changeset.change(host_binding(ctx), token_ciphertext: nil),
       prefix: ctx.scope.prefix
     )
@@ -307,6 +330,17 @@ defmodule EmailJanitor.SelfHostRevocationsTest do
              )
 
     assert {:error, :revocation_pending} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
+    previous = row
+    row = saved(ctx)
+    refute row.request_id == previous.request_id
+
+    assert {:error, :confirmation_changed} =
+             Revocations.confirm_manual(
+               ctx.inbox.id,
+               previous.request_id,
+               previous.google_subject,
+               :google_access_removed
+             )
 
     assert {:ok, :operator_confirmed} =
              Revocations.confirm_manual(

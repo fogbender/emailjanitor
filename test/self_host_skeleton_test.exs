@@ -209,6 +209,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert :ok = disconnect_and_complete(owner, box.id)
     send(callback, :continue)
     assert {:error, :google_credentials_unavailable} = Task.await(task, 5000)
+    assert :ok = complete_revocations()
     saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
     assert saved.state == :disconnected
     assert saved.token_ciphertext == nil
@@ -493,9 +494,9 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert {:error, :unauthorized} = disconnect_and_complete("other", second.id)
   end
 
-  test "connection validates credentials and timezone before any durable binding", ctx do
+  test "invalid token shapes never persist; valid rejected grants remain captured for retirement",
+       ctx do
     {:ok, owner} = SelfHost.authorize_owner(result())
-    assert {:error, :invalid_connection} = SelfHost.connect(owner, result(), "Invalid/Timezone")
 
     assert {:error, :invalid_connection} =
              SelfHost.connect(
@@ -514,6 +515,12 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
              )
 
     assert Repo.aggregate(from(b in Binding), :count, prefix: ctx.scope.prefix) == 0
+    assert {:error, :invalid_connection} = SelfHost.connect(owner, result(), "Invalid/Timezone")
+
+    assert [%{state: :revoking, token_ciphertext: nil}] =
+             Repo.all(Binding, prefix: ctx.scope.prefix)
+
+    assert :ok = complete_revocations()
     expired = with_token(result(), %{"expires_at" => System.system_time(:second) - 1})
     assert {:error, :invalid_connection} = SelfHost.connect(owner, expired, "Etc/UTC")
 

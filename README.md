@@ -731,3 +731,38 @@ repair then preserves the original authority age. Explicit repair still uses
 `queue_recheck` to reset paused or capped work.
 The 30s mutation watchdog ends after the provider call; positive proof and
 reporting use the remaining overall 60s owner budget, including database waits.
+
+
+### Retained Google grants
+
+The opt-in single-user host stores every received, canonical offline grant under
+its immutable Google identity. A new consent commits its encrypted capability
+before a separate binding/publication transaction, so failed validation, stale
+publication or a SQL rollback cannot erase it. Repeated refresh IDs are deduplicated
+with a domain-separated HMAC using the existing credential master. Only encrypted
+authentication JSON and metadata are retained; no email bodies are added.
+
+Superseded grants stay dormant while a newer connection is active. Revoking one
+may invalidate other grants for the same Google user/project. Disconnect stops
+local work immediately, then retires one saved snapshot per bounded worker tick.
+A callback received while retirement is fenced is retained without activation.
+Only the exact snapshot covered by a provider result is erased; a newer recapture
+survives. Reconnection stays fenced until all retained capabilities are settled.
+
+Refresh ownership is committed before SDK wire I/O. SDK replies are captured
+independently before normalization, version checks or credential publication.
+Retirement waits for active refreshes. A confirmed-dead owner receives a physical
+30-second quarantine, covering the SDK's connect10s + receive15s bounds even after
+a wall-clock jump. A lost response remains explicitly uncertain. Success from the
+project-wide revocation endpoint can resolve that uncertainty; an invalid old
+refresh token alone cannot prove an uncaptured rotation gone. In that case local
+access stays stopped and the existing exact local operator confirmation of ALL
+former Google access removed is required. Fresh captures invalidate stale manual
+confirmation IDs. Provider calls never run under SQL locks.
+
+These facade calls belong outside caller-owned SQL transactions. The maintained
+browser host observes that boundary; a host must not wrap OAuth exchange/capture
+in a transaction that it may later roll back. Migration105 preserves legacy
+in-flight retirements and refuses rollback while grants or uncertain refreshes
+remain. Keep the credential master stable, complete retirement before a supported
+schema rollback, and never downgrade to a host that ignores the retained ledger.
