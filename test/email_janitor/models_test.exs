@@ -377,6 +377,56 @@ defmodule EmailJanitor.ModelsTest do
     assert {:ok, %Decision{}} = run(:azure, messages)
   end
 
+  test "combined encoded context above the request budget is kept without dispatch" do
+    requester = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(requester, :oversized_context_dispatched)
+      azure_response(conn, @decision)
+    end)
+
+    messages =
+      for n <- 1..5,
+          do:
+            message(
+              id: "m#{n}",
+              body: String.duplicate("b", 16_000),
+              headers: [{"From", "sales@vendor.com"}, {"Subject", String.duplicate("s", 4096)}]
+            )
+
+    assert {:keep, :unreadable_content} = run(:azure, messages)
+    refute_receive :oversized_context_dispatched, 0
+  end
+
+  test "mixed targets and context retain original order without duplicate-ID expansion" do
+    expected = ["TARGET_A", "CONTEXT_BEFORE_B", "TARGET_B", "CONTEXT_MIDDLE", "CONTEXT_NEWEST"]
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      refute body =~ "DROPPED_CONTEXT"
+
+      offsets =
+        Enum.map(expected, fn marker ->
+          {offset, _} = :binary.match(body, marker)
+          offset
+        end)
+
+      assert offsets == Enum.sort(offsets)
+      azure_response(conn, @decision)
+    end)
+
+    messages = [
+      message(id: "shared", body: "DROPPED_CONTEXT", labels: []),
+      message(id: "targetA", body: "TARGET_A"),
+      message(id: "shared", body: "CONTEXT_BEFORE_B", labels: []),
+      message(id: "targetB", body: "TARGET_B"),
+      message(id: "shared", body: "CONTEXT_MIDDLE", labels: []),
+      message(id: "shared", body: "CONTEXT_NEWEST", labels: [])
+    ]
+
+    assert {:ok, %Decision{}} = run(:azure, messages)
+  end
+
   test "more than five actionable messages keeps the whole conversation without dispatch" do
     requester = self()
 
