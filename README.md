@@ -59,10 +59,11 @@ here; full SaaS authorization is a later integration gate.
 ## Model privacy boundary
 
 Use only `[:email_janitor, :model, :stop]` for application model metrics; it emits
-duration and a fixed success/error status. Do not export or log ReqLLM's raw
-exception lifecycle events: upstream error objects can contain transient request
-text even with `payloads: :none`. The SDK adapter discards those errors and returns
-fixed categories. Raw payload tracing, SDK debug mode and automatic dotenv loading
-are disabled. Normal tests cover echoed body text in HTTP errors and application
-telemetry. SDK retries are disabled (`max_retries: 0`); the durable job owner controls
+duration and a fixed success/error status. The adapter removes the pinned SDK's
+request lifecycle telemetry before dispatch, including the upstream exception
+event that can otherwise contain raw text despite `payloads: :none`. Provider
+preparation, signing and decoding still use the SDK. Tests attach an upstream
+exporter and exercise failures for both providers. Raw payload tracing and dotenv
+loading are disabled; calls fail closed if SDK debug mode is enabled. SDK retries
+are disabled (`max_retries: 0`); the durable job owner controls
 retry/backoff. Never put full SDK responses/errors into job arguments or reports.

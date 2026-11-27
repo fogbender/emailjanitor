@@ -21,7 +21,7 @@ defmodule EmailJanitor.ModelsTest do
     config
   end
 
-  defp run(provider, messages \\ [message(body: "PRIVATE_BODY_SENTINEL")]) do
+  defp run(provider, messages \\ [message(body: "PRIVATE_BODY_SENTINEL")], box \\ inbox()) do
     credentials = fn "us-east-1" ->
       {:ok,
        [
@@ -40,7 +40,8 @@ defmodule EmailJanitor.ModelsTest do
          http_options: [plug: {Req.Test, __MODULE__}]
        ]},
       messages,
-      "Keep requested customer conversations."
+      "Keep requested customer conversations.",
+      box
     )
   end
 
@@ -185,6 +186,97 @@ defmodule EmailJanitor.ModelsTest do
     refute inspect(meta) =~ "PRIVATE_BODY_SENTINEL"
   end
 
+  test "an attached upstream exporter cannot capture lifecycle request data on failures" do
+    id = "janitor-test-upstream-events"
+
+    :ok =
+      :telemetry.attach_many(
+        id,
+        ReqLLM.Telemetry.events(),
+        fn event, measure, meta, pid ->
+          send(pid, {:upstream_event, event, measure, meta})
+        end,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    for failure <- [:transport, 400, 429, 500], provider <- [:azure, :bedrock] do
+      Req.Test.stub(__MODULE__, fn conn ->
+        if failure == :transport,
+          do: Req.Test.transport_error(conn, :econnrefused),
+          else:
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              failure,
+              Jason.encode!(%{error: %{message: "PRIVATE_BODY_SENTINEL"}})
+            )
+      end)
+
+      assert {:error, :model_unavailable} = run(provider)
+    end
+
+    refute_receive {:upstream_event, [:req_llm, :request, _], _, _}
+
+    for value <- drain_upstream() do
+      refute inspect(value) =~ "PRIVATE_BODY_SENTINEL"
+      refute inspect(value) =~ "TEST_API_KEY_SENTINEL"
+      refute inspect(value) =~ "TEST_SECRET_KEY_SENTINEL"
+    end
+  end
+
+  defp drain_upstream do
+    receive do
+      {:upstream_event, event, measure, meta} -> [{event, measure, meta} | drain_upstream()]
+    after
+      0 -> []
+    end
+  end
+
+  test "the selected inbox and recipient context reach the request through Reviewer" do
+    alias EmailJanitor.{Inbox, Reviewer}
+
+    for address <- ["owner@first.example.com", "owner@second.example.com"] do
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        assert body =~ address
+        assert body =~ "recipient@example.com"
+        azure_response(conn, @decision)
+      end)
+
+      {:ok, box} = Inbox.new("box-" <> address, address)
+      value = message(headers: [{"From", "sales@vendor.com"}, {"To", "recipient@example.com"}])
+
+      assert {:ok, _} =
+               Reviewer.review(
+                 [value],
+                 box,
+                 MapSet.new(),
+                 {SDK, [config: config(:azure), http_options: [plug: {Req.Test, __MODULE__}]]},
+                 "Only clean unsolicited offers addressed to this inbox.",
+                 1
+               )
+    end
+  end
+
+  test "oversized and deeply nested HTML fails closed before DOM construction or HTTP" do
+    Req.Test.stub(__MODULE__, fn _ -> flunk("Oversized HTML must never reach the provider") end)
+
+    for source <- [
+          String.duplicate("x", 262_145),
+          String.duplicate("<div>", 2500) <> "Pitch" <> String.duplicate("</div>", 2500)
+        ] do
+      value =
+        message(
+          headers: [{"From", "sales@vendor.com"}, {"Content-Type", "text/html"}],
+          body: source
+        )
+
+      assert {:error, :model_unavailable} = run(:azure, [value])
+    end
+  end
+
   test "HTML cleanup is case-insensitive and includes only the last five messages" do
     Req.Test.stub(__MODULE__, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -222,7 +314,7 @@ defmodule EmailJanitor.ModelsTest do
     assert {:error, _} = run(:azure)
   end
 
-  test "an out-of-enum model response is rejected by the SDK" do
+  test "an out-of-enum model response is rejected" do
     Req.Test.stub(__MODULE__, fn conn ->
       azure_response(conn, %{
         "action" => "delete",

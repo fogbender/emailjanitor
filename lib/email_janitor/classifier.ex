@@ -5,7 +5,9 @@ defmodule EmailJanitor.Classifier do
   @callback classify(list(EmailJanitor.Message.t()), String.t(), keyword()) ::
               {:ok, String.t() | map()} | {:error, term()}
 
-  def propose({adapter, options}, messages, instructions) do
+  def propose({adapter, options}, messages, instructions, inbox \\ nil) do
+    options = if inbox, do: Keyword.put(options, :inbox, inbox), else: options
+
     case adapter.classify(messages, instructions, options) do
       {:ok, result} ->
         case Decision.parse(result) do
