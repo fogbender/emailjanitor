@@ -78,7 +78,10 @@ defmodule EmailJanitor.ModelsTest do
       assert Plug.Conn.get_req_header(conn, "api-key") == ["TEST_API_KEY_SENTINEL"]
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       assert body =~ "PRIVATE_BODY_SENTINEL"
-      assert [tool] = Jason.decode!(body)["tools"]
+      request = Jason.decode!(body)
+      assert request["store"] in [nil, false]
+      assert get_in(request, ["tool_choice", "function", "name"]) == "structured_output"
+      assert [tool] = request["tools"]
       assert (tool["name"] || get_in(tool, ["function", "name"])) == "structured_output"
       azure_response(conn, @decision)
     end)
@@ -89,24 +92,29 @@ defmodule EmailJanitor.ModelsTest do
   test "Bedrock uses SDK SigV4 and Nova Converse, not an API key" do
     Req.Test.stub(__MODULE__, fn conn ->
       assert conn.host == "bedrock-runtime.us-east-1.amazonaws.com"
-      assert String.ends_with?(conn.request_path, "/converse")
+      assert conn.request_path == "/model/amazon.nova-micro-v1:0/converse"
       [authorization] = Plug.Conn.get_req_header(conn, "authorization")
       assert authorization =~ "AWS4-HMAC-SHA256"
       assert authorization =~ "TEST_ACCESS_ID"
+      assert authorization =~ "/us-east-1/bedrock/aws4_request"
+      assert authorization =~ ~r/SignedHeaders=[^ ]*x-amz-security-token/
       assert Plug.Conn.get_req_header(conn, "x-amz-security-token") == ["TEST_SESSION_SENTINEL"]
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       assert body =~ "PRIVATE_BODY_SENTINEL"
+      request = Jason.decode!(body)
+      assert request["toolConfig"] in [nil, %{}]
+      assert get_in(request, ["inferenceConfig", "maxTokens"]) == 4096
 
       Req.Test.json(conn, %{
         output: %{
           message: %{
             role: "assistant",
             content: [
-              %{toolUse: %{toolUseId: "tool-1", name: "structured_output", input: @decision}}
+              %{text: Jason.encode!(@decision)}
             ]
           }
         },
-        stopReason: "tool_use",
+        stopReason: "end_turn",
         usage: %{inputTokens: 100, outputTokens: 15, totalTokens: 115},
         metrics: %{latencyMs: 1}
       })
@@ -202,7 +210,7 @@ defmodule EmailJanitor.ModelsTest do
     assert {:ok, %Decision{}} = run(:azure, messages)
   end
 
-  test "schema-invalid model decisions fail closed" do
+  test "contradictory model decisions fail closed" do
     Req.Test.stub(__MODULE__, fn conn ->
       azure_response(conn, %{
         "action" => "done",
@@ -212,6 +220,30 @@ defmodule EmailJanitor.ModelsTest do
     end)
 
     assert {:error, _} = run(:azure)
+  end
+
+  test "an out-of-enum model response is rejected by the SDK" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      azure_response(conn, %{
+        "action" => "delete",
+        "confidence" => "high",
+        "category" => "cold_outreach"
+      })
+    end)
+
+    assert {:error, :model_unavailable} = run(:azure)
+  end
+
+  test "Nova text must be valid constrained JSON, not a tool or prose fallback" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        output: %{message: %{role: "assistant", content: [%{text: "PRIVATE_BODY_SENTINEL"}]}},
+        stopReason: "end_turn",
+        usage: %{inputTokens: 10, outputTokens: 5, totalTokens: 15}
+      })
+    end)
+
+    assert {:error, :model_unavailable} = run(:bedrock)
   end
 
   test "config offers only Bedrock self-host and Azure SaaS, and redacts secrets" do

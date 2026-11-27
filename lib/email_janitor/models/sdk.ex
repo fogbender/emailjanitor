@@ -59,22 +59,24 @@ defmodule EmailJanitor.Models.SDK do
     options = Keyword.merge(options, credentials)
     provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
 
-    case ReqLLM.generate_object(
-           %{provider: provider, id: config.model},
-           context,
-           @schema,
-           options
-         ) do
-      {:ok, response} ->
-        object = ReqLLM.Response.object(response)
+    model = %{provider: provider, id: config.model}
+    # ReqLLM does not force structured tools for Nova Micro. Classification has
+    # no executable tools, so use its normal text API and validate JSON locally.
+    generated =
+      if config.provider == :bedrock,
+        do: ReqLLM.generate_text(model, context, Keyword.delete(options, :output_validation)),
+        else: ReqLLM.generate_object(model, context, @schema, options)
 
-        case Decision.parse(object) do
-          {:ok, _} -> {:ok, object}
-          _ -> {:error, :invalid_decision}
-        end
-
-      _ ->
-        {:error, :model_unavailable}
+    with {:ok, response} <- generated,
+         object =
+           if(config.provider == :bedrock,
+             do: ReqLLM.Response.text(response),
+             else: ReqLLM.Response.object(response)
+           ),
+         {:ok, _} <- Decision.parse(object) do
+      if is_binary(object), do: Jason.decode(object), else: {:ok, object}
+    else
+      _ -> {:error, :model_unavailable}
     end
   rescue
     _ -> {:error, :model_unavailable}
