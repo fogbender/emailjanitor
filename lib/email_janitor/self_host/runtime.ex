@@ -25,6 +25,9 @@ defmodule EmailJanitor.SelfHost.Runtime do
 
   defp runtime_configured?(config) do
     with true <- not is_nil(config.google_oauth),
+         revoke_path when is_binary(revoke_path) <- config.google_oauth.revocation_executable,
+         {:ok, %{type: :regular, mode: revoke_mode}} <- File.stat(revoke_path),
+         true <- Bitwise.band(revoke_mode, 0o111) != 0,
          path when is_binary(path) <- config.reply_parser_executable,
          {:ok, %{type: :regular, mode: mode}} <- File.stat(path),
          true <- Bitwise.band(mode, 0o111) != 0,

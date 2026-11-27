@@ -88,9 +88,12 @@ defmodule EmailJanitor.SelfHost.Adapters do
         {:ok, scope, %Inbox{id: id, address: address}}
 
       [] ->
-        if matches != [] and Enum.all?(matches, fn {_, _, state} -> state == :disconnected end),
-          do: {:ignore, :disconnected},
-          else: {:error, :route_unavailable}
+        if matches != [] and
+             Enum.all?(matches, fn {_, _, state} ->
+               state in [:disconnected, :revoking, :revocation_required]
+             end),
+           do: {:ignore, :disconnected},
+           else: {:error, :route_unavailable}
 
       _ ->
         {:error, :route_unavailable}

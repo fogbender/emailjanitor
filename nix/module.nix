@@ -33,6 +33,10 @@ in {
       default = "/run/secrets/emailjanitor/google-client.json";
       description = "Runtime Google Web OAuth client JSON with the exact public /auth/google/callback redirect.";
     };
+    googleHelperPackage = lib.mkOption {
+      type = lib.types.package;
+      description = "Pinned official Google SDK package providing bin/emailjanitor-google-revoke.";
+    };
     publicHostname = lib.mkOption {
       type = lib.types.nullOr (lib.types.addCheck
         (lib.types.strMatching "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
@@ -106,6 +110,7 @@ in {
         JANITOR_SECRET_KEY_BASE_FILE = "%d/web-secret";
         JANITOR_GOOGLE_CLIENT_JSON_FILE = "%d/google-client.json";
         JANITOR_REPLY_PARSER_EXECUTABLE = "${cfg.replyParserPackage}/bin/emailjanitor-reply-parser";
+        JANITOR_GOOGLE_REVOKE_EXECUTABLE = "${cfg.googleHelperPackage}/bin/emailjanitor-google-revoke";
         ERL_CRASH_DUMP = "/dev/null";
         RELEASE_TMP = "/run/emailjanitor/release";
         RELEASE_DISTRIBUTION = "none";

@@ -140,7 +140,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
 
     assert_receive {:scheduler_resolved, ^key}, 5_000
     assert {:ok, ^binding, ^box} = Store.fetch_binding(key)
-    assert :ok = SelfHost.disconnect(owner, box.id)
+    assert :ok = disconnect_and_complete(owner, box.id)
     assert {:error, :inbox_unavailable} = Store.fetch_binding(key)
     assert {:error, :inbox_unavailable} = Store.fetch_binding("not-a-binding-key")
   end
@@ -207,7 +207,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
 
     task = Task.async(fn -> Credentials.token({box.id, before.epoch}) end)
     assert_receive {:refresh_waiting, callback}, 5000
-    assert :ok = SelfHost.disconnect(owner, box.id)
+    assert :ok = disconnect_and_complete(owner, box.id)
     send(callback, :continue)
     assert {:error, :google_credentials_unavailable} = Task.await(task, 5000)
     saved = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
@@ -249,7 +249,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
     refute before.reset_baseline
     assert :ok = Store.activate({box.id, before.epoch})
-    assert :ok = SelfHost.disconnect(owner, box.id)
+    assert :ok = disconnect_and_complete(owner, box.id)
     assert {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
     reconnected = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
     assert reconnected.reset_baseline
@@ -274,7 +274,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
                on_baseline: fn _ -> Store.activate({box.id, first.epoch}) end
              )
 
-    :ok = SelfHost.disconnect(owner, box.id)
+    :ok = disconnect_and_complete(owner, box.id)
     {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
     fresh = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
     ref = {box.id, fresh.epoch}
@@ -482,16 +482,16 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert {:ok, token} = SelfHost.open("gmail-token", first.id, saved.token_ciphertext)
     assert Content.read(token) == Content.read(initial_result.token)
     {:ok, before} = EmailJanitor.Store.instruction_version(scope, first.id)
-    assert :ok = SelfHost.disconnect(owner, first.id)
+    assert :ok = disconnect_and_complete(owner, first.id)
     assert {:ok, after_version} = EmailJanitor.Store.instruction_version(scope, first.id)
     assert after_version == before + 1
     assert Repo.get!(Binding, first.id, prefix: scope.prefix).token_ciphertext == nil
     assert {:error, :inbox_unavailable} = SelfHost.inbox(owner, first.id)
-    assert :ok = SelfHost.disconnect(owner, first.id)
+    assert :ok = disconnect_and_complete(owner, first.id)
     assert {:ok, ^after_version} = EmailJanitor.Store.instruction_version(scope, first.id)
     assert {:ok, ^second} = SelfHost.inbox(owner, second.id)
     assert {:error, :unauthorized} = SelfHost.connect("other", result(), "Etc/UTC")
-    assert {:error, :unauthorized} = SelfHost.disconnect("other", second.id)
+    assert {:error, :unauthorized} = disconnect_and_complete("other", second.id)
   end
 
   test "connection validates credentials and timezone before any durable binding", ctx do
@@ -530,6 +530,7 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     refute first.id == second.id
     assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).google_subject == "work-one"
     assert Repo.get!(Binding, second.id, prefix: ctx.scope.prefix).google_subject == "work-two"
+    assert :ok = complete_revocations()
     assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).state == :disconnected
     assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).token_ciphertext == nil
     {:ok, repeated} = SelfHost.connect(owner, result("work-one", "work@example.com"), "Etc/UTC")
@@ -723,5 +724,24 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
 
     assert {:error, :credential_seal_failed} =
              SelfHost.seal("browser-oauth", "id1", Content.new(String.duplicate("x", 65_537)))
+  end
+
+  # These older lifecycle tests assert the completed-disconnect state. Provider
+  # calls remain synthetic; pending/crash/identity fences are covered separately.
+  defp disconnect_and_complete(owner, id) do
+    case SelfHost.disconnect(owner, id) do
+      :ok -> complete_revocations()
+      other -> other
+    end
+  end
+
+  defp complete_revocations do
+    case EmailJanitor.SelfHost.Revocations.tick(SelfHost.config().google_oauth,
+           revoke: fn _, _ -> :ok end
+         ) do
+      {:ok, :idle} -> :ok
+      {:ok, _} -> complete_revocations()
+      error -> flunk("synthetic grant retirement failed: #{inspect(error)}")
+    end
   end
 end

@@ -37,7 +37,7 @@ defmodule EmailJanitor.SelfHost.Services do
 
   @impl true
   def init({config, feedback}) do
-    children = [{SelfHost.Maintenance, config}]
+    children = [{SelfHost.Maintenance, config}, SelfHost.Revocations.child_spec(config)]
 
     children =
       case Adapters.mail(config) do

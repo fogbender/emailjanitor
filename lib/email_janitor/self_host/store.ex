@@ -3,13 +3,15 @@ defmodule EmailJanitor.SelfHost.Store do
   import Ecto.Query
   alias EmailJanitor.{Address, Content, Digest, Inbox, SelfHost}
   alias EmailJanitor.Google.OAuth
-  alias EmailJanitor.SelfHost.{Binding, HistoricalAddress, Migration, Owner}
+  alias EmailJanitor.SelfHost.{Binding, HistoricalAddress, Migration, Owner, Revocations}
   alias EmailJanitor.Store.Mailbox
 
   def install(
         %EmailJanitor.Store.Scope{repo: EmailJanitor.SelfHost.Repo, prefix: "ej_selfhost"} = scope
-      ),
-      do: Ecto.Migrator.up(scope.repo, 100, Migration, prefix: scope.prefix, log: false)
+      ) do
+    result = Ecto.Migrator.up(scope.repo, 100, Migration, prefix: scope.prefix, log: false)
+    if result in [:ok, :already_up], do: Revocations.install(scope), else: result
+  end
 
   def install(_), do: {:error, :invalid_self_host_scope}
 
@@ -111,6 +113,10 @@ defmodule EmailJanitor.SelfHost.Store do
         )
 
         mailbox = lock_mailbox(scope, box.id)
+
+        if Revocations.blocked?(scope, result.subject),
+          do: scope.repo.rollback(:revocation_pending)
+
         binding = scope.repo.get(Binding, box.id, prefix: scope.prefix)
         readdressed = mailbox.address != box.address
         if readdressed and is_nil(binding), do: scope.repo.rollback(:invalid_connection)
@@ -219,13 +225,16 @@ defmodule EmailJanitor.SelfHost.Store do
                nil ->
                  scope.repo.rollback(:inbox_unavailable)
 
-               %Binding{state: :disconnected} ->
+               %Binding{state: state}
+               when state in [:disconnected, :revoking, :revocation_required] ->
                  :ok
 
                binding ->
+                 state = Revocations.stage!(scope, binding)
+
                  scope.repo.update!(
                    Ecto.Changeset.change(binding,
-                     state: :disconnected,
+                     state: state,
                      reset_baseline: true,
                      reset_generation: checkpoint_generation(scope, id),
                      token_ciphertext: nil,
@@ -429,10 +438,11 @@ defmodule EmailJanitor.SelfHost.Store do
 
     for binding <- bindings do
       lock_mailbox(scope, binding.id)
+      state = Revocations.stage!(scope, binding)
 
       scope.repo.update!(
         Ecto.Changeset.change(binding,
-          state: :disconnected,
+          state: state,
           reset_baseline: true,
           reset_generation: checkpoint_generation(scope, binding.id),
           token_ciphertext: nil,

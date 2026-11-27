@@ -43,6 +43,8 @@ export JANITOR_SECRET_KEY_BASE_FILE="$janitor_fixture_dir/web-secret"
 export JANITOR_GOOGLE_CLIENT_JSON_FILE="$janitor_fixture_dir/google.json"
 export JANITOR_REPLY_PARSER_EXECUTABLE
 JANITOR_REPLY_PARSER_EXECUTABLE=$(command -v emailjanitor-reply-parser)
+export JANITOR_GOOGLE_REVOKE_EXECUTABLE
+JANITOR_GOOGLE_REVOKE_EXECUTABLE=$(command -v emailjanitor-google-revoke)
 export JANITOR_GOOGLE_TOKEN_FILE="$janitor_fixture_dir/missing-service-token"
 export JANITOR_GOOGLE_SUBSCRIPTION=projects/janitor-fixture/subscriptions/gmail
 export JANITOR_GOOGLE_TOPIC=projects/janitor-fixture/topics/gmail

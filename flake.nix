@@ -14,6 +14,8 @@
           lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.emailjanitor;
         services.emailjanitor.replyParserPackage =
           lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.reply-parser;
+        services.emailjanitor.googleHelperPackage =
+          lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.google-auth-bridge;
         services.emailjanitor-google-token.package =
           lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.google-auth-bridge;
       };
@@ -130,7 +132,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           release = pkgs.runCommand "emailjanitor-release-check" {
-            nativeBuildInputs = [ self.packages.${system}.emailjanitor self.packages.${system}.reply-parser pkgs.python3 pkgs.postgresql_17 pkgs.curl ];
+            nativeBuildInputs = [ self.packages.${system}.emailjanitor self.packages.${system}.reply-parser self.packages.${system}.google-auth-bridge pkgs.python3 pkgs.postgresql_17 pkgs.curl ];
           } ''
             export HOME="$TMPDIR"
             export ERL_CRASH_DUMP=/dev/null

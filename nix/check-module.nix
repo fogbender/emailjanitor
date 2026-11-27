@@ -67,6 +67,7 @@ in assert service.serviceConfig.EnvironmentFile == "/run/secrets/emailjanitor/en
    assert service.environment.JANITOR_SECRET_KEY_BASE_FILE == "%d/web-secret";
    assert service.environment.JANITOR_GOOGLE_CLIENT_JSON_FILE == "%d/google-client.json";
    assert service.environment.JANITOR_REPLY_PARSER_EXECUTABLE == "${outputs.packages.x86_64-linux.reply-parser}/bin/emailjanitor-reply-parser";
+   assert service.environment.JANITOR_GOOGLE_REVOKE_EXECUTABLE == "${outputs.packages.x86_64-linux.google-auth-bridge}/bin/emailjanitor-google-revoke";
    assert builtins.length service.serviceConfig.LoadCredential == 3;
    assert pkgs.lib.hasInfix "SelfHost.Release.migrate()" service.serviceConfig.ExecStartPre;
    assert tokenHost.config.systemd.services.emailjanitor.environment.JANITOR_GOOGLE_TOKEN_FILE == "/run/emailjanitor-google-token/token.json";

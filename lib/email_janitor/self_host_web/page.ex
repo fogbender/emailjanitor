@@ -47,7 +47,7 @@ defmodule EmailJanitor.SelfHostWeb.Page do
           " · ",
           h(row.timezone),
           "</small></div>",
-          if(row.state != :disconnected,
+          if(row.state not in [:disconnected, :revoking, :revocation_required],
             do:
               form(
                 "/accounts/" <> URI.encode_www_form(row.inbox.id) <> "/disconnect",
@@ -122,6 +122,8 @@ defmodule EmailJanitor.SelfHostWeb.Page do
 
   defp status(:active), do: "Connected"
   defp status(:pending), do: "Connecting"
+  defp status(:revoking), do: "Stopped; Google authorization cleanup pending"
+  defp status(:revocation_required), do: "Stopped; manual Google authorization cleanup required"
   defp status(:reauthorization_required), do: "Reconnect needed"
   defp status(_), do: "Disconnected"
 

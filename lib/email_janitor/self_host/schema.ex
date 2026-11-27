@@ -19,7 +19,14 @@ defmodule EmailJanitor.SelfHost.Binding do
     field(:timezone, :string)
 
     field(:state, Ecto.Enum,
-      values: [:pending, :active, :disconnected, :reauthorization_required]
+      values: [
+        :pending,
+        :active,
+        :disconnected,
+        :reauthorization_required,
+        :revoking,
+        :revocation_required
+      ]
     )
 
     field(:epoch, :integer, default: 1)

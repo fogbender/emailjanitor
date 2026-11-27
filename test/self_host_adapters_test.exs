@@ -159,7 +159,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
       CoreStore.intent(ctx.scope, ctx.box.id, proposal, "100", policy: policy)
 
     :ok = CoreStore.transition(ctx.scope, ctx.box.id, action.id, :intent, :done)
-    :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    :ok = disconnect_and_complete(ctx.owner, ctx.box.id)
 
     assert {:existing, _, :done} =
              Executor.settle_action(ctx.scope, ctx.box, action.id,
@@ -193,7 +193,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
              ])
 
     assert Repo.aggregate(Grant, :count, prefix: ctx.scope.prefix) == 1
-    :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    :ok = disconnect_and_complete(ctx.owner, ctx.box.id)
     assert {:error, :manual_authorization_changed} = Authority.allow(ctx.ref, request, ["m1"])
     assert {:ok, _} = SelfHost.connect(ctx.owner, ctx.result, "Etc/UTC")
     binding = Repo.get!(Binding, ctx.box.id, prefix: ctx.scope.prefix)
@@ -228,7 +228,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
 
     assert {:ok, scope, inbox} = Adapters.route(ctx.box.address)
     assert scope == ctx.scope and inbox == ctx.box
-    :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    :ok = disconnect_and_complete(ctx.owner, ctx.box.id)
     assert {:error, :inbox_unavailable} = context.guard.()
     assert {:ignore, :disconnected} = Adapters.route(ctx.box.address)
   end
@@ -389,7 +389,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
              prefix: ctx.scope.prefix
            ).message_ids == ["m2"]
 
-    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert :ok = disconnect_and_complete(ctx.owner, ctx.box.id)
     assert {:error, :manual_authorization_changed} = Authority.discover(ctx.ref, ctx.box)
   end
 
@@ -576,7 +576,7 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     assert :binary.match(:erlang.term_to_binary(first), "PRIVATE_SENT_BODY") == :nomatch
     assert :unknown = Email.route(envelope("unconnected@example.net"))
     assert {:error, :feedback_connection_changed} = Email.resolve(ctx.config, "malformed")
-    assert :ok = SelfHost.disconnect(ctx.owner, ctx.box.id)
+    assert :ok = disconnect_and_complete(ctx.owner, ctx.box.id)
     assert {:error, _} = binding.restore_context.(first.key)
     assert {:error, :feedback_connection_changed} = Email.resolve(ctx.config, route.key)
   end
@@ -708,5 +708,24 @@ defmodule EmailJanitor.SelfHostAdaptersTest do
     assert :binary.match(:erlang.term_to_binary(row), "PRIVATE_SMTP_COMMAND_BODY") == :nomatch
     assert Repo.aggregate(EmailJanitor.Mail.Outgoing, :count, prefix: ctx.scope.prefix) == 0
     assert {:next, nil, 1000} = MailJobs.process_once(config)
+  end
+
+  # These older lifecycle tests assert the completed-disconnect state. Provider
+  # calls remain synthetic; pending/crash/identity fences are covered separately.
+  defp disconnect_and_complete(owner, id) do
+    case SelfHost.disconnect(owner, id) do
+      :ok -> complete_revocations()
+      other -> other
+    end
+  end
+
+  defp complete_revocations do
+    case EmailJanitor.SelfHost.Revocations.tick(SelfHost.config().google_oauth,
+           revoke: fn _, _ -> :ok end
+         ) do
+      {:ok, :idle} -> :ok
+      {:ok, _} -> complete_revocations()
+      error -> flunk("synthetic grant retirement failed: #{inspect(error)}")
+    end
   end
 end

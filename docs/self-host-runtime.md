@@ -46,8 +46,30 @@ The checkpoint address changes in the same transaction after verifying the
 existing subject/address binding; its generation and cursor remain usable.
 Connection lifecycle changes serialize without holding provider calls under SQL.
 
-Explicit disconnect clears encrypted credentials and increments the epoch and
-instruction guard. Ordinary refresh/reconsent preserves the epoch/cursor;
+Explicit disconnect atomically removes ordinary resolver access, increments the
+epoch/instruction guard and moves the existing encrypted credential into the
+metadata-only retirement queue (host migration 103). A separately supervised
+worker revokes the stored offline refresh token through the pinned official
+Google SDK, outside database locks. It clears the pending ciphertext only after
+HTTP 200, or exact provider rejection establishing that the saved token is
+unusable. The latter reports only local access removal, not project-wide
+permission revocation. Generic failures retain the encrypted capability and a
+bounded retry. Repeated disconnect is idempotent.
+
+Fresh consent for the same immutable Google subject remains blocked while any
+old revocation can still run, even through another OAuth client or address. A
+dead BEAM owner is insufficient subprocess-death proof: a persisted 60-second
+quarantine exceeds the 30-second owning operation plus its last possible
+13-second SDK process before recovery. Current successful calls wait for the
+helper's exit status. If Google's SDK already rejected the saved refresh grant
+and the ordinary resolver erased it, local disconnect can complete without
+claiming Google project permissions were removed, provided no old revocation is
+pending. An unexplained missing capability is displayed as requiring manual
+cleanup rather than falsely claiming success. Use a new isolated Google Cloud
+project: revocation affects every OAuth client and scope in that project, so
+reusing the old personal Janitor/Inbox Zero project is unsafe for live tests.
+
+Ordinary refresh/reconsent preserves the epoch/cursor;
 reauthorization after a revoked grant keeps the newly fenced epoch. A durable `reset_baseline`
 marker distinguishes deliberate reconnect from reauthorization and records the
 old checkpoint generation. Activation requires a different, nonnil checkpoint
@@ -102,6 +124,9 @@ The module runs ascending migrations before startup, keeps PostgreSQL on its
 local Unix socket, disables core dumps/distribution, and preserves access to
 boot/process identity needed for durable owner recovery. The maintained reply
 parser is supplied from the same pinned flake.
+The module also supplies `JANITOR_GOOGLE_REVOKE_EXECUTABLE` from its pinned
+official-SDK helper package; tokens never appear in its process arguments or a
+temporary credential file.
 
 `nixosModules.google-token` is also usable by the private Azure host. Its
 `services.emailjanitor-google-token.configuration` contains only the official
