@@ -335,3 +335,49 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
+
+## Google workload token helper
+
+The isolated `google-auth-bridge` Nix package uses Google’s official Node SDK
+for AWS IMDSv2 or an explicitly selected Azure managed identity. It signs and
+exchanges workload credentials and impersonates the provisioned Google service
+account for the Pub/Sub scope. The pinned SDK’s AWS client adds its target header
+after signing; a small SDK subclass supplies the fixed configured audience to
+the official signer before delegation and rejects unexpected signed headers.
+Revalidate that upstream assumption on every SDK upgrade. It never receives Gmail credentials, email content,
+or model input. There is no handwritten SigV4 or STS implementation.
+
+A root-owned scheduled service runs:
+
+```sh
+emailjanitor-google-token --config /etc/emailjanitor/google-external-account.json --output /run/emailjanitor-google/token.json
+```
+
+Provision the SDK `external_account` JSON from the operator’s trusted infrastructure
+outputs. Only the expected Google STS/IAM endpoints and exact AWS metadata source
+or Azure metadata URL with an explicit `client_id` are accepted. Executables,
+ambient AWS keys, custom credential endpoints, proxies, redirects and retries
+are disabled. The helper caps requests at 10 seconds and its process at 45 seconds.
+The Nix launcher starts Node with an empty environment, excluding startup proxy,
+TLS, module injection and debug settings. Hosts must run this isolated launcher
+without ambient instrumentation or observers.
+
+The config must be owned by the helper user and not group/world writable. Use a
+canonical path, including the direct store path for Nix-generated configuration;
+the helper refuses configuration symlinks. Use a
+canonical absolute output directory owned by root, with the application’s group
+and mode `0750`. Tokens replace atomically with mode `0640`; failed refreshes keep
+the previous file. Give the application read-only access to this directory and
+no metadata-server/workload-credential access. Renew well before expiry, for
+example every 15 minutes with a one-hour token; restart the helper after reboot.
+The runtime file contains only `access_token` and epoch-second `expires_at`.
+Supply `fn -> EmailJanitor.Google.ServiceToken.read(path) end` as the Pub/Sub
+resolver. Missing, unsafe, malformed or expiring tokens fail closed without
+ambient-account fallback or credential logging.
+
+`nix build .#google-auth-bridge` builds and fixture-tests the pinned helper.
+`nix develop --command bash scripts/check-google-auth` runs real SDK federation,
+redirection/retry, configuration, redaction and atomic-file tests plus dependency
+audit. Only synthetic workload identities and mocked HTTP are used. Service
+unit wiring and deployment remain host integration work; no cloud resources
+have been changed by this helper slice.
