@@ -25,7 +25,8 @@ defmodule EmailJanitor.Decision do
   def parse(value) when is_map(value) and map_size(value) == 3 do
     with {:ok, action} <- Map.fetch(@actions, value["action"]),
          {:ok, confidence} <- Map.fetch(@confidence, value["confidence"]),
-         {:ok, category} <- Map.fetch(@categories, value["category"]) do
+         {:ok, category} <- Map.fetch(@categories, value["category"]),
+         true <- action != :done or category in [:cold_outreach, :user_instruction] do
       {:ok, %__MODULE__{action: action, confidence: confidence, category: category}}
     else
       _ -> {:error, :invalid_decision}

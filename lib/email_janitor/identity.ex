@@ -21,6 +21,10 @@ defmodule EmailJanitor.Identity do
             else: Enum.reject(addresses, &Address.within?(Address.domain(&1), own_domain))
 
         cond do
+          relay? and not Address.shared?(own_domain) and
+              Enum.any?(originals, &Address.within?(Address.domain(&1), own_domain)) ->
+            {:keep, :own_domain}
+
           own_from? and (not relay? or external == []) ->
             {:keep, :own_domain}
 

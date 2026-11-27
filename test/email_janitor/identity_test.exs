@@ -81,6 +81,19 @@ defmodule EmailJanitor.IdentityTest do
              Identity.resolve(m, inbox("owner@acme.com", ["hello@acme.com"]))
   end
 
+  test "a colleague forwarded through a relay remains protected with an external Reply-To" do
+    m =
+      message(
+        headers: [
+          {"From", "hello@acme.com"},
+          {"X-Original-Sender", "colleague@acme.com"},
+          {"Reply-To", "customer@vendor.com"}
+        ]
+      )
+
+    assert {:keep, :own_domain} = Identity.resolve(m, inbox("owner@acme.com", ["hello@acme.com"]))
+  end
+
   test "known external author behind relay stays protected" do
     m = message(headers: [{"From", "hello@acme.com"}, {"Reply-To", "known@vendor.com"}])
 

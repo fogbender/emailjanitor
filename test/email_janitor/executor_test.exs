@@ -71,22 +71,58 @@ defmodule EmailJanitor.ExecutorTest do
     assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
   end
 
-  test "ambiguous failures retain durable IDs and never blindly retry even after restoration",
-       ctx do
-    for mode <- [:timeout_after_apply, :raise_after_apply] do
-      case execute(ctx, mode: mode) do
-        {:unresolved, id} ->
-          assert %Action{state: :unresolved} = Store.get(ctx.scope, ctx.inbox.id, id)
-
-        {:existing, _, :unresolved} ->
-          :ok
-      end
-
+  for mode <- [
+        :timeout_after_apply,
+        :raise_after_apply,
+        :throw_after_apply,
+        :exit_after_apply,
+        :error_without_apply
+      ] do
+    test "#{mode} retains an intent and never blindly retries", ctx do
+      assert {:unresolved, id} = execute(ctx, mode: unquote(mode))
+      assert %Action{state: :unresolved} = Store.get(ctx.scope, ctx.inbox.id, id)
       Agent.update(ctx.state, &%{&1 | messages: [message()]})
       assert {:existing, _, :unresolved} = execute(ctx)
+      assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
     end
+  end
 
-    assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+  for mode <- [:timeout_after_apply, :ok] do
+    test "#{mode} cannot re-archive restored mail with changed labels or instructions", ctx do
+      assert elem(execute(ctx, mode: unquote(mode)), 0) in [:done, :unresolved]
+      changed = message(labels: ["INBOX", "IMPORTANT"])
+      Agent.update(ctx.state, &%{&1 | messages: [changed]})
+
+      {:ok, fresh} =
+        Reviewer.review([changed], ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+      assert {:existing, _, _} = execute(%{ctx | proposal: fresh})
+
+      TestRepo.update_all(EmailJanitor.Store.Mailbox, [set: [instruction_version: 2]],
+        prefix: ctx.scope.prefix
+      )
+
+      {:ok, fresh} =
+        Reviewer.review(
+          [changed],
+          ctx.inbox,
+          MapSet.new(),
+          {TestClassifier, []},
+          "New preference.",
+          2
+        )
+
+      assert {:existing, _, _} = execute(%{ctx | proposal: fresh})
+      assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+      assert [^changed] = Agent.get(ctx.state, & &1.messages)
+    end
+  end
+
+  test "a cancelled intent can be retried only after fresh safeguards", ctx do
+    assert {:unresolved, id} = execute(ctx, mode: :error_without_apply)
+    :ok = Store.transition(ctx.scope, ctx.inbox.id, id, :unresolved, :cancelled)
+    assert {:done, new_id} = execute(ctx)
+    refute id == new_id
   end
 
   test "record IDs are scoped by both schema and inbox", ctx do
@@ -104,6 +140,7 @@ defmodule EmailJanitor.ExecutorTest do
     assert {:ok, {:created, first}} = Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100")
     assert {:ok, {:existing, second}} = Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "101")
     assert first.id == second.id
+    assert second.history_id == "100"
     assert TestRepo.aggregate(from(a in Action), :count, prefix: ctx.scope.prefix) == 1
   end
 

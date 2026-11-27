@@ -57,4 +57,13 @@ defmodule EmailJanitor.ReconciliationTest do
                Reconciliation.resolve(action(), %{complete?: true, events: [bad]})
     end
   end
+
+  test "contradictory events at the same history ID stay unresolved in either order" do
+    events = [event("101", "one", :inbox_removed), event("101", "one", :inbox_added)]
+
+    for ordered <- [events, Enum.reverse(events)] do
+      assert {:error, :incomplete_history} =
+               Reconciliation.resolve(action(), %{complete?: true, events: ordered})
+    end
+  end
 end

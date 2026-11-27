@@ -37,23 +37,33 @@ defmodule EmailJanitor.Store do
     }
 
     scope.repo.transaction(fn ->
-      scope.repo.insert!(record,
-        prefix: scope.prefix,
-        on_conflict: :nothing,
-        conflict_target: [:inbox_id, :fingerprint, :instruction_version]
-      )
+      # Serialize reservations even for different reviews of the same message.
+      # Label/prompt changes must never bypass an earlier ambiguous mutation.
+      mailbox =
+        scope.repo.one!(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
 
-      action =
-        scope.repo.one!(
+      if mailbox.instruction_version != proposal.instruction_version,
+        do: scope.repo.rollback(:proposal_changed)
+
+      existing =
+        scope.repo.one(
           from(a in Action,
             where:
-              a.inbox_id == ^inbox_id and a.fingerprint == ^proposal.fingerprint and
-                a.instruction_version == ^proposal.instruction_version
+              a.inbox_id == ^inbox_id and a.state in [:intent, :unresolved, :done, :restored] and
+                fragment("? && ?::text[]", a.message_ids, ^proposal.message_ids),
+            order_by: [asc: a.inserted_at],
+            limit: 1
           ),
           prefix: scope.prefix
         )
 
-      {if(action.id == record.id, do: :created, else: :existing), action}
+      if existing do
+        {:existing, existing}
+      else
+        {:created, scope.repo.insert!(record, prefix: scope.prefix)}
+      end
     end)
   end
 
@@ -70,6 +80,7 @@ defmodule EmailJanitor.Store do
              intent: :cancelled,
              unresolved: :done,
              unresolved: :restored,
+             unresolved: :cancelled,
              done: :restored
            ] do
     {count, _} =

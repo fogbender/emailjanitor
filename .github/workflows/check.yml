@@ -16,6 +16,6 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
       - name: Locked dependencies, format, compilation, and isolated tests
-        run: nix develop --command bash -c 'mix deps.get && bash scripts/check'
+        run: nix develop --command bash -c 'mix deps.get --check-locked && bash scripts/check'
       - name: Dependency security advisories
         run: nix develop --command mix hex.audit
