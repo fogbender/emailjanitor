@@ -58,10 +58,24 @@ defmodule EmailJanitor.Policy do
       end
 
     case result do
-      :ok -> :ok
-      {:blocked, reason} when is_atom(reason) -> {:blocked, reason}
-      {:error, :partial_admission_unsupported} = unsupported -> unsupported
-      _ -> {:error, :policy_unavailable}
+      :ok ->
+        :ok
+
+      {:blocked, reason} when is_atom(reason) ->
+        {:blocked, reason}
+
+      {:error, reason} = error
+      when reason in [
+             :partial_admission_unsupported,
+             :manual_authorization_changed,
+             :manual_recheck_unsupported,
+             :connection_changed,
+             :ineligible_recheck
+           ] ->
+        error
+
+      _ ->
+        {:error, :policy_unavailable}
     end
   rescue
     _ -> {:error, :policy_unavailable}
