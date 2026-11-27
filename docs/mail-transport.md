@@ -17,10 +17,14 @@ for its isolated root helper's atomic runtime file. The file contains exactly
 `access_key_id`, `secret_access_key`, `security_token` and epoch-second `expires_at`,
 with 15-minute STS credentials. The reader bounds input, rejects non-regular or
 symlinked files and group-writable/world-readable modes, and requires at least
-60 seconds of validity. It rereads on every SDK preparation; it never falls back
+60 seconds of validity. The SDK accepts the same 16 KiB session-token bound.
+It rereads on every SDK preparation; it never falls back
 to a developer profile or metadata endpoint. The host must own the parent
 directory as root, allow the application group read/traverse only, and atomically
-replace mode-0640 files. Do not grant the web/app process
+replace mode-0640 files.
+The metadata precheck and file open are separate; this API does not make an
+attacker-writable path safe or eliminate replacement races. Only the trusted
+root helper may replace the file. Do not grant the web/app process
 unrestricted instance-metadata access just for this adapter.
 
 SDK operation construction, XML parsing and SigV4 signing belong to ExAws. The

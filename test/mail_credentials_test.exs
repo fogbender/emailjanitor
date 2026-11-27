@@ -47,7 +47,11 @@ defmodule EmailJanitor.MailCredentialsTest do
               %{value() | "access_key_id" => "AKIA" <> String.duplicate("A", 16)},
               %{value() | "secret_access_key" => "PRIVATE_SENTINEL"},
               %{value() | "security_token" => "PRIVATE_SENTINEL\n"},
-              Map.put(value(), "body", "PRIVATE_SENTINEL")
+              Map.put(value(), "body", "PRIVATE_SENTINEL"),
+              Map.delete(value(), "security_token"),
+              %{value() | "expires_at" => "not an integer"},
+              ["PRIVATE_SENTINEL"],
+              nil
             ] do
           write(ctx.credential_path, invalid)
           assert {:error, :mail_credentials_unavailable} = Credentials.read(ctx.credential_path)
@@ -59,8 +63,12 @@ defmodule EmailJanitor.MailCredentialsTest do
 
   test "rejects insecure, symlinked, oversized, missing and non-file inputs", ctx do
     write(ctx.credential_path, value())
-    File.chmod!(ctx.credential_path, 0o644)
-    assert {:error, :mail_credentials_unavailable} = Credentials.read(ctx.credential_path)
+
+    for mode <- [0o644, 0o660] do
+      File.chmod!(ctx.credential_path, mode)
+      assert {:error, :mail_credentials_unavailable} = Credentials.read(ctx.credential_path)
+    end
+
     File.chmod!(ctx.credential_path, 0o640)
     link = Path.join(ctx.dir, "link")
     File.ln_s!(ctx.credential_path, link)
@@ -74,7 +82,8 @@ defmodule EmailJanitor.MailCredentialsTest do
   end
 
   test "maintained SDK signs with the fresh file credentials and refuses stale files", ctx do
-    write(ctx.credential_path, value())
+    long_token = String.duplicate("x", 16_384)
+    write(ctx.credential_path, %{value() | "security_token" => long_token})
     parent = self()
 
     base =
@@ -90,11 +99,31 @@ defmodule EmailJanitor.MailCredentialsTest do
 
     config = %{base | credentials: fn -> Credentials.read(ctx.credential_path) end}
     assert :ok = SDK.delete(config, "incoming/synthetic-receipt")
-    assert_received {:signed, [authorization], ["SYNTHETIC_TOKEN_PRIVATE"]}
+    assert_received {:signed, [authorization], [^long_token]}
     assert authorization =~ "Credential=" <> value()["access_key_id"] <> "/"
 
     write(ctx.credential_path, %{value() | "expires_at" => System.system_time(:second) - 1})
     assert {:error, :mail_unavailable} = SDK.delete(config, "incoming/synthetic-receipt")
     refute_received {:signed, _, _}
+  end
+
+  test "enforces the exact validity window", ctx do
+    for seconds <- [59, 60, 960, 961] do
+      result = stable_boundary(ctx.credential_path, seconds, 3)
+
+      if seconds in [60, 960],
+        do: assert(match?({:ok, _}, result)),
+        else: assert(result == {:error, :mail_credentials_unavailable})
+    end
+  end
+
+  defp stable_boundary(path, seconds, attempts) when attempts > 0 do
+    now = System.system_time(:second)
+    write(path, %{value() | "expires_at" => now + seconds})
+    result = Credentials.read(path)
+
+    if now == System.system_time(:second),
+      do: result,
+      else: stable_boundary(path, seconds, attempts - 1)
   end
 end

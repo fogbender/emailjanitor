@@ -10,9 +10,10 @@ defmodule EmailJanitor.Mail.SDK do
          true <- is_list(credentials),
          true <-
            Enum.all?(
-             [:access_key_id, :secret_access_key, :security_token],
+             [:access_key_id, :secret_access_key],
              &valid_secret?(credentials[&1])
-           ) do
+           ),
+         true <- valid_secret?(credentials[:security_token], 16_384) do
       {:ok,
        %Prepared{
          options:
@@ -201,5 +202,6 @@ defmodule EmailJanitor.Mail.SDK do
     end
   end
 
-  defp valid_secret?(value), do: is_binary(value) and byte_size(value) in 1..4096
+  defp valid_secret?(value, limit \\ 4096),
+    do: is_binary(value) and byte_size(value) in 1..limit
 end
