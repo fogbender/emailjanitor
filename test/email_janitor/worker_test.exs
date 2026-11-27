@@ -165,15 +165,40 @@ defmodule EmailJanitor.WorkerTest do
     assert_receive {:fresh_policy, _, :reserve, _}
     assert_receive {:fresh_policy, _, :settle, _}
     before = Enum.count(read(ctx.state).calls, &(&1 == :full_thread))
+    observer = self()
 
     config = %{
       ctx.config
-      | policy_for_messages: fn _ -> flunk("recovery fetched message bodies") end
+      | policy_for_messages: fn _ ->
+          send(observer, :unexpected_recovery_factory)
+          {:error, :policy_unavailable}
+        end
     }
 
-    assert {:ok, %{recovery: :settled}} = Worker.step(config)
+    assert {:ok, %{recovery: :settled, status: :idle}} = Worker.step(config)
     assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == before
+    refute_receive :unexpected_recovery_factory
     refute_receive {:fresh_policy, _, _, _}
+    assert read(ctx.state).mutations == [["message-1"]]
+  end
+
+  test "a queued candidate retains its retry after a derived policy failure", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    [%Candidate{candidate_id: id}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+    before = length(read(ctx.state).model_inputs)
+    bad = %{ctx.config | policy_for_messages: fn _ -> {:ok, nil} end}
+    assert {:ok, %{status: :policy_unavailable}} = Worker.step(bad)
+
+    assert [%Candidate{status: :pending, requested: true, candidate_id: ^id}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(read(ctx.state).model_inputs) == before
+    assert read(ctx.state).mutations == []
+    Agent.update(ctx.quota, &%{&1 | block: nil})
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :done}} = Worker.step(fresh_policy(ctx.config))
     assert read(ctx.state).mutations == [["message-1"]]
   end
 
