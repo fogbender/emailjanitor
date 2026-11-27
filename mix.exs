@@ -33,6 +33,8 @@ defmodule EmailJanitor.MixProject do
       {:ecto_sql, "~> 3.14"},
       {:postgrex, "~> 0.23.0"},
       {:req, "~> 0.7.0"},
+      {:req_llm, "~> 1.31.0"},
+      {:plug, "~> 1.20", only: :test},
       {:stream_data, "~> 1.4", only: :test}
     ]
   end
