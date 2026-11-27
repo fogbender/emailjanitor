@@ -233,7 +233,7 @@ defmodule EmailJanitor.ModelsTest do
     assert {:ok, %Decision{action: :done}} = run(:bedrock)
   end
 
-  for status <- [400, 429, 500] do
+  for status <- [400, 401, 403, 413, 422, 429, 500] do
     test "HTTP #{status} sends once and never logs echoed content or secrets" do
       count = start_supervised!({Agent, fn -> 0 end})
 
@@ -248,7 +248,10 @@ defmodule EmailJanitor.ModelsTest do
         )
       end)
 
-      logs = capture_log(fn -> assert {:error, :model_unavailable} = run(:azure) end)
+      reason =
+        if unquote(status) in [400, 413, 422], do: :model_rejected, else: :model_unavailable
+
+      logs = capture_log(fn -> assert {:error, ^reason} = run(:azure) end)
       assert Agent.get(count, & &1) == 1
       refute logs =~ "PRIVATE_BODY_SENTINEL"
       refute logs =~ "TEST_API_KEY_SENTINEL"
@@ -345,7 +348,7 @@ defmodule EmailJanitor.ModelsTest do
       |> Plug.Conn.send_resp(400, Jason.encode!(%{error: %{message: "PRIVATE_BODY_SENTINEL"}}))
     end)
 
-    assert {:error, :model_unavailable} = run(:azure)
+    assert {:error, :model_rejected} = run(:azure)
     assert_receive {:safe_event, %{duration: duration}, %{status: :error} = meta}
     assert is_integer(duration)
     refute inspect(meta) =~ "PRIVATE_BODY_SENTINEL"
@@ -379,7 +382,8 @@ defmodule EmailJanitor.ModelsTest do
             )
       end)
 
-      assert {:error, :model_unavailable} = run(provider)
+      reason = if failure in [400, 413, 422], do: :model_rejected, else: :model_unavailable
+      assert {:error, ^reason} = run(provider)
     end
 
     refute_receive {:upstream_event, [:req_llm, :request, _], _, _}

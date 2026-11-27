@@ -58,6 +58,9 @@ defmodule EmailJanitor.Models.SDK do
       {:error, :invalid_model_content} ->
         {:keep, :unreadable_content}
 
+      {:error, :model_rejected} ->
+        {:error, :model_rejected}
+
       {:error, reason} when reason in [:invalid_model_output, :invalid_decision] ->
         {:invalid, :decision}
 
@@ -134,6 +137,7 @@ defmodule EmailJanitor.Models.SDK do
     case generate(config.provider, model, context, options, schema) do
       {:ok, response} -> validated_object(response, config.provider, schema)
       {:invalid, :decision} -> {:error, :invalid_model_output}
+      {:error, :model_rejected} -> {:error, :model_rejected}
       _ -> {:error, :model_unavailable}
     end
   rescue
@@ -237,13 +241,22 @@ defmodule EmailJanitor.Models.SDK do
           %Req.Response{status: status} when status in 200..299 ->
             {:invalid, :decision}
 
+          %Req.Response{status: status} when status in [400, 413, 422] ->
+            {:error, :model_rejected}
+
           _ ->
             {:error, :model_unavailable}
         end)
 
       case result do
-        {:error, %ReqLLM.Error.API.Response{status: status}} when status in 200..299 ->
+        {:error, %{__struct__: kind, status: status}}
+        when kind in [ReqLLM.Error.API.Request, ReqLLM.Error.API.Response] and status in 200..299 ->
           {:invalid, :decision}
+
+        {:error, %{__struct__: kind, status: status}}
+        when kind in [ReqLLM.Error.API.Request, ReqLLM.Error.API.Response] and
+               status in [400, 413, 422] ->
+          {:error, :model_rejected}
 
         other ->
           other
