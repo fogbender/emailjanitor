@@ -92,7 +92,6 @@ defmodule EmailJanitor.ContentTest do
     for attrs <- [
           "hidden",
           "hidden='false'",
-          "aria-hidden='true'",
           "style='display:none'",
           "style='DISPLAY : NONE !important; color:red'",
           "style='color:red; visibility: hidden'"
@@ -106,6 +105,69 @@ defmodule EmailJanitor.ContentTest do
       assert Content.read(result) =~ "Visible development pitch"
       refute Content.read(result) =~ "HIDDEN_SENTINEL"
       refute Content.read(result) =~ "hidden.example.com"
+    end
+  end
+
+  test "accessibility hints and explicitly visible hidden elements keep their text" do
+    for attrs <- [
+          "aria-hidden='true'",
+          "hidden style='display:block'",
+          "hidden style='display:inline !important'",
+          "hidden style='display:list-item'",
+          "hidden style='display:block flow'",
+          "style='display:none;display:block'",
+          "style='display:block!important;display:none'"
+        ] do
+      assert {:ok, result} = HTML.readable(Content.new("<p #{attrs}>Visible pitch</p>"))
+      assert Content.read(result) == "Visible pitch"
+    end
+  end
+
+  test "comments and common hidden preheaders are removed before the text budget" do
+    for style <- [
+          "/*comment*/display:none",
+          "display:/*comment*/none",
+          "opacity:0",
+          "max-height:0px;overflow:hidden",
+          "display:none!important;display:block"
+        ] do
+      source =
+        "<div style='#{style}'>" <>
+          String.duplicate("HIDDEN_SENTINEL", 5000) <> "</div><p>Visible pitch</p>"
+
+      assert {:ok, result} = HTML.readable(Content.new(source), 100)
+      assert Content.read(result) == "Visible pitch"
+    end
+  end
+
+  test "non-Outlook call-to-action buttons remain visible" do
+    source =
+      "<!--[if mso]><v:roundrect>Outlook button</v:roundrect><![endif]-->" <>
+        "<a href='https://vendor.example/book' style='mso-hide:all'>Book a sales call</a>"
+
+    assert {:ok, result} = HTML.readable(Content.new(source))
+    assert Content.read(result) == "https://vendor.example/book Book a sales call"
+  end
+
+  test "visibility can be overridden by descendants but display and opacity cannot" do
+    source =
+      "<div style='visibility:hidden'>Hidden parent" <>
+        "<a href='https://hidden.example'>Hidden link</a>" <>
+        "<p style='visibility:visible'>Visible child " <>
+        "<a href='https://visible.example'>Visible link</a></p></div>"
+
+    assert {:ok, result} = HTML.readable(Content.new(source))
+    assert Content.read(result) == "Visible child https://visible.example Visible link"
+
+    for style <- ["display:none", "opacity:0", "max-height:0;overflow:hidden"] do
+      assert {:ok, result} =
+               HTML.readable(
+                 Content.new(
+                   "<div style='#{style}'><p style='visibility:visible'>Hidden child</p></div>"
+                 )
+               )
+
+      assert Content.read(result) == ""
     end
   end
 
