@@ -14,6 +14,7 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
 
     keys = [
       :self_host_adapter,
+      :self_host_oauth,
       :browser_test_scope,
       :browser_test_observer,
       :browser_test_inboxes,
@@ -23,6 +24,18 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
 
     old = Map.new(keys, &{&1, Application.fetch_env(:email_janitor, &1)})
     Application.put_env(:email_janitor, :self_host_adapter, TestHost)
+
+    Application.put_env(
+      :email_janitor,
+      :self_host_oauth,
+      {EmailJanitor.SelfHostWeb.TestOAuth,
+       %EmailJanitor.Google.OAuth.Result{
+         subject: "owner-subject",
+         email: "owner@acme.com",
+         token: Content.new("synthetic")
+       }}
+    )
+
     Application.put_env(:email_janitor, :browser_test_scope, scope)
     Application.put_env(:email_janitor, :browser_test_observer, self())
     {:ok, box} = Inbox.new("browser-inbox", "owner@acme.com")
@@ -278,5 +291,75 @@ defmodule EmailJanitor.SelfHostWeb.WebTest do
     assert body =~ text
     assert get_resp_header(conn, "cache-control") == ["no-store"]
     refute_receive {:respond, _, _, _, _, _}
+  end
+
+  test "form line breaks are normalized before enforcing the UTF-8 byte limit", t do
+    page = get(signed_in(), "/chat")
+    text = String.duplicate("漢", 5_000) <> String.duplicate("\r\n", 1_000)
+
+    conn =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> post("/chat", %{
+        _csrf_token: csrf(page),
+        inbox_id: t.box.id,
+        request_id: Ecto.UUID.generate(),
+        message: text
+      })
+
+    assert html_response(conn, 200) =~ "Instruction updated"
+    assert_receive {:respond, _, _, _, _, content}
+    assert byte_size(Content.read(content)) == 16_000
+    refute Content.read(content) =~ "\r"
+  end
+
+  test "a blocked client cannot consume another visitor's sign-in allowance", _ do
+    page = get(browser(), "/")
+
+    for _ <- 1..3 do
+      conn =
+        page
+        |> recycle()
+        |> put_private(:plug_skip_csrf_protection, false)
+        |> put_req_header("x-real-ip", "203.0.113.10")
+        |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+      assert response(conn, 302)
+    end
+
+    blocked =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> put_req_header("x-real-ip", "203.0.113.10")
+      |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+    assert html_response(blocked, 429) =~ "Too many sign-in attempts"
+
+    allowed =
+      page
+      |> recycle()
+      |> put_private(:plug_skip_csrf_protection, false)
+      |> put_req_header("x-real-ip", "203.0.113.11")
+      |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+    assert response(allowed, 302)
+  end
+
+  test "non-loopback peers cannot bypass their cap with forged proxy headers", _ do
+    page = get(browser(), "/")
+
+    for n <- 1..4 do
+      conn =
+        page
+        |> recycle()
+        |> Map.put(:remote_ip, {198, 51, 100, 12})
+        |> put_private(:plug_skip_csrf_protection, false)
+        |> put_req_header("x-real-ip", "203.0.113.#{n}")
+        |> post("/auth/google", %{_csrf_token: csrf(page), timezone: "Etc/UTC"})
+
+      assert conn.status == if(n <= 3, do: 302, else: 429)
+    end
   end
 end

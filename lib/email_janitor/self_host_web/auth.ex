@@ -19,6 +19,7 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     @derive {Inspect, only: [:id, :mode, :expires_at]}
     schema "selfhost_web_attempts" do
       field(:browser_hash, :binary)
+      field(:client_hash, :binary)
       field(:session_hash, :binary)
       field(:subject, :string)
       field(:mode, Ecto.Enum, values: [:sign_in, :connect])
@@ -100,11 +101,12 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
     _ -> {:error, :session_unavailable}
   end
 
-  def begin(mode, session_token, timezone, now \\ DateTime.utc_now())
+  def begin(mode, session_token, timezone, now \\ DateTime.utc_now(), client \\ "unspecified")
       when mode in [:sign_in, :connect] do
     with {:ok, subject, session_hash} <- initiator(session_token, now),
          true <- mode == :sign_in or is_binary(subject),
          true <- is_binary(timezone) and byte_size(timezone) <= 128,
+         true <- is_binary(client) and byte_size(client) in 1..128,
          {:ok, _} <- DateTime.shift_zone(now, timezone, Tzdata.TimeZoneDatabase),
          {adapter, config} = gateway(),
          {:ok, %{url: url, session_params: session}} <- adapter.authorize_url(config, mode),
@@ -120,6 +122,7 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
             %Attempt{
               id: id,
               browser_hash: hash(browser_token),
+              client_hash: hash(client),
               subject: subject,
               session_hash: session_hash,
               mode: mode,
@@ -187,13 +190,14 @@ defmodule EmailJanitor.SelfHostWeb.Auth do
 
         purge(now)
 
-        if is_nil(attempt.subject) and
-             scope.repo.aggregate(
-               from(a in Attempt, where: is_nil(a.subject) and a.expires_at > ^now),
-               :count,
-               options(scope)
-             ) >= 20,
-           do: scope.repo.rollback(:too_many_attempts)
+        if is_nil(attempt.subject) do
+          anonymous = from(a in Attempt, where: is_nil(a.subject) and a.expires_at > ^now)
+          client = from(a in anonymous, where: a.client_hash == ^attempt.client_hash)
+
+          if scope.repo.aggregate(client, :count, options(scope)) >= 3 or
+               scope.repo.aggregate(anonymous, :count, options(scope)) >= 1_000,
+             do: scope.repo.rollback(:too_many_attempts)
+        end
 
         scope.repo.insert!(attempt, options(scope))
       end,

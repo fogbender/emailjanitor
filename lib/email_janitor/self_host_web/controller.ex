@@ -74,7 +74,13 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
     mode = if params["mode"] == "connect", do: :connect, else: :sign_in
 
     with {:ok, flow} <-
-           Auth.begin(mode, get_session(conn, :session_token), params["timezone"] || "Etc/UTC") do
+           Auth.begin(
+             mode,
+             get_session(conn, :session_token),
+             params["timezone"] || "Etc/UTC",
+             DateTime.utc_now(),
+             client(conn)
+           ) do
       conn
       |> put_session(:oauth_browser_token, flow.browser_token)
       |> redirect(external: flow.url)
@@ -149,6 +155,8 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
   defp selected(_, _, _), do: {:error, :choose_inbox}
 
   defp message(text) when is_binary(text) do
+    text = String.replace(text, "\r\n", "\n")
+
     if byte_size(text) in 1..16_000 and String.valid?(text),
       do: {:ok, text},
       else: {:error, :invalid_message}
@@ -160,6 +168,41 @@ defmodule EmailJanitor.SelfHostWeb.Controller do
     do: if(String.valid?(text), do: text, else: "")
 
   defp input_text(_), do: ""
+
+  defp client(conn) do
+    peer = conn.remote_ip
+
+    forwarded =
+      if peer in [{127, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 1}],
+        do: get_req_header(conn, "x-real-ip"),
+        else: []
+
+    ip =
+      case forwarded do
+        [value] when byte_size(value) <= 45 ->
+          case if(String.valid?(value),
+                 do: :inet.parse_address(String.to_charlist(value)),
+                 else: {:error, :invalid_ip}
+               ) do
+            {:ok, address} -> address
+            _ -> peer
+          end
+
+        _ ->
+          peer
+      end
+
+    # IPv6 clients share one /64 bucket, so address rotation within a network
+    # does not create unlimited anonymous attempt capacity.
+    ip =
+      case ip do
+        {0, 0, 0, 0, 0, 65_535, a, b} -> {div(a, 256), rem(a, 256), div(b, 256), rem(b, 256)}
+        {a, b, c, d, _, _, _, _} -> {a, b, c, d, 0, 0, 0, 0}
+        other -> other
+      end
+
+    ip |> :inet.ntoa() |> to_string()
+  end
 
   defp conversation_id(owner, inbox_id) do
     <<a::48, _::4, b::12, _::2, c::62, _::binary>> =

@@ -12,6 +12,15 @@ Google Web application OAuth client with the exact callback URL
 `https://<your-host>/auth/google/callback`. Host configuration supplies the
 owner identity, OAuth credentials, encryption key and stable web secret.
 
+The proxy must overwrite `X-Real-IP` with the actual client address, for example
+Nginx `proxy_set_header X-Real-IP $remote_addr;`. Janitor accepts that header only
+from a loopback peer; other peers use their socket address. It hashes canonical
+IP buckets (IPv6 /64) for anonymous OAuth attempt limits, storing no raw address.
+Each client can have three live attempts within the ten-minute expiry; a separate
+1,000-row backstop bounds all anonymous state. Signed-in owner connection flows
+have their own authenticated access. A visitor reaching their limit does not
+consume another client's allowance. Proxy configuration is part of readiness.
+
 Only the configured owner can sign in. The owner can connect multiple Google
 accounts, choose the inbox for a conversation and disconnect an account.
 Browser timezone is supplied during connection for each account's 9pm digest.
