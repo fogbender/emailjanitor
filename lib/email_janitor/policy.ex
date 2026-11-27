@@ -87,6 +87,7 @@ defmodule EmailJanitor.Policy do
     if function_exported?(policy.adapter, :retire_candidate_messages, 4) do
       case policy.adapter.retire_candidate_messages(policy.context, inbox_id, candidate_id, ids) do
         :ok -> :ok
+        {:error, :partial_retirement_unsupported} = unsupported -> unsupported
         _ -> {:error, :policy_unavailable}
       end
     else

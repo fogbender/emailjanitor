@@ -1,3 +1,7 @@
+defmodule EmailJanitor.UnsupportedExactRetirement do
+  def retire_candidate_messages(_, _, _, _), do: {:error, :partial_retirement_unsupported}
+end
+
 defmodule EmailJanitor.TestPolicy do
   @behaviour EmailJanitor.Policy
 
@@ -608,5 +612,15 @@ defmodule EmailJanitor.PolicyTest do
                  log: false
                )
     end
+  end
+
+  test "exact retirement preserves a nested adapter's unsupported capability reason" do
+    assert {:error, :partial_retirement_unsupported} =
+             Policy.retire_candidate_messages(
+               %Policy{adapter: EmailJanitor.UnsupportedExactRetirement, context: nil},
+               "inbox-1",
+               Ecto.UUID.generate(),
+               ["message-1"]
+             )
   end
 end
