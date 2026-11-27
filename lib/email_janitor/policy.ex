@@ -10,16 +10,52 @@ defmodule EmailJanitor.Policy do
   @derive {Inspect, only: [:adapter]}
   defstruct [:adapter, :context]
 
+  defmodule Admission do
+    @moduledoc "Fresh full INBOX IDs, distinct from the selected Done mutation IDs."
+    @enforce_keys [:inbox_message_ids]
+    defstruct @enforce_keys
+  end
+
   @callback reserve(term(), String.t(), String.t(), [String.t()], DateTime.t()) ::
               :ok | {:blocked, atom()} | {:error, atom()}
   @callback settle(term(), String.t(), String.t(), term()) :: :ok | {:error, atom()}
   @callback retire_candidate(term(), String.t(), String.t(), [String.t()]) ::
               :ok | {:error, atom()}
+  @callback reserve(term(), String.t(), String.t(), [String.t()], DateTime.t(), %Admission{}) ::
+              :ok | {:blocked, atom()} | {:error, atom()}
+  @optional_callbacks reserve: 6
 
   def unlimited, do: %__MODULE__{adapter: EmailJanitor.Policy.Unlimited, context: nil}
 
   def reserve(%__MODULE__{} = policy, inbox_id, action_id, message_ids, now) do
-    case policy.adapter.reserve(policy.context, inbox_id, action_id, message_ids, now) do
+    reserve(policy, inbox_id, action_id, message_ids, now, %Admission{
+      inbox_message_ids: message_ids
+    })
+  end
+
+  def reserve(
+        %__MODULE__{} = policy,
+        inbox_id,
+        action_id,
+        message_ids,
+        now,
+        %Admission{} = admission
+      ) do
+    Code.ensure_loaded?(policy.adapter)
+
+    result =
+      cond do
+        function_exported?(policy.adapter, :reserve, 6) ->
+          policy.adapter.reserve(policy.context, inbox_id, action_id, message_ids, now, admission)
+
+        Enum.sort(message_ids) == Enum.sort(admission.inbox_message_ids) ->
+          policy.adapter.reserve(policy.context, inbox_id, action_id, message_ids, now)
+
+        true ->
+          {:blocked, :partial_admission_unsupported}
+      end
+
+    case result do
       :ok -> :ok
       {:blocked, reason} when is_atom(reason) -> {:blocked, reason}
       _ -> {:error, :policy_unavailable}
@@ -64,6 +100,7 @@ defmodule EmailJanitor.Policy.Unlimited do
   @moduledoc false
   @behaviour EmailJanitor.Policy
   def reserve(_, _, _, _, _), do: :ok
+  def reserve(_, _, _, _, _, _), do: :ok
   def settle(_, _, _, _), do: :ok
   def retire_candidate(_, _, _, _), do: :ok
 end

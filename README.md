@@ -59,6 +59,26 @@ Review has a 60-second budget covering Gmail reads, classification and metadata
 retirement. A timeout returns `:executor_unavailable` and keeps pending work for
 retry; configure provider request deadlines within that budget.
 
+Hosts may pass `cleanup_target_ids:` to `Executor.review/8` from a verified
+new-arrival eligibility proof. `Message.cleanup_target` separates that selection
+from raw Gmail INBOX state. The model receives the remaining conversation as
+context and returns one constrained decision per target in a single request;
+missing, duplicate or context-only IDs invalidate the whole response. The model
+budget remains at most five targets, 32KB preferences and 96KB complete context.
+Unreadable/oversized content preserves pending work for retry, not retirement.
+Existing correspondence, sent/draft and manual-restoration guards still protect
+the full conversation before review and again before execution.
+
+`Proposal.message_ids` are the Done subset; `evaluated_message_ids` also includes
+kept targets; `inbox_message_ids` is the full reviewed raw INBOX snapshot. Execution
+checks the exact full snapshot and full-thread fingerprint before mutating only
+Done IDs. `Policy.reserve/6` receives the full snapshot in `Policy.Admission` so
+the private SaaS can enforce its free whole-thread rule while paid and default
+single-user deployments admit eligible subsets. Legacy five-argument policy
+adapters reject partial admission without reserving quota. Partial retirement
+withdraws evaluated or now-archived IDs only; unevaluated INBOX context keeps its
+pending metadata and stable marker. No new model metadata contains email bodies.
+
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
 - Validated classifier boundary; transient content redaction and HTML extraction.

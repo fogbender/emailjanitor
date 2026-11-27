@@ -3,7 +3,7 @@ defmodule EmailJanitor.Message do
   alias EmailJanitor.Content
   @enforce_keys [:id, :thread_id, :headers, :labels]
   @derive {Inspect, only: [:id, :thread_id, :labels]}
-  defstruct [:id, :thread_id, :headers, :labels, :received_at, body: nil]
+  defstruct [:id, :thread_id, :headers, :labels, :received_at, :cleanup_target, body: nil]
   @type t :: %__MODULE__{}
 
   def header(%__MODULE__{headers: headers}, name) do
@@ -15,6 +15,10 @@ defmodule EmailJanitor.Message do
   end
 
   def in_inbox?(%__MODULE__{labels: labels}), do: "INBOX" in labels
+
+  @doc "Host-selected eligibility is separate from Gmail's raw INBOX state."
+  def cleanup_target?(%__MODULE__{} = message),
+    do: in_inbox?(message) and message.cleanup_target != false
 
   def fingerprint(messages) do
     messages

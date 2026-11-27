@@ -128,9 +128,19 @@ defmodule EmailJanitor.Store do
         policy = Keyword.get(opts, :policy, Policy.unlimited())
         now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
 
-        case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
+        admission = %Policy.Admission{inbox_message_ids: Proposal.inbox_ids(proposal)}
+
+        case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now, admission) do
           :ok ->
-            retire_overlapping_candidates(scope, inbox_id, candidate, policy, review_started_at)
+            retire_overlapping_candidates(
+              scope,
+              inbox_id,
+              candidate,
+              policy,
+              review_started_at,
+              proposal
+            )
+
             record = struct(record, Owner.capture())
             record = %{record | lease_expires_at: DateTime.add(clock(scope), 60)}
             action = scope.repo.insert!(record, prefix: scope.prefix)
@@ -140,7 +150,15 @@ defmodule EmailJanitor.Store do
           # A block commits the host's pending-candidate metadata but never creates
           # a Gmail mutation intent. Errors roll back the entire reservation.
           {:blocked, reason} ->
-            retire_overlapping_candidates(scope, inbox_id, candidate, policy, review_started_at)
+            retire_overlapping_candidates(
+              scope,
+              inbox_id,
+              candidate,
+              policy,
+              review_started_at,
+              proposal
+            )
+
             {:blocked, reason}
 
           {:error, reason} ->
@@ -150,22 +168,25 @@ defmodule EmailJanitor.Store do
     end)
   end
 
-  defp retire_overlapping_candidates(scope, inbox_id, current, policy, started_at) do
+  defp retire_overlapping_candidates(scope, inbox_id, current, policy, started_at, proposal) do
+    opts = [
+      evaluated_message_ids: Proposal.evaluated_ids(proposal),
+      inbox_message_ids: Proposal.inbox_ids(proposal)
+    ]
+
     prior =
       scope.repo.all(
         from(c in Candidate,
           where:
             c.inbox_id == ^inbox_id and c.id != ^current.id and c.updated_at <= ^started_at and
-              fragment("? && ?::text[]", c.message_ids, ^current.message_ids)
+              (c.thread_id == ^current.thread_id or
+                 fragment("? && ?::text[]", c.message_ids, ^current.message_ids))
         ),
         prefix: scope.prefix
       )
 
     for candidate <- prior do
-      case Policy.retire_candidate(policy, inbox_id, candidate.id, candidate.message_ids) do
-        :ok -> scope.repo.delete!(candidate, prefix: scope.prefix)
-        {:error, reason} -> scope.repo.rollback(reason)
-      end
+      retire_candidate!(scope, policy, inbox_id, candidate, opts)
     end
 
     cancelled =
@@ -173,13 +194,21 @@ defmodule EmailJanitor.Store do
         from(a in Action,
           where:
             a.inbox_id == ^inbox_id and a.state == :cancelled and a.updated_at <= ^started_at and
-              fragment("? && ?::text[]", a.message_ids, ^current.message_ids)
+              (a.thread_id == ^current.thread_id or
+                 fragment("? && ?::text[]", a.message_ids, ^current.message_ids))
         ),
         prefix: scope.prefix
       )
 
     for action <- cancelled,
-        do: retire_metadata!(scope, policy, inbox_id, action.id, action.message_ids)
+        do:
+          retire_metadata!(
+            scope,
+            policy,
+            inbox_id,
+            action.id,
+            retirement_ids(action.message_ids, opts)
+          )
 
     :ok
   end
@@ -213,8 +242,7 @@ defmodule EmailJanitor.Store do
         )
 
       for candidate <- candidates do
-        retire_metadata!(scope, policy, inbox_id, candidate.id, candidate.message_ids)
-        scope.repo.delete!(candidate, prefix: scope.prefix)
+        retire_candidate!(scope, policy, inbox_id, candidate, opts)
       end
 
       cancelled =
@@ -228,11 +256,41 @@ defmodule EmailJanitor.Store do
         )
 
       for action <- cancelled,
-          do: retire_metadata!(scope, policy, inbox_id, action.id, action.message_ids)
+          do:
+            retire_metadata!(
+              scope,
+              policy,
+              inbox_id,
+              action.id,
+              retirement_ids(action.message_ids, opts)
+            )
 
       :retired
     end)
   end
+
+  defp retire_candidate!(scope, policy, inbox_id, candidate, opts) do
+    ids = retirement_ids(candidate.message_ids, opts)
+    retire_metadata!(scope, policy, inbox_id, candidate.id, ids)
+
+    # A context-only INBOX member was not evaluated. Keep its stable marker so a
+    # later eligible review can still retire or promote that pending work.
+    if length(ids) == length(candidate.message_ids),
+      do: scope.repo.delete!(candidate, prefix: scope.prefix)
+  end
+
+  defp retirement_ids(ids, opts) do
+    case Keyword.fetch(opts, :inbox_message_ids) do
+      :error ->
+        ids
+
+      {:ok, inbox_ids} ->
+        evaluated = Keyword.fetch!(opts, :evaluated_message_ids)
+        Enum.filter(ids, &(&1 in evaluated or &1 not in inbox_ids))
+    end
+  end
+
+  defp retire_metadata!(_scope, _policy, _inbox_id, _id, []), do: :ok
 
   defp retire_metadata!(scope, policy, inbox_id, id, ids) do
     case Policy.retire_candidate(policy, inbox_id, id, ids) do
