@@ -461,47 +461,18 @@ defmodule EmailJanitor.ConversationTest do
 
   test "resume reports a confirmed nested action even when its workflow died before the receipt result",
        t do
-    {:ok, control} = Agent.start_link(fn -> %{} end)
     ctx = context(t.ctx, target: :none)
-    {gmail, opts} = ctx.gmail
-
-    ctx = %{
-      ctx
-      | execution_options: [
-          on_plan_admitted: fn _, _, _ ->
-            owner = self()
-            Agent.update(control, &Map.put(&1, :owner, owner))
-            :ok
-          end
-        ],
-        gmail:
-          {gmail,
-           Keyword.put(opts, :before, fn ->
-             Process.exit(Agent.get(control, & &1.owner), :kill)
-           end)}
-    }
-
     request_id = Ecto.UUID.generate()
-
-    assert {:error, :conversation_unavailable} =
-             Conversation.respond(ctx, request_id, Content.new("Mark it Done."))
-
-    assert_confirmed_action(ctx, 200)
+    assert {:error, :executor_unavailable} = crash_after_confirmed_action(ctx, request_id)
+    assert [%{state: :done}] = TestRepo.all(Action, prefix: ctx.scope.prefix)
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
     Agent.update(t.state, &%{&1 | messages: []})
-
-    ctx = %{
-      ctx
-      | execution_options: [],
-        gmail: {gmail, opts},
-        model: [script: fn _, _, _ -> raise "must resume without a model" end]
-    }
+    ctx = %{ctx | model: [script: fn _, _, _ -> raise "must resume without a model" end]}
 
     assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
     assert Content.read(reply) =~ "marked 1 email Done"
     refute Content.read(reply) =~ "needed no inbox change"
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
-    Agent.stop(control)
   end
 
   test "completed references need not be loaded again to resume the remaining effects", t do
@@ -561,17 +532,59 @@ defmodule EmailJanitor.ConversationTest do
     assert Agent.get(t.state, & &1.calls) == [["message-1"], ["message-2"]]
   end
 
-  defp assert_confirmed_action(_ctx, 0), do: flunk("nested action did not finish")
+  defp crash_after_confirmed_action(ctx, request_id) do
+    EmailJanitor.Owner.workflow(fn ->
+      {:ok, ref} = Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
 
-  defp assert_confirmed_action(ctx, attempts) do
-    case TestRepo.all(Action, prefix: ctx.scope.prefix) do
-      [%{state: :done}] ->
-        :ok
+      plan = %Plan{
+        operation: :done,
+        references: [ref.token],
+        preference_target: :none,
+        instruction: Content.new(""),
+        query: Content.new(""),
+        reply: Content.new(""),
+        search_complete: true
+      }
 
-      _ ->
-        Process.sleep(5)
-        assert_confirmed_action(ctx, attempts - 1)
-    end
+      {:ok, receipt} =
+        Ledger.reserve(
+          ctx.scope,
+          ctx.inbox.id,
+          ctx.conversation_id,
+          request_id,
+          plan,
+          [ref],
+          ctx.guard
+        )
+
+      {:ok, proposal} =
+        EmailJanitor.Executor.review(
+          ctx.scope,
+          ctx.inbox,
+          "thread-1",
+          ctx.gmail,
+          {EmailJanitor.TestClassifier, []},
+          "",
+          1
+        )
+
+      policy =
+        EmailJanitor.Conversation.ExecutionPolicy.new(
+          ctx.policy,
+          ctx.scope,
+          ctx.inbox.id,
+          receipt
+        )
+
+      assert {:done, _} =
+               EmailJanitor.Executor.execute(ctx.scope, ctx.inbox, proposal, ctx.gmail,
+                 policy: policy
+               )
+
+      # Crash after the action and binding are durable, before recording the
+      # conversation result. No child may continue work after this death.
+      Process.exit(self(), :kill)
+    end)
   end
 
   test "a dispatched intent with a dead owner remains uncertain even without a readable Gmail copy",
@@ -805,38 +818,14 @@ defmodule EmailJanitor.ConversationTest do
   end
 
   test "a request's own historical Done remains attributable after that action was restored", t do
-    {:ok, control} = Agent.start_link(fn -> %{} end)
     ctx = context(t.ctx, target: :none)
-    {gmail, opts} = ctx.gmail
-
-    ctx = %{
-      ctx
-      | execution_options: [
-          on_plan_admitted: fn _, _, _ ->
-            owner = self()
-            Agent.update(control, &Map.put(&1, :owner, owner))
-            :ok
-          end
-        ],
-        gmail:
-          {gmail,
-           Keyword.put(opts, :before, fn ->
-             Process.exit(Agent.get(control, & &1.owner), :kill)
-           end)}
-    }
-
     request_id = Ecto.UUID.generate()
-
-    assert {:error, :conversation_unavailable} =
-             Conversation.respond(ctx, request_id, Content.new("Done."))
-
-    assert_confirmed_action(ctx, 200)
+    assert {:error, :executor_unavailable} = crash_after_confirmed_action(ctx, request_id)
+    assert [%{state: :done}] = TestRepo.all(Action, prefix: ctx.scope.prefix)
     TestRepo.update_all(Action, [set: [state: :restored]], prefix: ctx.scope.prefix)
     Agent.update(t.state, &%{&1 | messages: []})
-    ctx = %{ctx | execution_options: [], gmail: {gmail, opts}}
     assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
     assert Content.read(reply) =~ "marked 1 email Done"
-    Agent.stop(control)
   end
 
   test "an existing unresolved action from another request isn't recorded as this request's effect",

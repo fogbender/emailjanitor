@@ -129,7 +129,8 @@ defmodule EmailJanitor.Restore do
                {:ok, effect_id} <- Ecto.UUID.cast(effect_id),
                {:ok, action_id} <- Ecto.UUID.cast(action_id),
                true <- valid_ids?(ids),
-               :ok <- authorized(authorize) do
+               :ok <- authorized(authorize),
+               :ok <- readable_inbox(scope, inbox) do
             ids = Enum.sort(ids)
 
             case existing(scope, inbox, effect_id, action_id, ids) do
@@ -192,7 +193,8 @@ defmodule EmailJanitor.Restore do
   @doc "Bounded metadata-only IDs awaiting DB settlement of positive restore evidence."
   def pending_settlements(scope, %Inbox{} = inbox, limit \\ 10) do
     safe(fn ->
-      if is_integer(limit) and limit in 1..100 do
+      with true <- is_integer(limit) and limit in 1..100,
+           :ok <- readable_inbox(scope, inbox) do
         {:ok,
          scope.repo.all(
            from(e in Effect,
@@ -206,7 +208,8 @@ defmodule EmailJanitor.Restore do
            log: false
          )}
       else
-        {:error, :invalid_restore_selection}
+        {:error, :wrong_inbox} = error -> error
+        _ -> {:error, :invalid_restore_selection}
       end
     end)
   end
