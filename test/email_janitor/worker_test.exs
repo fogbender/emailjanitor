@@ -437,7 +437,7 @@ defmodule EmailJanitor.WorkerTest do
     )
 
     config = %{ctx.config | gmail: {Gmail, [state: ctx.state, thread_failures: ["bad-thread"]]}}
-    assert {:ok, %{status: :eligibility_unavailable, more?: true}} = Worker.step(config)
+    assert {:ok, %{status: :deferred, more?: true}} = Worker.step(config)
     assert {:ok, %{status: :done}} = Worker.step(config)
     assert read(ctx.state).mutations == [["z-new"]]
     assert {:ok, [%{message_id: "a-old"}]} = pending(ctx)
@@ -457,7 +457,7 @@ defmodule EmailJanitor.WorkerTest do
     )
 
     config = %{ctx.config | gmail: {Gmail, [state: ctx.state, snapshot_failures: ["bad-thread"]]}}
-    assert {:ok, %{status: :worker_unavailable, more?: true}} = Worker.step(config)
+    assert {:ok, %{status: :deferred, more?: true}} = Worker.step(config)
     assert {:ok, %{status: :done}} = Worker.step(config)
     assert read(ctx.state).mutations == [["z-new"]]
   end
@@ -547,6 +547,134 @@ defmodule EmailJanitor.WorkerTest do
     assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
     assert length(read(ctx.state).model_inputs) == 8
     assert {:ok, [_]} = pending(ctx)
+  end
+
+  test "real scheduler passes two unreadable siblings and cleans a newer healthy thread", ctx do
+    observer = self()
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(id: "a-old-1", thread_id: "bad-thread"),
+            Fixtures.message(id: "a-old-2", thread_id: "bad-thread"),
+            Fixtures.message(id: "z-new", thread_id: "good-thread")
+          ],
+          arrivals: %{"100" => %{through: "101", ids: ["a-old-1", "a-old-2", "z-new"]}}
+      }
+    )
+
+    config = %{
+      ctx.config
+      | gmail: {Gmail, [state: ctx.state, thread_failures: ["bad-thread"]]},
+        report: fn status ->
+          send(observer, {:reported_worker_status, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted-inbox"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    assert_receive {:reported_worker_status, :done}, 2_000
+    assert read(ctx.state).mutations == [["z-new"]]
+
+    assert [%Deferral{status: :unreadable, message_ids: ["a-old-1", "a-old-2"]}] =
+             Repo.all(Deferral, prefix: ctx.scope.prefix)
+
+    assert {:ok, pending} = pending(ctx)
+    assert Enum.sort(Enum.map(pending, & &1.message_id)) == ["a-old-1", "a-old-2"]
+    before = Enum.count(read(ctx.state).calls, &(&1 == :full_thread))
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == before
+  end
+
+  test "real scheduler unions transient snapshot failures instead of alternating sibling IDs",
+       ctx do
+    observer = self()
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: [
+            Fixtures.message(id: "a-old-1", thread_id: "bad-thread"),
+            Fixtures.message(id: "a-old-2", thread_id: "bad-thread"),
+            Fixtures.message(id: "z-new", thread_id: "good-thread")
+          ],
+          arrivals: %{"100" => %{through: "101", ids: ["a-old-1", "a-old-2", "z-new"]}}
+      }
+    )
+
+    config = %{
+      ctx.config
+      | gmail: {Gmail, [state: ctx.state, snapshot_failures: ["bad-thread"]]},
+        report: fn status ->
+          send(observer, {:reported_worker_status, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted-inbox"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    assert_receive {:reported_worker_status, :done}, 2_000
+    assert read(ctx.state).mutations == [["z-new"]]
+
+    assert [%Deferral{status: :transient, message_ids: ["a-old-1", "a-old-2"]}] =
+             Repo.all(Deferral, prefix: ctx.scope.prefix)
+
+    assert {:ok, pending} = pending(ctx)
+    assert Enum.sort(Enum.map(pending, & &1.message_id)) == ["a-old-1", "a-old-2"]
+    before = Enum.count(read(ctx.state).calls, &(&1 == :full_thread))
+    advance(ctx.clock, 901)
+    assert {:ok, %{status: :deferred}} = Worker.step(config)
+    assert Enum.count(read(ctx.state).calls, &(&1 == :full_thread)) == before
+  end
+
+  test "unrelated arrival outages do not count toward the eight invalid-decision limit", ctx do
+    Agent.update(ctx.state, &%{&1 | model: :error})
+
+    for _ <- 1..7 do
+      assert {:ok, %{status: :model_unavailable}} = Worker.step(ctx.config)
+      advance(ctx.clock, 901)
+    end
+
+    Agent.update(ctx.state, &%{&1 | model: :invalid})
+    assert {:ok, %{status: :invalid_decision}} = Worker.step(ctx.config)
+
+    assert [%Deferral{status: :invalid, attempts: 1}] =
+             Repo.all(Deferral, prefix: ctx.scope.prefix)
+  end
+
+  test "unrelated candidate outages have a separate invalid-decision counter", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.state, &%{&1 | model: :error})
+
+    for _ <- 1..7 do
+      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+      advance(ctx.clock, 901)
+    end
+
+    Agent.update(ctx.state, &%{&1 | model: :invalid})
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+
+    assert [%Candidate{requested: true, attempts: 8, invalid_attempts: 1}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
   end
 
   defp await_blocked(_backend, 0),

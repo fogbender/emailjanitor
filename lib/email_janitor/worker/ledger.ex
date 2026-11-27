@@ -204,6 +204,7 @@ defmodule EmailJanitor.Worker.Ledger do
           status: :pending,
           requested: requested,
           attempts: 0,
+          invalid_attempts: 0,
           next_attempt_at: nil,
           inserted_at: now,
           updated_at: now
@@ -258,7 +259,7 @@ defmodule EmailJanitor.Worker.Ledger do
           from(c in Candidate,
             where: c.inbox_id == ^inbox.id and c.candidate_id == ^uuid and c.status == :pending
           ),
-          [set: [requested: true, attempts: 0, next_attempt_at: nil]],
+          [set: [requested: true, attempts: 0, invalid_attempts: 0, next_attempt_at: nil]],
           prefix: scope.prefix,
           log: false
         )
@@ -342,7 +343,7 @@ defmodule EmailJanitor.Worker.Ledger do
         from(p in Candidate,
           where: p.inbox_id == ^inbox.id and p.candidate_id in subquery(candidates)
         ),
-        [set: [requested: true, attempts: 0, next_attempt_at: nil]],
+        [set: [requested: true, attempts: 0, invalid_attempts: 0, next_attempt_at: nil]],
         prefix: scope.prefix,
         log: false
       )
@@ -354,7 +355,11 @@ defmodule EmailJanitor.Worker.Ledger do
     case result do
       status when status in [:retry, :unreadable, :invalid_decision] ->
         attempts = min(candidate.attempts + 1, 16)
-        capped = status == :invalid_decision and attempts >= 8
+
+        invalid_attempts =
+          if status == :invalid_decision, do: min(candidate.invalid_attempts + 1, 8), else: 0
+
+        capped = invalid_attempts >= 8
 
         scope.repo.update_all(
           from(c in Candidate,
@@ -365,6 +370,7 @@ defmodule EmailJanitor.Worker.Ledger do
           [
             set: [
               attempts: attempts,
+              invalid_attempts: invalid_attempts,
               requested: not capped,
               next_attempt_at:
                 DateTime.add(now, if(status == :unreadable, do: 900, else: delay(attempts)))

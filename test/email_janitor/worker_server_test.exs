@@ -147,6 +147,68 @@ defmodule EmailJanitor.WorkerServerTest do
     refute_receive {:slice, 3}, 100
   end
 
+  test "explicit trusted repair resets only the selected reference" do
+    owner = self()
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, ["a", "b"]} end,
+         resolve: fn ref -> {:ok, config(ref)} end,
+         step: fn cfg ->
+           send(owner, {:attempted, cfg.inbox.id})
+           {:ok, %{status: :rate_limited, more?: false}}
+         end,
+         interval_ms: 5_000}
+      )
+
+    assert_receive {:attempted, "a"}, 1_000
+    assert_receive {:attempted, "b"}, 1_000
+    wait_failed_refs(server, ["a", "b"], 100)
+    Server.wake(server, "a")
+    assert_receive {:attempted, "a"}, 1_000
+    refute_receive {:attempted, "b"}, 100
+  end
+
+  test "new explicit wake refreshes the trusted list without reviving another failed inbox" do
+    owner = self()
+    refs = start_supervised!({Agent, fn -> ["a"] end})
+
+    server =
+      start_supervised!(
+        {Server,
+         list: fn -> {:ok, Agent.get(refs, & &1)} end,
+         resolve: fn ref -> {:ok, config(ref)} end,
+         step: fn cfg ->
+           send(owner, {:attempted, cfg.inbox.id})
+           {:ok, %{status: :rate_limited, more?: false}}
+         end,
+         interval_ms: 5_000}
+      )
+
+    assert_receive {:attempted, "a"}, 1_000
+    wait_failed_refs(server, ["a"], 100)
+    Agent.update(refs, fn _ -> ["a", "new-ref"] end)
+    Server.wake(server, "new-ref")
+    assert_receive {:attempted, "new-ref"}, 1_000
+    refute_receive {:attempted, "a"}, 100
+    Server.wake(server, "not-in-trusted-list")
+    refute_receive {:attempted, "not-in-trusted-list"}, 100
+  end
+
+  defp wait_failed_refs(_server, _refs, 0), do: flunk("references did not enter backoff")
+
+  defp wait_failed_refs(server, refs, left) do
+    state = :sys.get_state(server)
+
+    if Enum.all?(refs, &(state.entries[&1].attempts > 0)) do
+      :ok
+    else
+      Process.sleep(5)
+      wait_failed_refs(server, refs, left - 1)
+    end
+  end
+
   defp wait_failed(_server, 0), do: flunk("step did not enter failure backoff")
 
   defp wait_failed(server, left) do

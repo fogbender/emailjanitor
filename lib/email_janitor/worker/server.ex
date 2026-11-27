@@ -39,6 +39,9 @@ defmodule EmailJanitor.Worker.Server do
 
   def wake(server), do: GenServer.cast(server, :wake)
 
+  @doc "Explicit trusted auth/config/upgrade repair only. Pub/Sub must use wake/1."
+  def wake(server, ref), do: GenServer.cast(server, {:wake, ref})
+
   @impl true
   def init(options) do
     list = options[:list]
@@ -67,6 +70,25 @@ defmodule EmailJanitor.Worker.Server do
        }}
     else
       {:stop, :invalid_worker_server}
+    end
+  end
+
+  @impl true
+  def handle_cast({:wake, ref}, state) do
+    if Parser.valid_id?(ref) do
+      now = System.monotonic_time(:millisecond)
+
+      entries =
+        case Map.fetch(state.entries, ref) do
+          {:ok, _} -> Map.put(state.entries, ref, %{due: now, attempts: 0})
+          :error -> state.entries
+        end
+
+      # New refs are accepted only from the next trusted list refresh.
+      send(self(), :tick)
+      {:noreply, %{state | entries: entries}}
+    else
+      {:noreply, state}
     end
   end
 

@@ -406,9 +406,24 @@ defmodule EmailJanitor.Gmail.Ingestion do
              }}
         end
       else
-        {:error, :not_found} -> {:skip, :deleted_arrival}
-        {:error, reason} = error when reason in @provider_errors -> error
-        _ -> {:error, :eligibility_unavailable}
+        {:error, :not_found} ->
+          {:skip, :deleted_arrival}
+
+        {:error, reason} = error when reason in @provider_errors ->
+          error
+
+        {:error, reason}
+        when reason in [
+               :invalid_thread,
+               :invalid_mime,
+               :invalid_message,
+               :invalid_headers,
+               :invalid_date
+             ] ->
+          {:error, :unreadable_content}
+
+        _ ->
+          {:error, :eligibility_unavailable}
       end
     end)
   end

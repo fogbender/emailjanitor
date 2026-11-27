@@ -203,21 +203,56 @@ defmodule EmailJanitor.Worker do
 
   defp stable_deferral?(_, _, _), do: false
 
-  defp pre_review_failure(config, checkpoint, id, key, version, now, error) do
+  defp pre_review_failure(
+         config,
+         checkpoint,
+         id,
+         key,
+         version,
+         now,
+         error,
+         fingerprint \\ "metadata-unavailable"
+       ) do
+    old = Ledger.deferral(config.scope, config.inbox, checkpoint.generation, key)
+
+    ids =
+      if old && old.instruction_version == version,
+        do: Enum.uniq([id | old.message_ids]),
+        else: [id]
+
+    status =
+      if error in [{:error, :unreadable_content}, {:error, :invalid_thread_snapshot}],
+        do: :unreadable,
+        else: :transient
+
     Ledger.defer(
       config.scope,
       config.inbox,
       checkpoint.generation,
       key,
-      "metadata-unavailable",
+      fingerprint,
       version,
-      [id],
-      :transient,
+      ids,
+      status,
       now
     )
 
-    error
+    # A handled local failure must not activate the inbox-wide scheduler backoff,
+    # otherwise that backoff can always outlast the item's own retry deferral.
+    if inbox_failure?(error), do: error, else: :deferred
   end
+
+  defp inbox_failure?({:error, reason})
+       when reason in [
+              :authorization_required,
+              :forbidden,
+              :rate_limited,
+              :wrong_inbox,
+              :connection_changed
+            ],
+       do: true
+
+  defp inbox_failure?(_), do: false
 
   defp review_targets(config, checkpoint, id, snapshot, instructions, version, now) do
     case Ingestion.eligible_thread(
@@ -259,19 +294,16 @@ defmodule EmailJanitor.Worker do
         processed(config, checkpoint, [id], :skipped)
 
       error ->
-        Ledger.defer(
-          config.scope,
-          config.inbox,
-          checkpoint.generation,
+        pre_review_failure(
+          config,
+          checkpoint,
+          id,
           snapshot.thread_id,
-          snapshot.fingerprint,
           version,
-          [id],
-          :transient,
-          now
+          now,
+          error,
+          snapshot.fingerprint
         )
-
-        error
     end
   end
 
@@ -395,7 +427,8 @@ defmodule EmailJanitor.Worker do
     old = Ledger.deferral(config.scope, config.inbox, checkpoint.generation, eligible.thread_id)
 
     capped =
-      error == {:error, :invalid_decision} and not is_nil(old) and old.attempts >= 7 and
+      error == {:error, :invalid_decision} and not is_nil(old) and old.status == :invalid and
+        old.attempts >= 7 and
         old.instruction_version == version and old.fingerprint == snapshot.fingerprint
 
     Ledger.defer(
@@ -406,7 +439,11 @@ defmodule EmailJanitor.Worker do
       snapshot.fingerprint,
       version,
       eligible.message_ids,
-      if(capped, do: :blocked, else: :transient),
+      cond do
+        capped -> :blocked
+        error == {:error, :invalid_decision} -> :invalid
+        true -> :transient
+      end,
       now
     )
 

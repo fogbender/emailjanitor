@@ -401,6 +401,9 @@ even when Pub/Sub notifications are absent. Supervise the authenticated
 `Gmail.NotificationWorker.Server` pull loop separately (trusted `source:`
 adapter/config, database-only `router:`, optional `wake:` callback), and call
 `Worker.Server.wake/1` after committing notifications when lower latency is needed.
+That generic wake preserves failure backoff. Only a trusted explicit auth/config
+repair or upgrade uses `wake/2` with a host-derived reference to reset that one
+inbox's backoff; new references must still appear in the trusted list callback.
 
 The host's `authorize` callback is checked again inside admission. It must use
 bounded local database checks, and explicit disconnect/binding changes must lock
