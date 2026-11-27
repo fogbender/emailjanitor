@@ -7,3 +7,4 @@ config :domainatrex, fetch_latest: false
 # this pinned SDK can put raw text in exception metadata despite payloads:none.
 config :req_llm, telemetry: [payloads: :none], debug: false, load_dotenv: false
 config :ex_aws, http_client: ExAws.Request.Req, json_codec: Jason
+config :tzdata, :autoupdate, :disabled
