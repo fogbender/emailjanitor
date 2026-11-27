@@ -47,8 +47,11 @@ existing subject/address binding; its generation and cursor remain usable.
 Connection lifecycle changes serialize without holding provider calls under SQL.
 
 Explicit disconnect clears encrypted credentials and increments the epoch and
-instruction guard. Ordinary refresh/reconsent preserves the epoch/cursor. Refresh
-uses the shared maintained OAuth SDK outside SQL and publishes with an exact
+instruction guard. Ordinary refresh/reconsent preserves the epoch/cursor;
+reauthorization after a revoked grant keeps the newly fenced epoch. A durable `reset_baseline`
+marker distinguishes deliberate reconnect from reauthorization and remains set
+until the worker's baseline activation transaction commits.
+Provider refresh uses the shared maintained OAuth SDK outside SQL and publishes with an exact
 credential-version check: a late response cannot revive a disconnected grant or
 overwrite newer consent. Revoked grants clear credentials, require reauthorization
 and invalidate prepared work. Each SDK resolver captures its explicit inbox and

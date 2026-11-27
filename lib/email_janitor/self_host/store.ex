@@ -99,7 +99,7 @@ defmodule EmailJanitor.SelfHost.Store do
             }
 
         if binding.google_subject != result.subject, do: scope.repo.rollback(:invalid_connection)
-        resumed = binding.state in [:pending, :active]
+        resumed = binding.state != :disconnected
 
         if readdressed do
           readdress_checkpoint!(scope, box.id, mailbox.address, box.address)
@@ -115,7 +115,8 @@ defmodule EmailJanitor.SelfHost.Store do
           timezone: timezone,
           token_ciphertext: cipher,
           token_version: binding.token_version + 1,
-          state: if(resumed, do: binding.state, else: :pending),
+          state: if(binding.state == :active, do: :active, else: :pending),
+          reset_baseline: binding.reset_baseline or not resumed,
           epoch: if(resumed and not readdressed, do: binding.epoch, else: binding.epoch + 1)
         }
 
@@ -188,6 +189,7 @@ defmodule EmailJanitor.SelfHost.Store do
                  scope.repo.update!(
                    Ecto.Changeset.change(binding,
                      state: :disconnected,
+                     reset_baseline: true,
                      token_ciphertext: nil,
                      epoch: binding.epoch + 1,
                      token_version: binding.token_version + 1
@@ -266,7 +268,8 @@ defmodule EmailJanitor.SelfHost.Store do
 
            case fetch_binding(ref) do
              {:ok, binding, _} ->
-               scope.repo.update!(Ecto.Changeset.change(binding, state: :active),
+               scope.repo.update!(
+                 Ecto.Changeset.change(binding, state: :active, reset_baseline: false),
                  prefix: scope.prefix
                )
 
@@ -348,6 +351,7 @@ defmodule EmailJanitor.SelfHost.Store do
       scope.repo.update!(
         Ecto.Changeset.change(binding,
           state: :disconnected,
+          reset_baseline: true,
           token_ciphertext: nil,
           epoch: binding.epoch + 1,
           token_version: binding.token_version + 1

@@ -207,6 +207,31 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert saved.epoch == before.epoch + 1
     assert {:ok, next} = EmailJanitor.Store.instruction_version(ctx.scope, box.id)
     assert next == version + 1
+    assert {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    reauthorized = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert reauthorized.epoch == saved.epoch
+    assert reauthorized.state == :pending
+    refute reauthorized.reset_baseline
+  end
+
+  test "only deliberate disconnect/reconnect requests a new baseline until activation commits",
+       ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    before = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    refute before.reset_baseline
+    assert :ok = Store.activate({box.id, before.epoch})
+    assert :ok = SelfHost.disconnect(owner, box.id)
+    assert {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    reconnected = Repo.get!(Binding, box.id, prefix: ctx.scope.prefix)
+    assert reconnected.reset_baseline
+    assert reconnected.state == :pending
+    assert reconnected.epoch > before.epoch
+    assert {:ok, ^box} = SelfHost.connect(owner, result(), "Etc/UTC")
+    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
+    assert :ok = Store.activate({box.id, reconnected.epoch})
+    refute Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).reset_baseline
+    assert Repo.get!(Binding, box.id, prefix: ctx.scope.prefix).state == :active
   end
 
   test "late refresh cannot overwrite newer consent even when the connection epoch is preserved",
