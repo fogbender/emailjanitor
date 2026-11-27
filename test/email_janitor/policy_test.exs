@@ -14,9 +14,16 @@ defmodule EmailJanitor.TestPolicy do
   end
 
   def settle(context, _inbox, action_id, result) do
-    send(self(), {:policy_settlement, action_id, result})
+    if observer = Map.get(context, :observer),
+      do: send(observer, {:policy_settlement, action_id, result})
 
-    if Process.get(:fail_settlement, false) do
+    failed =
+      case Map.get(context, :control) do
+        nil -> false
+        control -> Agent.get(control, & &1.fail)
+      end
+
+    if failed do
       {:error, :unavailable}
     else
       {ids, rest} =
@@ -31,6 +38,23 @@ defmodule EmailJanitor.TestPolicy do
     end
   end
 
+  def retire_candidate(context, _inbox, id, ids) do
+    if context.mode == :retire_error do
+      {:error, :unavailable}
+    else
+      record(context, id, "retire", ids)
+
+      Ecto.Adapters.SQL.query!(
+        context.scope.repo,
+        "DELETE FROM #{context.scope.prefix}.policy_events WHERE action_id=$1 AND kind='reserve'",
+        [id],
+        log: false
+      )
+
+      :ok
+    end
+  end
+
   defp record(context, id, kind, ids, rest \\ []) do
     Ecto.Adapters.SQL.query!(
       context.scope.repo,
@@ -39,6 +63,22 @@ defmodule EmailJanitor.TestPolicy do
       log: false
     )
   end
+end
+
+defmodule EmailJanitor.KeepAfterHookClassifier do
+  @behaviour EmailJanitor.Classifier
+  def classify(_, _, opts) do
+    opts[:hook].()
+    {:ok, %{"action" => "keep", "confidence" => "high", "category" => "legitimate"}}
+  end
+end
+
+defmodule EmailJanitor.UnavailableReviewGmail do
+  @behaviour EmailJanitor.Gmail
+  def thread(_, _, _), do: {:error, :temporary_failure}
+  def contacted(_, _, _), do: {:error, :temporary_failure}
+  def history_id(_, _), do: {:error, :temporary_failure}
+  def remove_inbox(_, _, _), do: {:error, :temporary_failure}
 end
 
 defmodule EmailJanitor.PolicyTest do
@@ -56,7 +96,7 @@ defmodule EmailJanitor.PolicyTest do
     TestRepo
   }
 
-  alias EmailJanitor.Store.{Action, Scope}
+  alias EmailJanitor.Store.{Action, Candidate, Scope}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(TestRepo)
@@ -77,7 +117,8 @@ defmodule EmailJanitor.PolicyTest do
     state =
       start_supervised!({Agent, fn -> %{messages: [message()], contacted: [], calls: []} end})
 
-    %{scope: scope, inbox: box, proposal: proposal, state: state}
+    control = start_supervised!({Agent, fn -> %{fail: false} end}, id: :policy_control)
+    %{scope: scope, inbox: box, proposal: proposal, state: state, control: control}
   end
 
   defp execute(ctx, mode, gmail_opts \\ []) do
@@ -91,7 +132,10 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   defp policy(ctx, mode),
-    do: %Policy{adapter: TestPolicy, context: %{scope: ctx.scope, mode: mode}}
+    do: %Policy{
+      adapter: TestPolicy,
+      context: %{scope: ctx.scope, mode: mode, control: ctx.control, observer: self()}
+    }
 
   defp events do
     Ecto.Adapters.SQL.query!(
@@ -106,6 +150,301 @@ defmodule EmailJanitor.PolicyTest do
     assert {:blocked, :upgrade_required} = execute(ctx, :block)
     assert [["reserve", ["message-1"]]] = events()
     assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "fresh archive and new-correspondence guards retire blocked work without Gmail mutation",
+       ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    Agent.update(ctx.state, &%{&1 | contacted: ["vendor.com"]})
+    assert {:skip, :prior_correspondence} = execute(ctx, :block)
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["retire", ["message-1"]]] = events()
+    Agent.update(ctx.state, &%{&1 | contacted: []})
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    Agent.update(ctx.state, &%{&1 | messages: [message(labels: ["UNREAD", "IMPORTANT"])]})
+    assert {:skip, :proposal_changed} = execute(ctx, :block)
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "scoped model keep under current instructions retires old blocked metadata", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+
+    TestRepo.update_all(EmailJanitor.Store.Mailbox, [set: [instruction_version: 2]],
+      prefix: ctx.scope.prefix
+    )
+
+    classifier =
+      {TestClassifier,
+       [result: %{"action" => "keep", "confidence" => "high", "category" => "legitimate"}]}
+
+    assert {:keep, :classifier_kept} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {TestGmail, [state: ctx.state]},
+               classifier,
+               "Keep this sender.",
+               2,
+               policy: policy(ctx, :block)
+             )
+
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["retire", ["message-1"]]] = events()
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "transient Gmail and model failures retain pending work", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert {:error, :gmail_unavailable} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {EmailJanitor.UnavailableReviewGmail, []},
+               {TestClassifier, []},
+               "",
+               1,
+               policy: policy(ctx, :block)
+             )
+
+    assert {:error, :model_unavailable} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {TestGmail, [state: ctx.state]},
+               {TestClassifier, [mode: :raw_error]},
+               "",
+               1,
+               policy: policy(ctx, :block)
+             )
+
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["reserve", ["message-1"]]] = events()
+  end
+
+  test "failed retirement and concurrent prompt changes preserve old pending work", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    keep =
+      {TestClassifier,
+       [result: %{"action" => "keep", "confidence" => "high", "category" => "legitimate"}]}
+
+    assert {:error, :policy_unavailable} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {TestGmail, [state: ctx.state]},
+               keep,
+               "",
+               1,
+               policy: policy(ctx, :retire_error)
+             )
+
+    hook = fn ->
+      TestRepo.update_all(EmailJanitor.Store.Mailbox, [set: [instruction_version: 2]],
+        prefix: ctx.scope.prefix
+      )
+    end
+
+    assert {:error, :proposal_changed} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {TestGmail, [state: ctx.state]},
+               {EmailJanitor.KeepAfterHookClassifier, [hook: hook]},
+               "",
+               1,
+               policy: policy(ctx, :block)
+             )
+
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
+  test "an older keep review cannot retire a newer blocked reply", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    messages = [message(), message(id: "message-2")]
+    {:ok, newer} = Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+    scoped_policy = policy(ctx, :block)
+
+    hook = fn ->
+      Agent.update(ctx.state, &%{&1 | messages: messages})
+
+      assert {:ok, {:blocked, :upgrade_required}} =
+               Store.intent(ctx.scope, ctx.inbox.id, newer, "101", policy: scoped_policy)
+    end
+
+    assert {:keep, :classifier_kept} =
+             Executor.review(
+               ctx.scope,
+               ctx.inbox,
+               "thread-1",
+               {TestGmail, [state: ctx.state]},
+               {EmailJanitor.KeepAfterHookClassifier, [hook: hook]},
+               "",
+               1,
+               policy: scoped_policy
+             )
+
+    assert [%Candidate{message_ids: ["message-1", "message-2"]}] =
+             TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "outer transactions are rejected before reconciliation, recovery and settlement", ctx do
+    assert {:unresolved, id} = execute(ctx, :allow, mode: :timeout_after_apply)
+    Agent.update(ctx.control, &%{&1 | fail: true})
+
+    history = %{
+      complete?: true,
+      started_at: DateTime.utc_now(),
+      events: [%{history_id: "101", message_id: "message-1", event: :inbox_removed}]
+    }
+
+    assert {:ok, :checked} =
+             TestRepo.transaction(fn ->
+               assert {:error, :outer_transaction} =
+                        Executor.reconcile(ctx.scope, ctx.inbox, id, history,
+                          policy: policy(ctx, :allow)
+                        )
+
+               assert {:error, :outer_transaction} =
+                        Executor.recover(ctx.scope, ctx.inbox, id, policy: policy(ctx, :allow))
+
+               assert {:error, :outer_transaction} =
+                        Executor.settle_action(ctx.scope, ctx.inbox, id,
+                          policy: policy(ctx, :allow)
+                        )
+
+               assert {:error, :outer_transaction} =
+                        Executor.review(
+                          ctx.scope,
+                          ctx.inbox,
+                          "thread-1",
+                          {TestGmail, [state: ctx.state]},
+                          {TestClassifier, []},
+                          "",
+                          1,
+                          policy: policy(ctx, :allow)
+                        )
+
+               :checked
+             end)
+
+    assert %Action{state: :unresolved} = Store.get(ctx.scope, ctx.inbox.id, id)
+
+    assert {:settlement_pending, ^id, :done} =
+             Executor.reconcile(ctx.scope, ctx.inbox, id, history, policy: policy(ctx, :allow))
+
+    assert %Action{state: :done} = Store.get(ctx.scope, ctx.inbox.id, id)
+  end
+
+  test "repeated blocked notifications retain one candidate and promote its ID on admission",
+       ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["reserve", ["message-1"]]] = events()
+    assert {:done, ^id} = execute(ctx, :allow)
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert %Action{id: ^id} = Store.get(ctx.scope, ctx.inbox.id, id)
+    assert [["message-1"]] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "a cancelled admitted candidate never lends its ID to a new reservation", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert {:ok, {:created, %Action{id: ^id}}} =
+             Store.intent(ctx.scope, ctx.inbox.id, ctx.proposal, "100",
+               policy: policy(ctx, :allow)
+             )
+
+    Ecto.Adapters.SQL.query!(
+      TestRepo,
+      "UPDATE #{ctx.scope.prefix}.actions SET state='cancelled' WHERE id=$1::uuid",
+      [Ecto.UUID.dump!(id)],
+      log: false
+    )
+
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: next}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    refute next == id
+  end
+
+  test "large blocked message sets retain a stable identity without an oversized database index",
+       ctx do
+    messages = for _ <- 1..512, do: message(id: Ecto.UUID.generate() |> String.replace("-", ""))
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    ctx = %{ctx | proposal: proposal}
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+
+    assert [%Candidate{id: id, message_ids: ids}] =
+             TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert length(ids) == 512
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: ^id}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "a growing blocked thread retires the superseded proposal at core and host", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: old}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    messages = [message(), message(id: "message-2")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    ctx = %{ctx | proposal: proposal}
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+
+    assert [%Candidate{id: current, message_ids: ["message-1", "message-2"]}] =
+             TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+
+    refute current == old
+
+    assert %{rows: [[^old, "retire"], [^current, "reserve"]]} =
+             Ecto.Adapters.SQL.query!(
+               TestRepo,
+               "SELECT action_id,kind FROM #{ctx.scope.prefix}.policy_events ORDER BY kind DESC",
+               [],
+               log: false
+             )
+
+    assert {:done, ^current} = execute(ctx, :allow)
+    assert [] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [["message-1", "message-2"]] = Agent.get(ctx.state, & &1.calls)
+  end
+
+  test "candidate retirement failure rolls back admission and all host metadata", ctx do
+    assert {:blocked, :upgrade_required} = execute(ctx, :block)
+    assert [%Candidate{id: old}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    messages = [message(), message(id: "message-2")]
+    Agent.update(ctx.state, &%{&1 | messages: messages})
+
+    {:ok, proposal} =
+      Reviewer.review(messages, ctx.inbox, MapSet.new(), {TestClassifier, []}, "", 1)
+
+    assert {:error, :policy_unavailable} = execute(%{ctx | proposal: proposal}, :retire_error)
+    assert [%Candidate{id: ^old}] = TestRepo.all(Candidate, prefix: ctx.scope.prefix)
+    assert [] = TestRepo.all(Action, prefix: ctx.scope.prefix)
+    assert [["reserve", ["message-1"]]] = events()
     assert [] = Agent.get(ctx.state, & &1.calls)
   end
 
@@ -133,10 +472,10 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   test "failed settlement retries from durable outcomes without another Gmail call", ctx do
-    Process.put(:fail_settlement, true)
+    Agent.update(ctx.control, &%{&1 | fail: true})
     assert {:settlement_pending, id, :done} = execute(ctx, :allow)
     assert %Action{state: :done} = Store.get(ctx.scope, ctx.inbox.id, id)
-    Process.put(:fail_settlement, false)
+    Agent.update(ctx.control, &%{&1 | fail: false})
 
     assert {:existing, ^id, :done} =
              Executor.settle_action(ctx.scope, ctx.inbox, id, policy: policy(ctx, :allow))
@@ -165,7 +504,8 @@ defmodule EmailJanitor.PolicyTest do
   end
 
   for fail_settlement <- [false, true] do
-    test "mixed history settlement preserves both ID lists (failure=#{fail_settlement})", ctx do
+    test "mixed history stays blocked until all IDs are observed (failure=#{fail_settlement})",
+         ctx do
       messages = [message(id: "message-1"), message(id: "message-2")]
       Agent.update(ctx.state, &%{&1 | messages: messages})
 
@@ -175,32 +515,45 @@ defmodule EmailJanitor.PolicyTest do
       ctx = %{ctx | proposal: proposal}
       assert {:unresolved, id} = execute(ctx, :allow, mode: :timeout_after_apply)
       assert_received {:policy_settlement, ^id, :unresolved}
-      Process.put(:fail_settlement, unquote(fail_settlement))
+      Agent.update(ctx.control, &%{&1 | fail: unquote(fail_settlement)})
 
       history = %{
         complete?: true,
+        started_at: DateTime.utc_now(),
         events: [
           %{history_id: "101", message_id: "message-1", event: :inbox_removed},
           %{history_id: "102", message_id: "message-1", event: :inbox_added}
         ]
       }
 
+      assert {:error, :dispatch_outcome_unknown} =
+               Executor.reconcile(ctx.scope, ctx.inbox, id, history, policy: policy(ctx, :allow))
+
+      refute_received {:policy_settlement, ^id, {:reconciled, _, _}}
+
+      history = %{
+        history
+        | events:
+            history.events ++
+              [%{history_id: "103", message_id: "message-2", event: :inbox_removed}]
+      }
+
       result = Executor.reconcile(ctx.scope, ctx.inbox, id, history, policy: policy(ctx, :allow))
-      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1"], ["message-2"]}}
+      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1", "message-2"], []}}
 
       if unquote(fail_settlement),
         do: assert(result == {:settlement_pending, id, :restored}),
         else: assert(match?({:ok, {:restored, _}}, result))
 
-      Process.put(:fail_settlement, false)
+      Agent.update(ctx.control, &%{&1 | fail: false})
 
       assert {:existing, ^id, :restored} =
                Executor.settle_action(ctx.scope, ctx.inbox, id, policy: policy(ctx, :allow))
 
-      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1"], ["message-2"]}}
+      assert_received {:policy_settlement, ^id, {:reconciled, ["message-1", "message-2"], []}}
       assert [["message-1", "message-2"]] = Agent.get(ctx.state, & &1.calls)
 
-      assert %{rows: [[["message-1"], ["message-2"]]]} =
+      assert %{rows: [[["message-1", "message-2"], []]]} =
                Ecto.Adapters.SQL.query!(
                  TestRepo,
                  "SELECT message_ids,not_applied_ids FROM ej_test_a.policy_events WHERE kind='settle'",
