@@ -370,8 +370,9 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
     end
   end
 
-  for phase <- [:in_flight, :cached_review] do
-    test "an existing unresolved action preserves a newer Keep fence (#{phase})", ctx do
+  for keep_b <- [true, false], phase <- [:in_flight, :cached_review] do
+    test "an existing unresolved action preserves newer decisions Keep=#{keep_b} (#{phase})",
+         ctx do
       messages = [message(), message(id: "message-2")]
       Agent.update(ctx.state, &%{&1 | messages: messages})
       parent = self()
@@ -440,7 +441,11 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
           {pid, monitor, owner}
         end
 
-      assert {:ok, newer} = review.(["message-1", "message-2"], ["message-2"])
+      assert {:ok, newer} =
+               review.(
+                 ["message-1", "message-2"],
+                 if(unquote(keep_b), do: ["message-2"], else: [])
+               )
 
       assert {:existing, ^action_id, :unresolved} =
                database(fn ->
@@ -450,13 +455,22 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
       if running do
         {pid, monitor, owner} = running
         send(owner, :continue_existing)
-        assert_receive {:existing_old_result, {:error, :proposal_changed}}, 5_000
+        assert_receive {:existing_old_result, result}, 5_000
+
+        if unquote(keep_b),
+          do: assert(result == {:error, :proposal_changed}),
+          else: assert(match?({:done, _}, result))
+
         assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
       else
-        assert {:error, :proposal_changed} =
-                 database(fn ->
-                   Executor.execute(ctx.scope, ctx.inbox, old, {TestGmail, [state: ctx.state]})
-                 end)
+        result =
+          database(fn ->
+            Executor.execute(ctx.scope, ctx.inbox, old, {TestGmail, [state: ctx.state]})
+          end)
+
+        if unquote(keep_b),
+          do: assert(result == {:error, :proposal_changed}),
+          else: assert(match?({:done, _}, result))
       end
 
       fence = fn ->
@@ -472,13 +486,19 @@ defmodule EmailJanitor.PolicyConcurrencyTest do
       accepted_at = fence.()
       # A cached retry can settle its original action without refreshing the
       # accepted timestamp for any newer evaluation.
-      assert {:existing, ^action_id, :unresolved} =
-               database(fn ->
-                 Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
-               end)
+      if unquote(keep_b) do
+        assert {:existing, ^action_id, :unresolved} =
+                 database(fn ->
+                   Executor.execute(ctx.scope, ctx.inbox, newer, {TestGmail, [state: ctx.state]})
+                 end)
 
-      assert accepted_at == fence.()
-      assert [["message-1"]] == Agent.get(ctx.state, & &1.calls)
+        assert accepted_at == fence.()
+      end
+
+      expected_calls =
+        if unquote(keep_b), do: [["message-1"]], else: [["message-1"], ["message-2"]]
+
+      assert expected_calls == Agent.get(ctx.state, & &1.calls)
     end
   end
 

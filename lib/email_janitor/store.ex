@@ -144,7 +144,24 @@ defmodule EmailJanitor.Store do
             )
           )
 
-          record_review(scope, inbox_id, review_ids(evaluated_ids, opts))
+          # A fence for uncovered Done work needs a durable pending owner;
+          # otherwise an agreeing cached executor must remain able to admit it.
+          uncovered = proposal.message_ids -- existing.message_ids
+
+          pending_ids =
+            scope.repo.all(
+              from(c in Candidate,
+                where:
+                  c.inbox_id == ^inbox_id and
+                    fragment("? && ?::text[]", c.message_ids, ^uncovered),
+                select: {c.remaining_message_ids, c.message_ids}
+              ),
+              prefix: scope.prefix
+            )
+            |> Enum.flat_map(fn {remaining, original} -> remaining || original end)
+
+          fence_ids = Enum.filter(evaluated_ids, &(&1 not in uncovered or &1 in pending_ids))
+          record_review(scope, inbox_id, review_ids(fence_ids, opts))
         end
 
         {:existing, existing}
