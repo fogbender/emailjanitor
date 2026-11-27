@@ -79,6 +79,9 @@ defmodule EmailJanitor.Google.OAuth do
     "jwks_uri" => "https://www.googleapis.com/oauth2/v3/certs"
   }
 
+  @doc "Version of the typed code-exchange failure contract for host capability checks."
+  def callback_failure_version, do: 1
+
   def authorize_url(%Config{} = config, mode) when mode in [:sign_in, :connect] do
     protect(:authorization_failed, fn ->
       params = [scope: if(mode == :connect, do: "email " <> @gmail, else: "email")]
@@ -118,7 +121,17 @@ defmodule EmailJanitor.Google.OAuth do
         # Hosts capture it before validating scopes and deciding activation.
         {:ok, %Result{subject: subject, email: email, token: Content.new(Jason.encode!(token))}}
       else
-        _ -> {:error, :authorization_failed}
+        {:error,
+         %Assent.HTTPAdapter.InvalidResponseError{
+           response: %Assent.HTTPAdapter.HTTPResponse{
+             status: 400,
+             body: %{"error" => "invalid_grant"}
+           }
+         }} ->
+          {:error, :code_exchange_rejected}
+
+        _ ->
+          {:error, :authorization_failed}
       end
     end)
   end
@@ -320,6 +333,7 @@ defmodule EmailJanitor.Google.OAuth do
     case operation.() do
       {:ok, _} = value -> value
       {:error, :reauthorization_required} = value when reason == :refresh_failed -> value
+      {:error, :code_exchange_rejected} = value when reason == :authorization_failed -> value
       _ -> {:error, reason}
     end
   rescue
