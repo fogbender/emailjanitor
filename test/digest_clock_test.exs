@@ -70,7 +70,7 @@ defmodule EmailJanitor.DigestClockTest do
     assert {:error, :invalid_digest_event} =
              Event.new(
                Ecto.UUID.generate(),
-               "PRIVATE-BODY",
+               "PRIVATE/BODY",
                :done,
                "sender@example.com",
                "subject",
