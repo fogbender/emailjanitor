@@ -57,6 +57,63 @@ defmodule EmailJanitor.RecoveryTest do
     end)
   end
 
+  defp beam_owner(ctx, dispatch?) do
+    payload =
+      {ctx.scope.prefix, ctx.box.id, ctx.proposal, dispatch?}
+      |> :erlang.term_to_binary()
+      |> Base.encode64()
+
+    script = """
+    {:ok, _} = Application.ensure_all_started(:email_janitor)
+    {:ok, _} = EmailJanitor.TestRepo.start_link(
+      socket_dir: System.fetch_env!("JANITOR_TEST_SOCKET"), database: "emailjanitor_test",
+      username: System.fetch_env!("USER"), port: 5432, log: false)
+    [encoded] = System.argv()
+    {prefix, inbox, proposal, dispatch?} = encoded |> Base.decode64!() |> :erlang.binary_to_term()
+    {:ok, scope} = EmailJanitor.Store.Scope.new(EmailJanitor.TestRepo, prefix)
+    {:ok, {:created, action}} = EmailJanitor.Store.intent(scope, inbox, proposal, "100")
+    if dispatch?, do: :ok = EmailJanitor.Store.begin_dispatch(scope, inbox, action.id, action.owner_token)
+    IO.puts("READY:" <> action.id)
+    Process.sleep(:infinity)
+    """
+
+    paths = Path.wildcard("_build/test/lib/*/ebin") |> Enum.flat_map(&["-pa", &1])
+    args = ["--erl", "+S 2:2"] ++ paths ++ ["-e", script, "--", payload]
+
+    port =
+      Port.open({:spawn_executable, System.find_executable("elixir")}, [
+        :binary,
+        :exit_status,
+        args: args
+      ])
+
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+
+    on_exit(fn ->
+      if Port.info(port),
+        do: System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    end)
+
+    action_id = beam_ready(port, "")
+    action = database(fn -> Store.get(ctx.scope, ctx.box.id, action_id) end)
+    assert action.owner_os_pid == Integer.to_string(os_pid)
+    {port, os_pid, action}
+  end
+
+  defp beam_ready(port, output) do
+    receive do
+      {^port, {:data, data}} ->
+        output = output <> data
+
+        case Regex.run(~r/READY:([a-f0-9-]{36})/, output) do
+          [_, id] -> id
+          _ -> beam_ready(port, output)
+        end
+    after
+      10_000 -> flunk("isolated BEAM did not commit its intent")
+    end
+  end
+
   test "a process crash after committed preparation survives a new database connection", ctx do
     {pid, monitor, action} = owner(ctx, fn _, _ -> Process.exit(self(), :kill) end)
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, 5_000
@@ -136,6 +193,78 @@ defmodule EmailJanitor.RecoveryTest do
     send(pid, :dispatch)
     assert_receive {:fenced, {:error, :ownership_lost}}, 5_000
     assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+  end
+
+  test "a dispatch waiting behind a locked recovery decision observes the committed cancellation",
+       ctx do
+    {pid, monitor, action} =
+      owner(ctx, fn action, parent ->
+        receive do
+          :dispatch ->
+            send(
+              parent,
+              {:fenced,
+               Store.begin_dispatch(ctx.scope, ctx.box.id, action.id, action.owner_token)}
+            )
+        end
+      end)
+
+    parent = self()
+
+    {locker, lock_monitor} =
+      spawn_monitor(fn ->
+        database(fn ->
+          TestRepo.transaction(fn ->
+            TestRepo.one!(from(a in Action, where: a.id == ^action.id, lock: "FOR UPDATE"),
+              prefix: ctx.scope.prefix
+            )
+
+            send(parent, :row_locked)
+
+            receive do
+              :cancel ->
+                TestRepo.update_all(
+                  from(a in Action, where: a.id == ^action.id),
+                  [set: [state: :cancelled]],
+                  prefix: ctx.scope.prefix
+                )
+            end
+          end)
+        end)
+      end)
+
+    assert_receive :row_locked, 5_000
+    send(pid, :dispatch)
+    assert wait_for_dispatch_lock(ctx)
+    send(locker, :cancel)
+    assert_receive {:DOWN, ^lock_monitor, :process, ^locker, :normal}, 5_000
+    assert_receive {:fenced, {:error, :ownership_lost}}, 5_000
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+
+    assert %Action{state: :cancelled, dispatch_started_at: nil} =
+             database(fn -> Store.get(ctx.scope, ctx.box.id, action.id) end)
+  end
+
+  defp wait_for_dispatch_lock(ctx, tries \\ 100)
+  defp wait_for_dispatch_lock(_, 0), do: false
+
+  defp wait_for_dispatch_lock(ctx, tries) do
+    %{rows: [[waiting]]} =
+      database(fn ->
+        Ecto.Adapters.SQL.query!(
+          TestRepo,
+          "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1)",
+          ["%" <> ctx.scope.prefix <> "%FOR UPDATE%"],
+          log: false
+        )
+      end)
+
+    if waiting do
+      true
+    else
+      Process.sleep(10)
+      wait_for_dispatch_lock(ctx, tries - 1)
+    end
   end
 
   test "application and restoration after an executor crash settle without another Gmail mutation",
@@ -346,6 +475,76 @@ defmodule EmailJanitor.RecoveryTest do
       spawn_monitor(fn -> Owner.bounded(fn -> Process.sleep(:infinity) end, 20) end)
 
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, 5_000
+  end
+
+  for dispatch? <- [false, true] do
+    test "separate BEAM SIGKILL recovers a committed #{if dispatch?, do: "dispatched", else: "prepared"} action",
+         ctx do
+      {port, os_pid, action} = beam_owner(ctx, unquote(dispatch?))
+      assert Owner.proof(action) == :unknown
+      {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(os_pid)])
+      assert_receive {^port, {:exit_status, _}}, 5_000
+      assert Owner.proof(action) == :dead
+
+      expected = if unquote(dispatch?), do: :unresolved, else: :cancelled
+
+      assert {:ok, {^expected, _}} =
+               database(fn -> Store.recover(ctx.scope, ctx.box.id, action.id) end)
+    end
+  end
+
+  test "a failed dedicated owner cannot strand or kill its reusable caller", ctx do
+    caller = self()
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, :executor_unavailable} =
+                 Owner.run(fn ->
+                   database(fn ->
+                     {:ok, {:created, action}} =
+                       Store.intent(ctx.scope, ctx.box.id, ctx.proposal, "100")
+
+                     send(caller, {:isolated, self(), action})
+                     raise "PRIVATE_EMAIL_SENTINEL"
+                   end)
+                 end)
+      end)
+
+    refute log =~ "PRIVATE_EMAIL_SENTINEL"
+    assert_receive {:isolated, owner, action}
+    refute owner == caller
+    assert Process.alive?(caller)
+    assert Owner.proof(action) == :dead
+
+    assert {:ok, {:cancelled, _}} =
+             database(fn -> Store.recover(ctx.scope, ctx.box.id, action.id) end)
+
+    assert Process.alive?(caller)
+  end
+
+  test "Linux proof treats changed boots as dead but missing identity as unknown" do
+    action = struct(Action, Owner.capture())
+    old = %{action | owner_runtime: "old-runtime", owner_boot: "old-boot"}
+    assert Owner.proof(old) == :dead
+    assert Owner.proof(%{old | owner_host: nil}) == :unknown
+    assert Owner.proof(%{old | owner_os_start: nil}) == :unknown
+    assert Owner.proof(%{old | owner_boot: nil}) == :unknown
+
+    assert Owner.proof(%{old | owner_boot: action.owner_boot, owner_os_pid: "invalid"}) ==
+             :unknown
+  end
+
+  test "an unsupported current host cannot claim another runtime is dead" do
+    key = {Owner, :runtime}
+    action = struct(Action, Owner.capture())
+    runtime = :persistent_term.get(key)
+
+    try do
+      :persistent_term.put(key, %{runtime | owner_host: nil, owner_boot: nil})
+      assert Owner.proof(%{action | owner_runtime: "previous-runtime"}) == :unknown
+    after
+      :persistent_term.put(key, runtime)
+    end
   end
 
   test "concurrent captures agree on one runtime identity" do

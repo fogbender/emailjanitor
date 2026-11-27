@@ -3,6 +3,12 @@ defmodule EmailJanitor.Executor do
   alias EmailJanitor.{Identity, Inbox, Message, Owner, Proposal, Safeguards, Store}
 
   def execute(scope, %Inbox{} = inbox, %Proposal{} = proposal, {gmail, options}) do
+    if scope.repo.in_transaction?(),
+      do: {:error, :outer_transaction},
+      else: Owner.run(fn -> do_execute(scope, inbox, proposal, gmail, options) end)
+  end
+
+  defp do_execute(scope, inbox, proposal, gmail, options) do
     with {:ok, version} <- Store.instruction_version(scope, inbox.id),
          true <- version == proposal.instruction_version,
          {:ok, current} <- safe(fn -> gmail.thread(inbox.id, proposal.thread_id, options) end),
@@ -30,8 +36,13 @@ defmodule EmailJanitor.Executor do
     # Any error after sending is ambiguous: retain the intent for history-based
     # reconciliation. Repeating execute cannot issue the mutation a second time.
     Owner.bounded(fn ->
-      with :ok <- Store.begin_dispatch(scope, inbox.id, action.id, action.owner_token) do
-        dispatch(scope, inbox, action, gmail, options)
+      case Store.begin_dispatch(scope, inbox.id, action.id, action.owner_token) do
+        :ok ->
+          dispatch(scope, inbox, action, gmail, options)
+
+        {:error, _} = error ->
+          Store.cancel_prepared(scope, inbox.id, action.id, action.owner_token)
+          error
       end
     end)
   end

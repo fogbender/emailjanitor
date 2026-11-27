@@ -8,6 +8,25 @@ defmodule EmailJanitor.Owner do
   @request_ms 30_000
   @runtime_key {__MODULE__, :runtime}
 
+  @doc "Run one execution in an isolated owner, never the caller's reusable process."
+  def run(fun) do
+    task =
+      Task.Supervisor.async_nolink(EmailJanitor.ExecutorSupervisor, fn ->
+        try do
+          fun.()
+        rescue
+          _ -> {:error, :executor_unavailable}
+        catch
+          _, _ -> {:error, :executor_unavailable}
+        end
+      end)
+
+    case Task.yield(task, 60_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      _ -> {:error, :executor_unavailable}
+    end
+  end
+
   def capture do
     runtime = runtime()
 
@@ -75,8 +94,8 @@ defmodule EmailJanitor.Owner do
     owner = self()
     ref = make_ref()
 
-    watchdog =
-      spawn(fn ->
+    {watchdog, watchdog_monitor} =
+      spawn_monitor(fn ->
         monitor = Process.monitor(owner)
 
         receive do
@@ -91,6 +110,14 @@ defmodule EmailJanitor.Owner do
       fun.()
     after
       send(watchdog, {:finished, ref})
+
+      receive do
+        {:DOWN, ^watchdog_monitor, :process, ^watchdog, _} -> :ok
+      after
+        1_000 ->
+          Process.exit(watchdog, :kill)
+          Process.demonitor(watchdog_monitor, [:flush])
+      end
     end
   end
 

@@ -22,6 +22,12 @@ defmodule EmailJanitor.Store do
 
   def intent(%Scope{} = scope, inbox_id, %Proposal{} = proposal, history_id)
       when is_binary(history_id) do
+    if scope.repo.in_transaction?(),
+      do: {:error, :outer_transaction},
+      else: do_intent(scope, inbox_id, proposal, history_id)
+  end
+
+  defp do_intent(scope, inbox_id, proposal, history_id) do
     true = Regex.match?(~r/\A[0-9]{1,32}\z/, history_id)
 
     record = %Action{
@@ -77,32 +83,70 @@ defmodule EmailJanitor.Store do
 
   @doc "Fence an owner immediately before dispatch. Expired or different processes cannot send."
   def begin_dispatch(%Scope{} = scope, inbox_id, id, token) do
-    action = get(scope, inbox_id, id)
+    if scope.repo.in_transaction?(),
+      do: {:error, :outer_transaction},
+      else: do_begin_dispatch(scope, inbox_id, id, token)
+  end
 
-    with %Action{} <- action, true <- Owner.owns?(action) do
-      now = clock(scope)
+  defp do_begin_dispatch(scope, inbox_id, id, token) do
+    case scope.repo.transaction(fn ->
+           action =
+             scope.repo.one(
+               from(a in Action,
+                 where: a.id == ^id and a.inbox_id == ^inbox_id,
+                 lock: "FOR UPDATE"
+               ),
+               prefix: scope.prefix
+             )
 
+           with %Action{} <- action, true <- Owner.owns?(action) do
+             {count, _} =
+               scope.repo.update_all(
+                 from(a in Action,
+                   where:
+                     a.id == ^id and a.inbox_id == ^inbox_id and a.state == :intent and
+                       a.owner_token == ^token and
+                       a.lease_expires_at > fragment("clock_timestamp()") and
+                       is_nil(a.dispatch_started_at),
+                   update: [
+                     set: [
+                       dispatch_started_at: fragment("clock_timestamp()"),
+                       lease_expires_at: fragment("clock_timestamp() + interval '120 seconds'"),
+                       updated_at: fragment("clock_timestamp()")
+                     ]
+                   ]
+                 ),
+                 [],
+                 prefix: scope.prefix
+               )
+
+             if count == 1, do: :ok, else: scope.repo.rollback(:ownership_lost)
+           else
+             _ -> scope.repo.rollback(:ownership_lost)
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Cancel only this owner's action before its dispatch fence ever succeeded."
+  def cancel_prepared(%Scope{} = scope, inbox_id, id, token) do
+    with %Action{} = action <- get(scope, inbox_id, id), true <- Owner.owns?(action) do
       {count, _} =
         scope.repo.update_all(
           from(a in Action,
             where:
-              a.id == ^id and a.inbox_id == ^inbox_id and a.state == :intent and
-                a.owner_token == ^token and a.lease_expires_at > ^now and
-                is_nil(a.dispatch_started_at)
+              a.id == ^id and a.inbox_id == ^inbox_id and a.owner_token == ^token and
+                a.state == :intent and is_nil(a.dispatch_started_at)
           ),
-          [
-            set: [
-              dispatch_started_at: now,
-              lease_expires_at: DateTime.add(now, 120),
-              updated_at: now
-            ]
-          ],
+          [set: [state: :cancelled, updated_at: clock(scope)]],
           prefix: scope.prefix
         )
 
-      if count == 1, do: :ok, else: {:error, :ownership_lost}
+      if count == 1, do: :ok, else: {:error, :state_changed}
     else
-      _ -> {:error, :ownership_lost}
+      _ -> {:error, :state_changed}
     end
   end
 
@@ -137,6 +181,8 @@ defmodule EmailJanitor.Store do
           end
 
         if proof != :dead, do: scope.repo.rollback(:owner_not_proven_dead)
+
+        now = clock(scope)
 
         next = if is_nil(action.dispatch_started_at), do: :cancelled, else: :unresolved
 
@@ -255,12 +301,14 @@ defmodule EmailJanitor.Store do
     |> MapSet.new()
   end
 
-  defp fresh_recovery_history(%Action{recovered_at: nil}, _), do: :ok
+  defp fresh_recovery_history(%Action{dispatch_started_at: nil}, _), do: :ok
 
-  defp fresh_recovery_history(%Action{recovered_at: recovered}, %{
+  defp fresh_recovery_history(%Action{} = action, %{
          started_at: %DateTime{} = started
        }) do
-    if DateTime.compare(started, recovered) != :lt,
+    anchor = action.recovered_at || action.updated_at
+
+    if DateTime.compare(started, anchor) != :lt,
       do: :ok,
       else: {:error, :fresh_history_required}
   end
@@ -270,7 +318,7 @@ defmodule EmailJanitor.Store do
   # A request already sent to Gmail can finish after its local owner dies.
   # Empty history is an observation, not proof of permanent non-application.
   # Only positive outcomes for every dispatched ID settle such an orphan.
-  defp recovery_outcome(%Action{recovered_at: nil}, _), do: :ok
+  defp recovery_outcome(%Action{dispatch_started_at: nil}, _), do: :ok
   defp recovery_outcome(_, %{retry_ids: []}), do: :ok
   defp recovery_outcome(_, _), do: {:error, :dispatch_outcome_unknown}
 
