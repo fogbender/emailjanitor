@@ -1,4 +1,10 @@
 mock_provider "aws" {
+  mock_resource "aws_sns_topic" {
+    defaults = { arn = "arn:aws:sns:us-east-1:123456789012:janitor-test-receipts" }
+  }
+  mock_resource "aws_sqs_queue" {
+    defaults = { arn = "arn:aws:sqs:us-east-1:123456789012:janitor-test-mail" }
+  }
   mock_resource "aws_ses_domain_dkim" {
     defaults = { dkim_tokens = ["token-one", "token-two", "token-three"] }
   }
@@ -24,6 +30,11 @@ mock_provider "google" {
       email = "janitor-test-gmail@janitor-test-project.iam.gserviceaccount.com"
       name  = "projects/janitor-test-project/serviceAccounts/janitor-test-gmail@janitor-test-project.iam.gserviceaccount.com"
     }
+  }
+}
+mock_provider "google-beta" {
+  mock_resource "google_project_service_identity" {
+    defaults = { email = "service-123456789012@gcp-sa-pubsub.iam.gserviceaccount.com" }
   }
 }
 
