@@ -145,6 +145,41 @@ defmodule EmailJanitor.SelfHostSkeletonTest do
     assert Repo.aggregate(from(b in Binding), :count, prefix: ctx.scope.prefix) == 0
   end
 
+  test "same verified address with a different Google subject gets a different immutable inbox",
+       ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, first} = SelfHost.connect(owner, result("work-one", "work@example.com"), "Etc/UTC")
+    {:ok, second} = SelfHost.connect(owner, result("work-two", "work@example.com"), "Etc/UTC")
+    refute first.id == second.id
+    assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).google_subject == "work-one"
+    assert Repo.get!(Binding, second.id, prefix: ctx.scope.prefix).google_subject == "work-two"
+    assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).state == :disconnected
+    assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).token_ciphertext == nil
+    {:ok, repeated} = SelfHost.connect(owner, result("work-one", "work@example.com"), "Etc/UTC")
+    assert repeated.id == first.id
+    assert Repo.get!(Binding, first.id, prefix: ctx.scope.prefix).google_subject == "work-one"
+  end
+
+  test "same-subject readdress preserves its inbox identity and fences prepared old-address work",
+       ctx do
+    {:ok, owner} = SelfHost.authorize_owner(result())
+    {:ok, first} = SelfHost.connect(owner, result("work-one", "work@example.com"), "Etc/UTC")
+    old = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+    {:ok, version} = EmailJanitor.Store.instruction_version(ctx.scope, first.id)
+
+    {:ok, renamed} =
+      SelfHost.connect(owner, result("work-one", "new-work@example.com"), "Etc/UTC")
+
+    assert renamed.id == first.id
+    assert renamed.address == "new-work@example.com"
+    assert {:ok, ^renamed} = SelfHost.inbox(owner, first.id)
+    fresh = Repo.get!(Binding, first.id, prefix: ctx.scope.prefix)
+    assert fresh.google_subject == old.google_subject
+    assert fresh.epoch == old.epoch + 1
+    assert {:ok, next} = EmailJanitor.Store.instruction_version(ctx.scope, first.id)
+    assert next == version + 1
+  end
+
   test "AEAD binds each ciphertext to its purpose and opaque row ID", ctx do
     content = Content.new("PRIVATE_OAUTH_ATTEMPT_SENTINEL")
     assert {:ok, first} = SelfHost.seal("browser-oauth", "id1", content)

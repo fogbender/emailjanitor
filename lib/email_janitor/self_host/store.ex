@@ -54,8 +54,17 @@ defmodule EmailJanitor.SelfHost.Store do
          {:ok, cipher} <- SelfHost.seal("gmail-token", box.id, result.token) do
       transaction(fn scope ->
         # Match the core's preference/inbox insertion ordering for a new inbox.
+        # Only connect changes multiple bindings. Worker/disconnect never acquire
+        # this host-only lock after taking a scoped mailbox lock.
+        scope.repo.query!(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          ["emailjanitor/selfhost/connect"],
+          log: false
+        )
+
         EmailJanitor.Preferences.Lock.acquire(scope, :shared)
         now = DateTime.utc_now()
+        retire_replaced_subjects(scope, result.subject, box.address)
 
         scope.repo.insert_all(
           Mailbox,
@@ -73,8 +82,9 @@ defmodule EmailJanitor.SelfHost.Store do
         )
 
         mailbox = lock_mailbox(scope, box.id)
-        if mailbox.address != box.address, do: scope.repo.rollback(:invalid_connection)
         binding = scope.repo.get(Binding, box.id, prefix: scope.prefix)
+        readdressed = mailbox.address != box.address
+        if readdressed and is_nil(binding), do: scope.repo.rollback(:invalid_connection)
 
         binding =
           binding ||
@@ -88,12 +98,20 @@ defmodule EmailJanitor.SelfHost.Store do
         if binding.google_subject != result.subject, do: scope.repo.rollback(:invalid_connection)
         resumed = binding.state in [:pending, :active]
 
+        if readdressed do
+          scope.repo.update_all(
+            from(m in Mailbox, where: m.id == ^box.id),
+            [inc: [instruction_version: 1], set: [address: box.address, updated_at: now]],
+            prefix: scope.prefix
+          )
+        end
+
         changes = %{
           timezone: timezone,
           token_ciphertext: cipher,
           token_version: binding.token_version + 1,
           state: if(resumed, do: binding.state, else: :pending),
-          epoch: if(resumed, do: binding.epoch, else: binding.epoch + 1)
+          epoch: if(resumed and not readdressed, do: binding.epoch, else: binding.epoch + 1)
         }
 
         scope.repo.insert_or_update!(Ecto.Changeset.change(binding, changes),
@@ -218,6 +236,42 @@ defmodule EmailJanitor.SelfHost.Store do
 
   defp inbox_id(subject),
     do: "google-" <> Base.encode16(:crypto.hash(:sha256, subject), case: :lower)
+
+  defp retire_replaced_subjects(scope, subject, address) do
+    bindings =
+      scope.repo.all(
+        from(b in Binding,
+          join: m in Mailbox,
+          on: m.id == b.id,
+          where:
+            m.address == ^address and b.google_subject != ^subject and
+              b.state in [:pending, :active],
+          order_by: b.id,
+          select: b
+        ),
+        prefix: scope.prefix
+      )
+
+    for binding <- bindings do
+      lock_mailbox(scope, binding.id)
+
+      scope.repo.update!(
+        Ecto.Changeset.change(binding,
+          state: :disconnected,
+          token_ciphertext: nil,
+          epoch: binding.epoch + 1,
+          token_version: binding.token_version + 1
+        ),
+        prefix: scope.prefix
+      )
+
+      scope.repo.update_all(
+        from(m in Mailbox, where: m.id == ^binding.id),
+        [inc: [instruction_version: 1], set: [updated_at: DateTime.utc_now()]],
+        prefix: scope.prefix
+      )
+    end
+  end
 
   @doc false
   def lock_mailbox(scope, id) do

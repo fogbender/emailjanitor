@@ -3,6 +3,11 @@ defmodule EmailJanitor.SelfHost.Migration do
   use Ecto.Migration
 
   def change do
+    # Recreated accounts can reuse an address but need a new subject-bound ID.
+    # Keep historical inbox rows instead of reassigning their identity.
+    drop(unique_index(:inboxes, [:address]))
+    create(index(:inboxes, [:address]))
+
     create table(:self_host_owner, primary_key: false) do
       add(:id, :integer, primary_key: true)
       add(:subject, :text, null: false)
