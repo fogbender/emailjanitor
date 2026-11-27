@@ -128,7 +128,10 @@ defmodule EmailJanitor.SetupTest do
        ctx do
     {:ok, _} = Setup.init(ctx.directory, "owner@example.com", "https://janitor.example.com")
     {:ok, env} = Setup.load_settings(Path.join(ctx.directory, "settings.json"))
-    env = Map.put(env, "JANITOR_DATABASE_SOCKET", Path.join(ctx.parent, "nonexistent-socket"))
+    missing_socket = "/tmp/ej-nodb-" <> Ecto.UUID.generate()
+    refute File.exists?(missing_socket)
+    assert byte_size(missing_socket <> "/.s.PGSQL.5432") < 100
+    env = Map.put(env, "JANITOR_DATABASE_SOCKET", missing_socket)
     started = System.monotonic_time(:millisecond)
 
     logs =

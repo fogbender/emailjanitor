@@ -98,6 +98,13 @@
             test "$(stat -c %a "$TMPDIR/private")" = 700
             test "$(stat -c %s "$TMPDIR/private/credential-key")" = 32
             jq -e '.JANITOR_ENABLE_SELF_HOST == "0"' "$TMPDIR/private/settings.json"
+            if emailjanitor-setup doctor --settings "$TMPDIR/private/settings.json" > doctor.json; then
+              exit 1
+            else
+              janitor_setup_doctor_status=$?
+            fi
+            test "$janitor_setup_doctor_status" -eq 2
+            jq -e '.checks.database == "unavailable" and .local_ready == false and .processing_ready == false' doctor.json
             if emailjanitor-setup init --directory "$TMPDIR/private" \
               --owner owner@example.com --public-url https://janitor.example.com; then
               exit 1
