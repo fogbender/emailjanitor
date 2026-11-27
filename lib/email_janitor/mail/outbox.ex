@@ -99,7 +99,14 @@ defmodule EmailJanitor.Mail.Outbox do
         do: value
   end
 
-  def deliver(%Scope{} = scope, id, %Config{} = config, authorize, render, admission \\ fn _ -> :ok end)
+  def deliver(
+        %Scope{} = scope,
+        id,
+        %Config{} = config,
+        authorize,
+        render,
+        admission \\ fn _ -> :ok end
+      )
       when is_function(authorize, 1) and is_function(render, 1) and is_function(admission, 1) do
     if scope.repo.in_transaction?() do
       {:error, :outer_transaction}
@@ -173,7 +180,13 @@ defmodule EmailJanitor.Mail.Outbox do
         do: scope.repo.rollback(:mail_unavailable)
 
       if authorize.(row.inbox_id) != {:ok, inbox}, do: scope.repo.rollback(:mail_unavailable)
-      current = scope.repo.one(from(o in Outgoing, where: o.id == ^row.id and o.state == :pending, lock: "FOR UPDATE"), prefix: scope.prefix)
+
+      current =
+        scope.repo.one(
+          from(o in Outgoing, where: o.id == ^row.id and o.state == :pending, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
       if is_nil(current), do: scope.repo.rollback(:already_dispatched)
       if admission.(current) != :ok, do: scope.repo.rollback(:mail_admission_rejected)
 

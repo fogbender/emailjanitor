@@ -8,6 +8,7 @@ defmodule EmailJanitor.Digest.Migration do
       add(:timezone, :text, null: false)
       add(:last_cutoff, :utc_datetime_usec, null: false)
       add(:delivery_date, :date)
+      add(:delivery_at, :utc_datetime_usec)
       add(:delivery_digest_id, :uuid)
       timestamps(type: :utc_datetime_usec)
     end

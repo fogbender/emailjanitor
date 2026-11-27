@@ -6,6 +6,7 @@ defmodule EmailJanitor.Digest.Schedule do
     field(:timezone, :string)
     field(:last_cutoff, :utc_datetime_usec)
     field(:delivery_date, :date)
+    field(:delivery_at, :utc_datetime_usec)
     field(:delivery_digest_id, Ecto.UUID)
     timestamps(type: :utc_datetime_usec)
   end

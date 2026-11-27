@@ -27,6 +27,14 @@ defmodule EmailJanitor.DigestClockTest do
     assert DateTime.diff(b, a) == 25 * 3600
   end
 
+  test "a repeated local date chooses its already-passed first 21:00 boundary" do
+    now = ~U[1969-10-01 00:00:00Z]
+    assert {:ok, local} = Clock.local(now, "Pacific/Kwajalein")
+    assert local.hour == 12
+    assert {:ok, ~D[1969-09-30], cutoff} = Clock.cutoff(now, "Pacific/Kwajalein")
+    assert DateTime.compare(cutoff, ~U[1969-09-30 10:00:00Z]) == :eq
+  end
+
   test "invalid timezone fails closed without changing process-wide configuration" do
     previous = Calendar.get_time_zone_database()
     assert {:error, _} = Clock.cutoff(~U[2026-11-20 21:00:00Z], "Not/A_Zone")
@@ -68,5 +76,30 @@ defmodule EmailJanitor.DigestClockTest do
                "subject",
                ~U[2026-11-20 20:00:00Z]
              )
+  end
+
+  test "cleanup-compatible multi-address From and long or absent subjects still produce metadata" do
+    id = Ecto.UUID.generate()
+    at = ~U[2026-11-20 20:00:00Z]
+
+    assert {:ok, event} =
+             Event.new(
+               id,
+               "aa",
+               :done,
+               "First <first@example.com>, Second <second@example.net>",
+               String.duplicate("€", 10_000),
+               at
+             )
+
+    assert event.sender == "first@example.com"
+    assert byte_size(event.subject) <= 256
+    assert String.valid?(event.subject)
+
+    assert {:ok, %{subject: "(no subject)"}} =
+             Event.new(id, "aa", :done, "first@example.com", nil, at)
+
+    assert {:ok, %{subject: "(unavailable subject)"}} =
+             Event.new(id, "aa", :done, "first@example.com", :duplicate, at)
   end
 end

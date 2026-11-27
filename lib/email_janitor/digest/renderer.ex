@@ -3,9 +3,12 @@ defmodule EmailJanitor.Digest.Renderer do
   alias EmailJanitor.Content
   alias EmailJanitor.Mail.Message
   @reserve 4096
+  @max_digest_bytes 32_768
 
-  def metadata_budget, do: Message.max_text_bytes() - @reserve
-  def entry_bytes(entry), do: byte_size(line(entry))
+  def max_digest_bytes, do: @max_digest_bytes
+  def metadata_budget, do: @max_digest_bytes - @reserve
+  # Counting metadata under SQL locks must not construct a rendered body.
+  def entry_bytes(entry), do: byte_size(entry.sender) + byte_size(entry.subject) + 3
 
   def message(snapshot, entries, footer \\ "")
       when is_binary(footer) and byte_size(footer) <= 2048 do

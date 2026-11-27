@@ -11,18 +11,24 @@ defmodule EmailJanitor.Digest.Clock do
     with {:ok, local} <- local(now, zone) do
       date = DateTime.to_date(local)
 
-      date =
-        if Time.compare(DateTime.to_time(local), ~T[21:00:00]) == :lt,
-          do: Date.add(date, -1),
-          else: date
-
-      with {:ok, boundary} <- boundary(date, zone),
-           {:ok, utc} <- DateTime.shift_zone(boundary, "Etc/UTC", @database) do
-        {:ok, date, %{utc | microsecond: {elem(utc.microsecond, 0), 6}}}
+      with {:ok, today} <- utc_boundary(date, zone) do
+        if DateTime.compare(today, now) == :gt do
+          prior = Date.add(date, -1)
+          with {:ok, utc} <- utc_boundary(prior, zone), do: {:ok, prior, utc}
+        else
+          {:ok, date, today}
+        end
       end
     end
   rescue
     _ -> {:error, :invalid_timezone}
+  end
+
+  defp utc_boundary(date, zone) do
+    with {:ok, boundary} <- boundary(date, zone),
+         {:ok, utc} <- DateTime.shift_zone(boundary, "Etc/UTC", @database) do
+      {:ok, %{utc | microsecond: {elem(utc.microsecond, 0), 6}}}
+    end
   end
 
   defp boundary(date, zone) do

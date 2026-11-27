@@ -14,6 +14,12 @@ reviewed timezone-data updates in application releases as political rules change
 The library passes its database explicitly and does not change the embedding
 application's global Calendar configuration. Reconfiguring a timezone preserves
 the existing UTC cutoff and frozen snapshots.
+Embedding applications must also set this before dependencies start (a library's
+`config/config.exs` is not loaded by its parent application):
+
+```elixir
+config :tzdata, :autoupdate, :disabled
+```
 
 `Event.new(action_or_candidate_uuid, gmail_message_id, :done | :would_have_done,
 sender_header, subject, occurred_at)` validates a stable typed source ID, exact
@@ -66,6 +72,11 @@ billing into the library. The first-message explanation is based on previous
 provider-confirmed sends; an ambiguous earlier send may cause the explanation
 to appear again, which is safer than omitting it from the first received digest.
 
+Digests have a conservative 32 KiB complete-text budget so ordinary multipart
+plain/HTML replies quoting the digest fit the separate 1 MiB inbound processing
+cap. A maintained-MIME regression exercises escaped HTML and quoted-printable
+reply bodies. Signatures and attachments can still exceed the inbound limit;
+those receive the explicit terminal size outcome rather than being retried.
 Snapshots budget actual rendered header bytes, with reserved space for labels,
 intro and footer. Metadata that cannot fit stays unlisted for a later digest;
 unseen hypothetical IDs are never marked listed to satisfy an email size limit.
@@ -83,6 +94,9 @@ preparation, the DB-only admission hook locks the schedule and reserves the fres
 local dispatch day in the same transaction as `pending → dispatching`. This
 prevents stale preparation-time dates from admitting a second digest after
 midnight. The provider call remains outside SQL. A logical dispatch reservation,
+stored as a UTC instant, is converted to the current timezone when comparing
+delivery days after travel or a browser-timezone update. The date from the
+previous timezone is not reused as a new-zone calendar key. A logical reservation,
 not the later physical SMTP delivery time, defines the day; network delivery
 cannot be made atomic with PostgreSQL. Generic outbox fencing and its no-auto-
 resend policy still apply after ambiguous acceptance.
@@ -104,6 +118,15 @@ is isolated to its inbox and only fixed status counts leave the worker. Add it
 to the embedding application's supervised release; NixOS then restarts that
 release on failure/reboot. The database ledger, not an in-memory timer, owns all
 cutoffs, listing decisions, daily slots and replay protection.
+
+Lock ordering is shared with host settlement/disconnect: acquire the scoped
+mailbox before schedule/activity and public host Group/inbox locks. Configure,
+record, retire and claim follow it; dispatch obtains the same mailbox before
+its outgoing/admission locks. No provider, model or complete email renderer runs
+while these locks are held. The selection budget counts field bytes without
+constructing a rendered body. Hosts must not acquire a new scoped mailbox while
+already holding public Group locks for a different inbox; queue multi-inbox work
+outside that transaction.
 
 Tests use pinned real timezone data, controlled clocks, synthetic maintained-SDK
 HTTP responses, separate PostgreSQL connections and a fresh local database. They

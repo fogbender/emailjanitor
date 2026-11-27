@@ -295,13 +295,8 @@ defmodule EmailJanitor.DigestTest do
 
   test "metadata overflow remains unlisted and host claims are chunked without a daily plan limit",
        ctx do
-    sender =
-      String.duplicate("a", 64) <>
-        "@" <>
-        String.duplicate("b", 63) <>
-        "." <> String.duplicate("c", 63) <> "." <> String.duplicate("d", 49) <> ".example.com"
-
-    subject = String.duplicate("S", 256)
+    sender = "s@a.co"
+    subject = "S"
 
     {:ok, prototype} =
       Event.new(
@@ -345,36 +340,34 @@ defmodule EmailJanitor.DigestTest do
 
     assert {:ok, {:ready, first}} = Digest.tick(ctx.scope, ctx.inbox.id, @due, claim)
 
-    selected =
-      TestRepo.aggregate(from(a in Activity, where: a.digest_id == ^first.id), :count,
+    count = fn snapshot ->
+      TestRepo.aggregate(from(a in Activity, where: a.digest_id == ^snapshot.id), :count,
         prefix: ctx.scope.prefix
       )
+    end
 
+    selected = count.(first)
     assert selected > 1000 and selected < 6200
     {:ok, message} = Digest.render(ctx.scope, first.id)
-    assert byte_size(Content.read(message.text)) <= EmailJanitor.Mail.Message.max_text_bytes()
+
+    assert byte_size(Content.read(message.text)) <=
+             EmailJanitor.Digest.Renderer.max_digest_bytes()
 
     assert Enum.count(String.split(Content.read(message.text), "\n"), &(&1 == subject)) ==
              selected
 
     assert_receive {:batch_size, 500}
-    # Large SDK wire is tested separately; this provider-ack fixture isolates
-    # next-day overflow selection from Req.Plug's fixed 1 MB form parser.
-    TestRepo.update_all(
-      from(o in Outgoing, where: o.id == ^first.outbox_id),
-      [set: [state: :sent, provider_id: "size-proof"]],
-      prefix: ctx.scope.prefix
-    )
+    assert :ok = send_digest(ctx, first)
 
     assert {:ok, {:ready, second}} =
              Digest.tick(ctx.scope, ctx.inbox.id, ~U[2026-11-21 21:00:00Z], claim)
 
-    remaining =
-      TestRepo.aggregate(from(a in Activity, where: a.digest_id == ^second.id), :count,
-        prefix: ctx.scope.prefix
-      )
+    assert :ok = send_digest(ctx, second, ~U[2026-11-21 21:00:00Z])
 
-    assert selected + remaining == 6200
+    assert {:ok, {:ready, third}} =
+             Digest.tick(ctx.scope, ctx.inbox.id, ~U[2026-11-22 21:00:00Z], claim)
+
+    assert selected + count.(second) + count.(third) == 6200
 
     assert TestRepo.aggregate(from(a in Activity, where: is_nil(a.digest_id)), :count,
              prefix: ctx.scope.prefix
@@ -444,5 +437,79 @@ defmodule EmailJanitor.DigestTest do
 
     assert TestRepo.get!(Schedule, box.id, prefix: ctx.scope.prefix).delivery_date ==
              ~D[2026-03-08]
+  end
+
+  test "westward timezone change compares the previous UTC dispatch in the new zone", ctx do
+    {:ok, box} = EmailJanitor.Inbox.new("travel", "travel@example.com")
+    {:ok, _} = Store.add_inbox(ctx.scope, box)
+    :ok = Digest.configure(ctx.scope, box.id, "Asia/Tokyo", ~U[2026-11-20 01:00:00Z])
+    event(ctx.scope, box, 90, :done, ~U[2026-11-20 11:00:00Z])
+    {:ok, {:ready, old}} = Digest.tick(ctx.scope, box.id, ~U[2026-11-20 12:00:00Z])
+    assert :ok = send_digest(%{ctx | inbox: box}, old, ~U[2026-11-20 15:30:00Z])
+
+    assert TestRepo.get!(Schedule, box.id, prefix: ctx.scope.prefix).delivery_date ==
+             ~D[2026-11-21]
+
+    :ok = Digest.configure(ctx.scope, box.id, "America/Los_Angeles", ~U[2026-11-20 16:00:00Z])
+    event(ctx.scope, box, 91, :done, ~U[2026-11-20 20:00:00Z])
+    assert {:ok, :daily_slot_used} = Digest.tick(ctx.scope, box.id, ~U[2026-11-21 05:00:00Z])
+    assert {:ok, {:ready, next}} = Digest.tick(ctx.scope, box.id, ~U[2026-11-22 05:00:00Z])
+    assert :ok = send_digest(%{ctx | inbox: box}, next, ~U[2026-11-22 05:00:00Z])
+
+    assert TestRepo.get!(Schedule, box.id, prefix: ctx.scope.prefix).delivery_date ==
+             ~D[2026-11-21]
+  end
+
+  test "ordinary escaped multipart replies quoting a full digest fit the inbound MIME cap", ctx do
+    alias EmailJanitor.Digest.Renderer
+
+    sender =
+      String.duplicate("&", 64) <>
+        "@" <>
+        String.duplicate("b", 63) <>
+        "." <> String.duplicate("c", 63) <> "." <> String.duplicate("d", 49) <> ".example.com"
+
+    subject = String.duplicate("&<>=", 64)
+    entry = %{kind: :done, sender: sender, subject: subject}
+    entries = List.duplicate(entry, div(Renderer.metadata_budget(), Renderer.entry_bytes(entry)))
+    {:ok, message} = Renderer.message(%{first: true}, entries, String.duplicate("&", 2048))
+    body = Content.read(message.text)
+    assert byte_size(body) > 28_000 and byte_size(body) <= Renderer.max_digest_bytes()
+    reply = "Please keep Bob's email.\n\n" <> body
+
+    html =
+      Floki.raw_html([
+        {"p", [], ["Please keep Bob's email."]},
+        {"blockquote", [], [{"pre", [], [body]}]}
+      ])
+
+    mime =
+      Mail.build_multipart()
+      |> Mail.put_from(ctx.inbox.address)
+      |> Mail.put_to("janitor@janitor.example.com")
+      |> Mail.put_subject("Re: Email Janitor activity")
+      |> Mail.put_text(reply)
+      |> Mail.put_html(html)
+      |> Mail.render()
+
+    assert byte_size(mime) < 1_048_576
+
+    config = %{
+      F.config(fn _ -> flunk("unexpected transport") end)
+      | test_plug: fn conn ->
+          case conn.method do
+            "HEAD" ->
+              conn
+              |> Plug.Conn.put_resp_header("content-length", Integer.to_string(byte_size(mime)))
+              |> Plug.Conn.send_resp(200, "")
+
+            "GET" ->
+              Plug.Conn.send_resp(conn, 200, mime)
+          end
+        end
+    }
+
+    assert {:ok, content} = EmailJanitor.Mail.SDK.fetch(config, "incoming/quoted-reply")
+    assert byte_size(Content.read(content)) == byte_size(mime)
   end
 end

@@ -15,13 +15,19 @@ defmodule EmailJanitor.Digest do
 
   def configure(%Scope{} = scope, inbox_id, timezone, %DateTime{} = now) do
     with {:ok, _, cutoff} <- Clock.cutoff(now, timezone),
-         %Mailbox{} <- scope.repo.get(Mailbox, inbox_id, prefix: scope.prefix) do
-      scope.repo.insert!(%Schedule{inbox_id: inbox_id, timezone: timezone, last_cutoff: cutoff},
-        prefix: scope.prefix,
-        on_conflict: [set: [timezone: timezone]],
-        conflict_target: [:inbox_id]
-      )
+         {:ok, :ok} <-
+           transaction(scope, fn ->
+             lock_mailbox!(scope, inbox_id)
 
+             scope.repo.insert!(
+               %Schedule{inbox_id: inbox_id, timezone: timezone, last_cutoff: cutoff},
+               prefix: scope.prefix,
+               on_conflict: [set: [timezone: timezone]],
+               conflict_target: [:inbox_id]
+             )
+
+             :ok
+           end) do
       :ok
     else
       _ -> {:error, :invalid_digest_schedule}
@@ -32,6 +38,8 @@ defmodule EmailJanitor.Digest do
 
   def record(%Scope{} = scope, inbox_id, %Event{} = event) do
     transaction(scope, fn ->
+      lock_mailbox!(scope, inbox_id)
+
       if is_nil(scope.repo.get(Schedule, inbox_id, prefix: scope.prefix)),
         do: scope.repo.rollback(:unknown_digest_schedule)
 
@@ -62,17 +70,24 @@ defmodule EmailJanitor.Digest do
 
   @doc "Trusted host may retire an unlisted hypothetical after restore or another final decision."
   def retire_hypotheticals(%Scope{} = scope, inbox_id, ids) when is_list(ids) do
-    scope.repo.update_all(
-      from(a in Activity,
-        where:
-          a.inbox_id == ^inbox_id and a.message_id in ^ids and
-            a.kind == :would_have_done and is_nil(a.digest_id)
-      ),
-      [set: [retired: true]],
-      prefix: scope.prefix
-    )
+    case transaction(scope, fn ->
+           lock_mailbox!(scope, inbox_id)
 
-    :ok
+           scope.repo.update_all(
+             from(a in Activity,
+               where:
+                 a.inbox_id == ^inbox_id and a.message_id in ^ids and
+                   a.kind == :would_have_done and is_nil(a.digest_id)
+             ),
+             [set: [retired: true]],
+             prefix: scope.prefix
+           )
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      error -> error
+    end
   end
 
   def get(%Scope{} = scope, id), do: scope.repo.get(Snapshot, id, prefix: scope.prefix)
@@ -89,7 +104,7 @@ defmodule EmailJanitor.Digest do
         DateTime.compare(cutoff, schedule.last_cutoff) != :gt ->
           :not_due
 
-        schedule.delivery_date == DateTime.to_date(local) ->
+        delivery_day(schedule) == DateTime.to_date(local) ->
           advance(scope, schedule, cutoff)
           :daily_slot_used
 
@@ -236,9 +251,18 @@ defmodule EmailJanitor.Digest do
   defp no_extras(_, _, _, _), do: {:error, :hypothetical_policy_required}
 
   defp locked_schedule!(scope, inbox_id) do
+    lock_mailbox!(scope, inbox_id)
+
     scope.repo.one(from(s in Schedule, where: s.inbox_id == ^inbox_id, lock: "FOR UPDATE"),
       prefix: scope.prefix
     ) || scope.repo.rollback(:unknown_digest_schedule)
+  end
+
+  defp lock_mailbox!(scope, inbox_id) do
+    scope.repo.one(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+      prefix: scope.prefix
+    ) ||
+      scope.repo.rollback(:unknown_digest_schedule)
   end
 
   defp advance(scope, schedule, cutoff),
@@ -291,20 +315,35 @@ defmodule EmailJanitor.Digest do
     {:ok, local} = Clock.local(now, schedule.timezone)
     date = DateTime.to_date(local)
 
+    prior = delivery_day(schedule)
+
     if DateTime.compare(now, snapshot.cutoff) == :lt or
-         (schedule.delivery_date &&
-            (Date.compare(date, schedule.delivery_date) == :lt or
-               (schedule.delivery_date == date and schedule.delivery_digest_id != snapshot.id))) do
+         (prior &&
+            (Date.compare(date, prior) == :lt or
+               (prior == date and schedule.delivery_digest_id != snapshot.id))) do
       {:error, :daily_slot_used}
     else
       scope.repo.update_all(
         from(s in Schedule, where: s.inbox_id == ^snapshot.inbox_id),
-        [set: [delivery_date: date, delivery_digest_id: snapshot.id]],
+        [
+          set: [
+            delivery_date: date,
+            delivery_at: %{now | microsecond: {elem(now.microsecond, 0), 6}},
+            delivery_digest_id: snapshot.id
+          ]
+        ],
         prefix: scope.prefix
       )
 
       :ok
     end
+  end
+
+  defp delivery_day(%Schedule{delivery_at: nil}), do: nil
+
+  defp delivery_day(schedule) do
+    {:ok, local} = Clock.local(schedule.delivery_at, schedule.timezone)
+    DateTime.to_date(local)
   end
 
   defp transaction(scope, fun) do
