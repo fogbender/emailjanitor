@@ -118,6 +118,89 @@ defmodule EmailJanitor.Models.SDK do
     _, _ -> {:invalid, :decision}
   end
 
+  @doc """
+  Generate a bounded structured object with the same private SDK transport used
+  by classification. The schema and system prompt are trusted application code.
+  Returned JSON remains transient Content; callers validate their typed contract
+  before applying any effect. There are no model-executable provider tools.
+  """
+  def object(%Content{} = system, %Content{} = user, schema, opts) when is_map(schema),
+    do: request_object(system, user, schema, opts, true)
+
+  defp request_object(system, user, schema, opts, append_schema) do
+    suffix = if append_schema, do: "\nOUTPUT_SCHEMA_JSON:\n" <> Jason.encode!(schema), else: ""
+    system_text = Content.read(system) <> suffix
+    user_text = Content.read(user)
+
+    encoded =
+      Jason.encode!([
+        %{role: "system", content: system_text},
+        %{role: "user", content: user_text}
+      ])
+
+    if byte_size(encoded) <= 96_000 and String.valid?(system_text) and String.valid?(user_text) do
+      do_object(system_text, user_text, schema, opts)
+    else
+      {:error, :invalid_model_content}
+    end
+  rescue
+    _ -> {:error, :model_unavailable}
+  catch
+    _, _ -> {:error, :model_unavailable}
+  end
+
+  defp do_object(system_text, user_text, schema, opts) do
+    %Config{} = config = Keyword.fetch!(opts, :config)
+    false = ReqLLM.Debug.enabled?()
+    [] = :telemetry.list_handlers([:finch])
+    context = [ReqLLM.Context.system(system_text), ReqLLM.Context.user(user_text)]
+
+    options =
+      [
+        max_tokens: 4096,
+        max_retries: 0,
+        receive_timeout: 30_000,
+        total_timeout: 35_000,
+        telemetry: [payloads: :none],
+        req_http_options: Keyword.get(opts, :http_options, [])
+      ]
+      |> optional(:base_url, config.base_url)
+      |> optional(:deployment, config.deployment)
+
+    {:ok, credentials} = credentials(config, opts)
+    options = Keyword.merge(options, credentials)
+    provider = if config.provider == :bedrock, do: :amazon_bedrock, else: :azure
+    model = %{provider: provider, id: config.model}
+
+    with {:ok, response} <- generate(config.provider, model, context, options, schema),
+         {:ok, value} <- response_object(response, config.provider),
+         {:ok, validated} <- ReqLLM.Schema.validate(value, schema),
+         encoded = Jason.encode!(validated),
+         true <- byte_size(encoded) <= 32_000 do
+      {:ok, Content.new(encoded)}
+    else
+      _ -> {:error, :model_unavailable}
+    end
+  rescue
+    _ -> {:error, :model_unavailable}
+  catch
+    _, _ -> {:error, :model_unavailable}
+  end
+
+  defp response_object(response, :bedrock) do
+    case ReqLLM.Response.text(response) do
+      text when is_binary(text) and byte_size(text) <= 32_000 -> Jason.decode(text)
+      _ -> {:error, :invalid_object}
+    end
+  end
+
+  defp response_object(response, :azure) do
+    case ReqLLM.Response.object(response) do
+      value when is_map(value) -> {:ok, value}
+      _ -> {:error, :invalid_object}
+    end
+  end
+
   # ReqLLM 1.31 emits raw request-bearing exceptions even with payloads:none.
   # Use its provider preparation/decoding pipeline unchanged, but strip lifecycle
   # telemetry before any request can run. No global handlers are detached and no
@@ -152,8 +235,10 @@ defmodule EmailJanitor.Models.SDK do
           {ReqLLM.Providers.AmazonBedrock, :chat, Keyword.delete(options, :output_validation)}
 
         :azure ->
-          {:ok, schema} = ReqLLM.Schema.compile(schema)
-          {ReqLLM.Providers.Azure, :object, Keyword.put(options, :compiled_schema, schema)}
+          {:ok, compiled_schema} = ReqLLM.Schema.compile(schema)
+
+          {ReqLLM.Providers.Azure, :object,
+           Keyword.put(options, :compiled_schema, compiled_schema)}
       end
 
     with {:ok, options} <-
@@ -213,6 +298,15 @@ defmodule EmailJanitor.Models.SDK do
   defp quiet_request(request) do
     Logger.put_process_level(self(), :none)
     request
+  end
+
+  @doc "The bounded readable text shared by classification and conversational evidence."
+  def readable_body(%Message{} = message, bytes) when bytes in 1..16_000 do
+    {:ok, Content.new(bounded(text(message), bytes))}
+  rescue
+    _ -> {:error, :unreadable_content}
+  catch
+    _, _ -> {:error, :unreadable_content}
   end
 
   defp payload(message) do
