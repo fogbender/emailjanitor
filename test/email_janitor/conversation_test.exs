@@ -15,7 +15,11 @@ defmodule EmailJanitor.ConversationFixtureGmail do
     end)
   end
 
-  defdelegate thread(inbox, thread, opts), to: EmailJanitor.TestGmail
+  def thread(inbox, thread, opts) do
+    if opts[:thread_failure] && opts[:thread_failure].(),
+      do: {:error, :gmail_unavailable},
+      else: EmailJanitor.TestGmail.thread(inbox, thread, opts)
+  end
 
   def contacted(inbox, keys, opts) do
     result = EmailJanitor.TestGmail.contacted(inbox, keys, opts)
@@ -24,7 +28,12 @@ defmodule EmailJanitor.ConversationFixtureGmail do
   end
 
   defdelegate history_id(inbox, opts), to: EmailJanitor.TestGmail
-  defdelegate remove_inbox(inbox, ids, opts), to: EmailJanitor.TestGmail
+
+  def remove_inbox(inbox, ids, opts) do
+    result = EmailJanitor.TestGmail.remove_inbox(inbox, ids, opts)
+    if opts[:kill_after_apply], do: Process.exit(self(), :kill)
+    result
+  end
 end
 
 defmodule EmailJanitor.ConversationFixtureBlockedPolicy do
@@ -436,6 +445,7 @@ defmodule EmailJanitor.ConversationTest do
 
     assert_confirmed_action(ctx, 200)
     assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    Agent.update(t.state, &%{&1 | messages: []})
 
     ctx = %{
       ctx
@@ -518,6 +528,149 @@ defmodule EmailJanitor.ConversationTest do
       _ ->
         Process.sleep(5)
         assert_confirmed_action(ctx, attempts - 1)
+    end
+  end
+
+  test "a dispatched intent with a dead owner remains uncertain even without a readable Gmail copy",
+       t do
+    {:ok, control} = Agent.start_link(fn -> %{} end)
+    ctx = context(t.ctx, target: :none)
+    {gmail, opts} = ctx.gmail
+
+    ctx = %{
+      ctx
+      | execution_options: [
+          on_plan_admitted: fn _, _, _ ->
+            owner = self()
+            Agent.update(control, &Map.put(&1, :owner, owner))
+            :ok
+          end
+        ],
+        gmail:
+          {gmail,
+           opts ++
+             [
+               kill_after_apply: true,
+               before: fn ->
+                 Process.exit(Agent.get(control, & &1.owner), :kill)
+               end
+             ]}
+    }
+
+    request_id = Ecto.UUID.generate()
+
+    assert {:error, :conversation_unavailable} =
+             Conversation.respond(ctx, request_id, Content.new("Done."))
+
+    assert_dispatched_intent(ctx, t.state, 200)
+    Agent.update(t.state, &%{&1 | messages: []})
+
+    ctx = %{
+      ctx
+      | execution_options: [],
+        gmail: {gmail, opts},
+        model: [script: fn _, _, _ -> raise "no replanning" end]
+    }
+
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "uncertain"
+    refute Content.read(reply) =~ "needed no inbox change"
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+    Agent.stop(control)
+  end
+
+  test "another conversation's completed action is never claimed by a pending request", t do
+    ctx = context(t.ctx, target: :none)
+    request_id = reserve_pending(ctx)
+    other = %{ctx | conversation_id: Ecto.UUID.generate()}
+    assert {:ok, _} = Conversation.respond(other, Ecto.UUID.generate(), Content.new("Done."))
+    ctx = %{ctx | model: [script: fn _, _, _ -> raise "no replanning" end]}
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "needed no inbox change"
+    refute Content.read(reply) =~ "I marked"
+    receipt = Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id)
+    assert hd(receipt.results)["effect_id"] == nil
+    assert Agent.get(t.state, & &1.calls) == [["message-1"]]
+  end
+
+  test "temporary lookup failure leaves a pending request retryable", t do
+    ctx = context(t.ctx, target: :none)
+    request_id = reserve_pending(ctx)
+    {gmail, opts} = ctx.gmail
+    failing = %{ctx | gmail: {gmail, Keyword.put(opts, :thread_failure, fn -> true end)}}
+
+    assert {:error, :conversation_unavailable} =
+             Conversation.respond(failing, request_id, Content.new("Retry."))
+
+    refute Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id).completed
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "marked 1 email Done"
+  end
+
+  test "a definitively missing unapplied reference completes without blocking other requests",
+       t do
+    ctx = context(t.ctx, target: :none)
+    request_id = reserve_pending(ctx)
+    Agent.update(t.state, &%{&1 | messages: []})
+    assert {:ok, reply} = Conversation.respond(ctx, request_id, Content.new("Retry."))
+    assert Content.read(reply) =~ "could not finish processing"
+    assert Ledger.get(ctx.scope, ctx.inbox.id, ctx.conversation_id, request_id).completed
+    assert Agent.get(t.state, & &1.calls) == []
+  end
+
+  defp reserve_pending(ctx) do
+    request_id = Ecto.UUID.generate()
+
+    {:ok, ref} =
+      EmailJanitor.Conversation.Reference.new(ctx.inbox.id, "message-1", "thread-1", "", "")
+
+    task =
+      Task.async(fn ->
+        plan = %Plan{
+          operation: :done,
+          references: [ref.token],
+          preference_target: :none,
+          instruction: Content.new(""),
+          query: Content.new(""),
+          reply: Content.new(""),
+          search_complete: true
+        }
+
+        assert {:ok, _} =
+                 Ledger.reserve(
+                   ctx.scope,
+                   ctx.inbox.id,
+                   ctx.conversation_id,
+                   request_id,
+                   plan,
+                   [ref],
+                   fn -> :ok end
+                 )
+      end)
+
+    Task.await(task)
+    request_id
+  end
+
+  defp assert_dispatched_intent(_ctx, _state, 0), do: flunk("nested dispatch did not finish")
+
+  defp assert_dispatched_intent(ctx, state, attempts) do
+    case {TestRepo.all(Action, prefix: ctx.scope.prefix), Agent.get(state, & &1.calls)} do
+      {[%{state: :intent, dispatch_started_at: at, owner_beam_pid: owner}], [["message-1"]]}
+      when not is_nil(at) ->
+        pid = :erlang.binary_to_term(owner, [:safe])
+
+        if Process.alive?(pid),
+          do:
+            (
+              Process.sleep(5)
+              assert_dispatched_intent(ctx, state, attempts - 1)
+            ),
+          else: :ok
+
+      _ ->
+        Process.sleep(5)
+        assert_dispatched_intent(ctx, state, attempts - 1)
     end
   end
 end

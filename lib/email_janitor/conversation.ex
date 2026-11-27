@@ -137,44 +137,71 @@ defmodule EmailJanitor.Conversation do
   defp resume(ctx, receipt, _snapshot) do
     unfinished = unprocessed(receipt, receipt_refs(ctx, receipt))
 
-    {fresh, missing} =
-      Enum.reduce(unfinished, {[], []}, fn ref, {fresh, missing} ->
-        case Lookup.load(ctx, [%{message_id: ref.message_id, thread_id: ref.thread_id}]) do
-          {:ok, [loaded], _} -> {fresh ++ [%{loaded | action_id: ref.action_id}], missing}
-          _ -> {fresh, missing ++ [ref]}
+    loaded =
+      Enum.reduce_while(unfinished, {:ok, [], [], []}, fn ref, {:ok, fresh, missing, known} ->
+        case Ledger.action_result(ctx.scope, ctx.inbox.id, receipt.id, ref.message_id) do
+          {status, action_id} ->
+            {:cont, {:ok, fresh, missing, known ++ [{ref, status, action_id}]}}
+
+          :none ->
+            case Lookup.load(ctx, [%{message_id: ref.message_id, thread_id: ref.thread_id}]) do
+              {:ok, [value], _} ->
+                {:cont, {:ok, fresh ++ [%{value | action_id: ref.action_id}], missing, known}}
+
+              {:error, :reference_not_found} ->
+                {:cont, {:ok, fresh, missing ++ [ref], known}}
+
+              _ ->
+                {:halt, {:error, :conversation_unavailable}}
+            end
         end
       end)
 
-    refs =
-      Enum.map(receipt_refs(ctx, receipt), fn ref ->
-        Enum.find(fresh, &(&1.token == ref.token)) || ref
-      end)
+    with {:ok, fresh, missing, known} <- loaded do
+      refs =
+        Enum.map(receipt_refs(ctx, receipt), fn ref ->
+          Enum.find(fresh, &(&1.token == ref.token)) || ref
+        end)
 
-    proposal = %Plan{
-      operation: receipt.operation,
-      references: Enum.map(refs, & &1.token),
-      preference_target: receipt.preference_target,
-      instruction: Content.new(""),
-      replace_instructions: [],
-      query: Content.new(""),
-      reply: Content.new(""),
-      search_complete: receipt.search_complete
-    }
+      proposal = %Plan{
+        operation: receipt.operation,
+        references: Enum.map(refs, & &1.token),
+        preference_target: receipt.preference_target,
+        instruction: Content.new(""),
+        replace_instructions: [],
+        query: Content.new(""),
+        reply: Content.new(""),
+        search_complete: receipt.search_complete
+      }
 
-    with {:ok, claimed} <-
-           Ledger.reserve(
-             ctx.scope,
-             ctx.inbox.id,
-             ctx.conversation_id,
-             receipt.id,
-             proposal,
-             refs,
-             ctx.guard
-           ),
-         :ok <- record_results(ctx, claimed, missing, "unavailable", nil) do
-      available = Enum.reject(refs, fn ref -> Enum.any?(missing, &(&1.token == ref.token)) end)
-      finish_effects(ctx, claimed, available, proposal)
+      with {:ok, claimed} <-
+             Ledger.reserve(
+               ctx.scope,
+               ctx.inbox.id,
+               ctx.conversation_id,
+               receipt.id,
+               proposal,
+               refs,
+               ctx.guard
+             ),
+           :ok <- record_results(ctx, claimed, missing, "unavailable", nil),
+           :ok <- record_known(ctx, claimed, known) do
+        excluded =
+          Enum.map(missing, & &1.token) ++ Enum.map(known, fn {ref, _, _} -> ref.token end)
+
+        available = Enum.reject(refs, &(&1.token in excluded))
+        finish_effects(ctx, claimed, available, proposal)
+      end
     end
+  end
+
+  defp record_known(ctx, receipt, known) do
+    Enum.reduce_while(known, :ok, fn {ref, status, action_id}, :ok ->
+      case record_results(ctx, receipt, [ref], Atom.to_string(status), action_id) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   defp receipt_refs(ctx, receipt) do
@@ -253,7 +280,7 @@ defmodule EmailJanitor.Conversation do
         ids = Enum.map(remaining, & &1.message_id)
 
         result =
-          with {:ok, opts} <- cleanup_options(ctx, remaining, ids),
+          with {:ok, opts} <- cleanup_options(ctx, receipt, remaining, ids),
                :ok <- ctx.guard.(),
                {:ok, proposal} <-
                  Executor.review(
@@ -369,41 +396,37 @@ defmodule EmailJanitor.Conversation do
 
   defp record_cleanup(ctx, receipt, refs, result) do
     {status, effect_id} = cleanup_result(ctx, result)
+    action = if effect_id, do: Store.get(ctx.scope, ctx.inbox.id, effect_id), else: nil
 
-    if status == "unchanged" and receipt.operation == :done do
-      Enum.reduce_while(refs, :ok, fn ref, :ok ->
-        case Lookup.confirmed_since(ctx, ref.message_id, receipt.inserted_at) do
-          nil -> record_results(ctx, receipt, [ref], "unchanged", nil)
-          action_id -> record_results(ctx, receipt, [ref], "done", action_id)
+    Enum.reduce_while(refs, :ok, fn ref, :ok ->
+      actual =
+        case Ledger.action_result(ctx.scope, ctx.inbox.id, receipt.id, ref.message_id) do
+          {known, id} ->
+            {Atom.to_string(known), id}
+
+          :none ->
+            cond do
+              (status == "done" and action) && ref.message_id in action.applied_message_ids ->
+                {"unchanged", nil}
+
+              status == "done" ->
+                {"unavailable", nil}
+
+              (status == "unresolved" and action) && ref.message_id not in action.message_ids ->
+                {"unavailable", nil}
+
+              true ->
+                {status, effect_id}
+            end
         end
-        |> case do
-          :ok -> {:cont, :ok}
-          error -> {:halt, error}
-        end
-      end)
-    else
-      record_cleanup_status(ctx, receipt, refs, status, effect_id)
-    end
-  end
 
-  defp record_cleanup_status(ctx, receipt, refs, status, effect_id) do
-    if status == "done" do
-      action = Store.get(ctx.scope, ctx.inbox.id, effect_id)
+      {actual_status, actual_id} = actual
 
-      Enum.reduce_while(refs, :ok, fn ref, :ok ->
-        actual =
-          if action && ref.message_id in action.applied_message_ids,
-            do: "done",
-            else: "unavailable"
-
-        case record_results(ctx, receipt, [ref], actual, effect_id) do
-          :ok -> {:cont, :ok}
-          error -> {:halt, error}
-        end
-      end)
-    else
-      record_results(ctx, receipt, refs, status, effect_id)
-    end
+      case record_results(ctx, receipt, [ref], actual_status, actual_id) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   defp restore_result({:done, id}), do: {"restored", id}
@@ -446,7 +469,7 @@ defmodule EmailJanitor.Conversation do
     end
   end
 
-  defp cleanup_options(ctx, refs, ids) do
+  defp cleanup_options(ctx, receipt, refs, ids) do
     policy =
       case Keyword.get(ctx.execution_options, :policy_for_references) do
         nil -> ctx.policy
@@ -457,7 +480,10 @@ defmodule EmailJanitor.Conversation do
       %EmailJanitor.Policy{} ->
         {:ok,
          execution_options(ctx)
-         |> Keyword.put(:policy, policy)
+         |> Keyword.put(
+           :policy,
+           EmailJanitor.Conversation.ExecutionPolicy.new(policy, ctx.scope, ctx.inbox.id, receipt)
+         )
          |> Keyword.put(:cleanup_target_ids, ids)}
 
       _ ->

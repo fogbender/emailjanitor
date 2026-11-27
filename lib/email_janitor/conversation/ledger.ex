@@ -137,6 +137,84 @@ defmodule EmailJanitor.Conversation.Ledger do
     end
   end
 
+  defmodule ActionBinding do
+    use Ecto.Schema
+    @primary_key {:action_id, Ecto.UUID, autogenerate: false}
+    schema "conversation_action_bindings" do
+      field(:request_id, Ecto.UUID)
+      field(:inbox_id, :string)
+      field(:message_ids, {:array, :string})
+    end
+  end
+
+  @doc "Called only by the trusted admission policy inside Store.intent's mailbox transaction."
+  def bind_action(scope, inbox_id, request_id, owner_token, action_id, ids) do
+    if not scope.repo.in_transaction?(),
+      do: raise(ArgumentError, "binding requires admission transaction")
+
+    receipt =
+      scope.repo.get(Receipt, request_id, prefix: scope.prefix, log: false, telemetry_event: nil)
+
+    with %Receipt{
+           inbox_id: ^inbox_id,
+           operation: :done,
+           completed: false,
+           owner_token: ^owner_token
+         } <- receipt,
+         true <- is_list(ids) and length(ids) in 1..5,
+         true <-
+           Enum.all?(ids, fn id -> Enum.any?(receipt.references, &(&1["message_id"] == id)) end) do
+      scope.repo.insert!(
+        %ActionBinding{
+          action_id: action_id,
+          request_id: request_id,
+          inbox_id: inbox_id,
+          message_ids: Enum.sort(ids)
+        },
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
+
+      :ok
+    else
+      _ -> {:error, :conversation_changed}
+    end
+  end
+
+  @doc "Actual request-bound Gmail outcome, independent of provider reads or the receipt owner's liveness."
+  def action_result(scope, inbox_id, request_id, message_id) do
+    action =
+      scope.repo.one(
+        from(b in ActionBinding,
+          join: a in EmailJanitor.Store.Action,
+          on: a.id == b.action_id,
+          where:
+            b.request_id == ^request_id and b.inbox_id == ^inbox_id and
+              a.inbox_id == ^inbox_id and ^message_id in b.message_ids and
+              (a.state in [:intent, :unresolved] or
+                 (a.state == :done and ^message_id in a.applied_message_ids)),
+          order_by: [desc: a.inserted_at],
+          limit: 1,
+          select: a
+        ),
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
+
+    case action do
+      %{state: :done, applied_message_ids: ids, id: id} ->
+        if message_id in ids, do: {:done, id}, else: :none
+
+      %{state: state, id: id} when state in [:intent, :unresolved] ->
+        {:unresolved, id}
+
+      _ ->
+        :none
+    end
+  end
+
   def record_preference(scope, inbox_id, conversation_id, request_id, status, revision)
       when status in [:none, :updated, :unchanged, :failed] and
              (is_nil(revision) or is_integer(revision)) do

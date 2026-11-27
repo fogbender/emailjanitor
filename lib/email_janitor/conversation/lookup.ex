@@ -40,8 +40,15 @@ defmodule EmailJanitor.Conversation.Lookup do
           selected = if length(selected) < 5, do: selected ++ [message], else: selected
           {:cont, {:ok, refs ++ [ref], selected, threads}}
         else
-          # A deleted reference is unavailable; never substitute a similar email.
-          _ -> {:halt, {:error, :lookup_unavailable}}
+          # Only a successful thread read with no exact message is definitive.
+          nil ->
+            {:halt, {:error, :reference_not_found}}
+
+          {:error, reason} when reason in [:not_found, :thread_not_found] ->
+            {:halt, {:error, :reference_not_found}}
+
+          _ ->
+            {:halt, {:error, :lookup_unavailable}}
         end
       end)
       |> case do
@@ -84,23 +91,6 @@ defmodule EmailJanitor.Conversation.Lookup do
           _ -> {:error, :lookup_unavailable}
         end
     end
-  end
-
-  @doc false
-  def confirmed_since(ctx, message_id, since) do
-    ctx.scope.repo.one(
-      from(a in Action,
-        where:
-          a.inbox_id == ^ctx.inbox.id and a.state in [:done, :restored] and
-            ^message_id in a.applied_message_ids and a.dispatch_started_at >= ^since,
-        order_by: [desc: a.inserted_at],
-        limit: 1,
-        select: a.id
-      ),
-      prefix: ctx.scope.prefix,
-      log: false,
-      telemetry_event: nil
-    )
   end
 
   defp action(ctx, message_id) do
