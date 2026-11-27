@@ -76,3 +76,16 @@ The SaaS will own identity/group routing and supply a trusted database schema
 scope to this library. The library does not determine tenants or accept storage
 scopes from model output or HTTP parameters. Query-prefix separation is covered
 here; full SaaS authorization is a later integration gate.
+
+Adapters that resolve credentials or verify the Google account must implement the
+optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
+and returns an opaque zero-argument mutation closure. Only invoke that closure
+inside the executor's durable dispatch fence; never persist it or its captured
+credentials in a job. Preparation failure or termination creates no intent and
+reserves no quota. Legacy lightweight adapters remain supported through
+`remove_inbox/3`.
+
+The executor also reserves a complete dispatch watchdog window inside its overall
+execution deadline. If slow preparation exhausts that window, it fails before
+admission; if database contention exhausts it after intent, the never-dispatched
+intent is cancelled and its policy settlement is retried safely.
