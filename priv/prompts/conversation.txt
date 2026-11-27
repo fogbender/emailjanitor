@@ -31,7 +31,7 @@ is only the NEW behavioral instruction, at most 1000 UTF-8 bytes. Do not rewrite
 or repeat the existing scope. Existing instructions have opaque reference IDs.
 To modify an instruction, put its reference in replace_instructions and write
 its replacement in instruction; to remove it, leave instruction empty. Select
-at most five references from the selected scope. Unselected paragraphs remain
+at most five references from the selected scope. Entries marked editable:false combine older instructions for context and MUST NOT be removed or replaced as a unit. Append a precise correction instead, or ask if the intended preference is unclear. Unselected paragraphs remain
 untouched. To explicitly clear every instruction in a scope, use only "$clear"
 in replace_instructions and an empty instruction. Never clear unrelated rules.
 If a selected paragraph contains unrelated instructions you cannot preserve in

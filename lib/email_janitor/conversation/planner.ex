@@ -51,12 +51,23 @@ defmodule EmailJanitor.Conversation.Planner do
            ) do
       bodies = messages |> Enum.map(& &1.body) |> Enum.filter(&match?(%Content{}, &1))
 
+      headers =
+        Enum.flat_map(references, &[{:sender, &1.sender}, {:subject, &1.subject}]) ++
+          Enum.flat_map(messages, fn message ->
+            [
+              {:sender, Content.new(header(message, "from"))},
+              {:subject, Content.new(header(message, "subject"))}
+            ]
+          end)
+
       with {:ok, plan} <-
              Plan.parse(
                Content.read(object),
                tokens,
-               bodies,
-               Map.new(instructions, fn {scope, rows} -> {scope, Enum.map(rows, & &1.id)} end)
+               bodies ++ headers,
+               Map.new(instructions, fn {scope, rows} ->
+                 {scope, rows |> Enum.filter(& &1.editable) |> Enum.map(& &1.id)}
+               end)
              ),
            true <-
              not truncated or
@@ -74,7 +85,12 @@ defmodule EmailJanitor.Conversation.Planner do
     _, _ -> {:error, :conversation_unavailable}
   end
 
-  defp instruction(entry), do: %{"reference" => entry.id, "text" => Content.read(entry.text)}
+  defp instruction(entry),
+    do: %{
+      "reference" => entry.id,
+      "text" => Content.read(entry.text),
+      "editable" => entry.editable
+    }
 
   defp readable_messages(messages) do
     Enum.reduce_while(messages, {:ok, []}, fn message, {:ok, acc} ->

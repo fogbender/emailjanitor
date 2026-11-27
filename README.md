@@ -42,7 +42,11 @@ returns a transient typed proposal with inbox-bound reference tokens; email
 content cannot supply a storage scope, credential or arbitrary tool. Incomplete
 search results cannot authorize effects. Readable email passages are rejected from
 distilled instructions. Small edits preserve unrelated instruction paragraphs
-without generating a full 15,000-byte scope replacement. These checks supplement the prompt; execution still
+without generating a full 15,000-byte scope replacement. Grouped context is
+read-only, so a grouped reference cannot discard independent neighboring rules.
+Sender/subject text and decoded header names also participate in the copied-text
+guard; canonical sender addresses remain usable in preferences.
+These checks supplement the prompt; execution still
 requires the immutable executor safeguards and the host's policy.
 
 `Conversation.respond/3` uses a trusted `Conversation.Context` supplied by the

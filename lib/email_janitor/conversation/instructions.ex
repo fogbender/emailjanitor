@@ -6,23 +6,26 @@ defmodule EmailJanitor.Conversation.Instructions do
     Content.read(content)
     |> String.split("\n\n", trim: true)
     |> group_paragraphs()
-    |> Enum.map(fn text ->
+    |> Enum.map(fn paragraphs ->
+      text = Enum.join(paragraphs, "\n\n")
+
       %{
         id:
           "rule_" <> binary_part(Base.encode16(:crypto.hash(:sha256, text), case: :lower), 0, 24),
-        text: Content.new(text)
+        text: Content.new(text),
+        editable: length(paragraphs) == 1
       }
     end)
   end
 
   defp group_paragraphs(paragraphs) do
     size = max(1, div(length(paragraphs) + 63, 64))
-    Enum.chunk_every(paragraphs, size) |> Enum.map(&Enum.join(&1, "\n\n"))
+    Enum.chunk_every(paragraphs, size)
   end
 
   def edit(%Content{} = current, remove, %Content{} = addition) do
     entries = entries(current)
-    allowed = Enum.map(entries, & &1.id)
+    allowed = entries |> Enum.filter(& &1.editable) |> Enum.map(& &1.id)
     text = addition |> Content.read() |> String.trim()
 
     cond do

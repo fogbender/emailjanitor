@@ -51,10 +51,8 @@ defmodule EmailJanitor.Conversation.Plan do
          true <- text?(value["query"], 512),
          true <- text?(value["reply"], 1024),
          true <-
-           is_list(source_bodies) and length(source_bodies) <= 5 and
-             Enum.all?(source_bodies, fn source ->
-               match?(%Content{}, source) and byte_size(Content.read(source)) <= 8_000
-             end),
+           is_list(source_bodies) and length(source_bodies) <= 35 and
+             Enum.all?(source_bodies, &valid_source?/1),
          true <- instruction_references?(value, instruction_refs),
          true <- compatible?(value),
          true <- distilled?(value["instruction"], source_bodies) do
@@ -127,15 +125,61 @@ defmodule EmailJanitor.Conversation.Plan do
   defp distilled?(instruction, sources) do
     normalized = normalize(instruction)
 
-    Enum.all?(sources, fn %Content{} = source ->
-      body = normalize(Content.read(source))
+    sources
+    |> Enum.flat_map(&source_values/1)
+    |> Enum.all?(fn {kind, raw} ->
+      body = normalize(raw)
 
       cond do
+        body == "" -> true
+        normalized == body -> false
+        kind == :header -> not copied_header?(normalized, raw)
         byte_size(body) < 12 -> true
         String.contains?(normalized, body) -> false
         true -> not copied_passage?(normalized, body)
       end
     end)
+  end
+
+  defp valid_source?(%Content{} = source), do: byte_size(Content.read(source)) <= 8_000
+
+  defp valid_source?({kind, %Content{} = source}) when kind in [:sender, :subject],
+    do: byte_size(Content.read(source)) <= 1_024
+
+  defp valid_source?(_), do: false
+
+  defp source_values(%Content{} = source), do: [{:body, Content.read(source)}]
+
+  defp source_values({kind, source}) when kind in [:sender, :subject] do
+    raw = Content.read(source)
+    # Decode encoded words as unstructured text, so every display name, comment
+    # and group is covered rather than only RFC2822's first From mailbox.
+    decoded =
+      try do
+        {"subject", value} = Mail.Parsers.RFC2822.parse_header("Subject: " <> raw, [])
+        if is_binary(value), do: value, else: raw
+      rescue
+        _ -> raw
+      catch
+        _, _ -> raw
+      end
+
+    [{:header, raw}, {:header, decoded}] |> Enum.uniq()
+  end
+
+  defp copied_header?(instruction, raw) do
+    identifier =
+      raw
+      |> String.replace(~r/[^\s<>(),:;"@]+@[a-zA-Z0-9.-]+/u, " ")
+      |> String.replace(~r/[<>(),:;"]/u, " ")
+      |> normalize()
+
+    command = instruction |> String.replace(~r/[<>(),:;"]/u, " ") |> normalize()
+    # Names and short subject identifiers may legitimately appear in a new
+    # behavioral instruction. Reject an instruction copied wholesale from header
+    # text, or a long copied passage; do not reject ordinary "Keep mail from X".
+    (byte_size(command) >= 4 and String.contains?(identifier, command)) or
+      copied_passage?(command, identifier)
   end
 
   defp copied_passage?(instruction, body) do
