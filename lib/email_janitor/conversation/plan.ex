@@ -215,8 +215,11 @@ defmodule EmailJanitor.Conversation.Plan do
 
     (parsed ++ enclosed ++ List.flatten(scanned))
     |> Enum.filter(fn value ->
-      byte_size(value) <= 254 and String.contains?(value, "@") and
-        not Regex.match?(~r/\s/u, value)
+      byte_size(value) <= 254 and
+        Regex.match?(
+          ~r/\A(?:"[^"\s,;:()]{1,64}"|[^@\s<>(),:;"\[\]]+(?:\([^()\s,;:"]{1,32}\))?)@(?:[^@\s<>(),:;"\[\]]+|\[(?:IPv6:)?[0-9a-fA-F:.]+\])\z/u,
+          value
+        )
     end)
     |> Enum.map(&String.downcase/1)
     |> Enum.uniq()
