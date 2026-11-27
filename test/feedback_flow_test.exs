@@ -689,4 +689,21 @@ defmodule EmailJanitor.FeedbackFlowTest do
     assert {:error, :feedback_unavailable} = accept(%{ctx | config: unavailable})
     assert Agent.get(ctx.state, & &1.gmail_calls) == 0
   end
+
+  test "second and millisecond SES timestamps survive durable intake and feedback without changing freshness",
+       ctx do
+    for {precision, n} <- [{:second, 1}, {:millisecond, 2}] do
+      at = DateTime.utc_now() |> DateTime.truncate(precision)
+      {receipt, _} = F.receipt(ctx.config.mail, "ses-timestamp-#{n}", at)
+      assert elem(receipt.received_at.microsecond, 1) == 6
+      assert DateTime.compare(receipt.received_at, at) == :eq
+      assert {:ok, incoming} = Spool.accept(ctx.scope, ctx.transport.id, receipt)
+      assert DateTime.diff(incoming.expires_at, at, :microsecond) == 3_600_000_000
+
+      assert {:ok, id} =
+               accept(ctx, incoming, raw(ctx.sender.address, "timestamp-#{n}@example.com"))
+
+      assert DateTime.compare(Ledger.get(ctx.scope, id).received_at, at) == :eq
+    end
+  end
 end
