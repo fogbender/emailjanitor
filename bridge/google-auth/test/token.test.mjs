@@ -100,6 +100,13 @@ test('official SDK signs AWS IMDSv2 credentials, exchanges and impersonates for 
   const extra = JSON.parse(decodeURIComponent(actualSubject));
   extra.headers.push({key: 'evil', value: 'unexpected'});
   assert.throws(() => verifyAwsSubject(encodeURIComponent(JSON.stringify(extra)), AUDIENCE));
+  const endpoint = JSON.parse(decodeURIComponent(actualSubject));
+  endpoint.url = endpoint.url.replace('sts.us-east-1.amazonaws.com', 'sts.attacker.example');
+  endpoint.headers.find(h => h.key === 'host').value = 'sts.attacker.example';
+  assert.throws(() => verifyAwsSubject(encodeURIComponent(JSON.stringify(endpoint)), AUDIENCE));
+  const mismatched = JSON.parse(decodeURIComponent(actualSubject));
+  mismatched.headers.find(h => h.key === 'host').value = 'sts.us-west-2.amazonaws.com';
+  assert.throws(() => verifyAwsSubject(encodeURIComponent(JSON.stringify(mismatched)), AUDIENCE));
 });
 
 test('official SDK exchanges explicitly selected Azure managed identity with no project discovery', async () => {

@@ -19,19 +19,21 @@
             npmDepsHash = "sha256-EYI2Fz+mWTgzO2kxk6pDo5mUvfyiNBN+gG0/IIjfm/4=";
             npmFlags = [ "--ignore-scripts" ];
             dontNpmBuild = true;
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
             doCheck = true;
             checkPhase = "npm test";
             postInstall = ''
               rm "$out/bin/emailjanitor-google-token"
-              makeWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-google-token" \
+              makeBinaryWrapper ${pkgs.coreutils}/bin/env "$out/bin/emailjanitor-google-token" \
                 --add-flags "-i ${pkgs.nodejs_22}/bin/node $out/lib/node_modules/@emailjanitor/google-token-bridge/cli.mjs"
             '';
             doInstallCheck = true;
             installCheckPhase = ''
               runHook preInstallCheck
+              printf 'echo BASH_ENV_RAN >&2; exit 0\n' >bridge.bash-env
               set +e
               NODE_OPTIONS='--require=/nonexistent-emailjanitor-module' \
+                BASH_ENV="$PWD/bridge.bash-env" \
                 NODE_DEBUG=http GOOGLE_SDK_NODE_LOGGING='*' \
                 NODE_USE_ENV_PROXY=1 NODE_TLS_REJECT_UNAUTHORIZED=0 \
                 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
@@ -45,6 +47,7 @@
               set -e
               test "$janitor_bridge_status" -eq 1
               test ! -s bridge.stdout
+              test ! -e bridge.warnings
               printf 'Google service token refresh failed.\n' >bridge.expected
               cmp bridge.expected bridge.stderr
               runHook postInstallCheck
