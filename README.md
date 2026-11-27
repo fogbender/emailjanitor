@@ -36,6 +36,16 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
 
 ## Implemented foundation
 
+Host policy callbacks reserve and settle under database locks. Settlement rereads
+the current durable outcome while excluding reconciliation and transition races;
+retrying settlement cannot overwrite a newer outcome with stale uncertainty.
+Blocked admissions retain one non-mutation candidate ID per inbox/exact message
+set; admission promotes that same ID to an action. A later cancelled retry gets
+a new reservation ID. Overlapping older blocked proposals are retired atomically
+via `Policy.retire_candidate/4` when a newer proposal is blocked or admitted;
+hosts remove only that old proposal's pending metadata, without recording a Gmail
+outcome or refunding quota. Candidate markers contain IDs only, never email bodies.
+
 - Conservative sender and correspondence guards, including configured relays,
   shared mailbox providers and public-suffix-aware parent-domain matching.
 - Validated, tool-free classifier boundary; transient content redaction and HTML
@@ -48,11 +58,14 @@ nix develop --command bash scripts/test test/email_janitor/executor_test.exs
   actions and ordinary transport failures remain unresolved until fresh, complete Gmail history positively
   accounts for every message; empty history never licenses replay. Live owners
   remain protected, expired local owners are killed before recovery, and unknown
-  hosts/runtimes cannot be taken over. Hosts call `Executor.recover/3` and then
-  `Store.reconcile/4` with authenticated history started after recovery.
+  hosts/runtimes cannot be taken over. Policy-aware hosts call
+  `Executor.recover/4`, then `Executor.reconcile/5` with authenticated history
+  started after recovery, and pass the same `policy:` to both. They execute new
+  actions through `Executor.execute/5` with that policy. Defaults without a policy
+  are the unlimited single-user deployment only.
   Do not wrap execution in a host transaction: it is rejected so the intent is
   committed before Gmail is called. Low-level store ownership APIs are internal
-  executor primitives; a host should call `Executor.execute/4`.
+  executor primitives; hosts use the policy-aware Executor APIs above.
 - Pure history-based ambiguous-action reconciliation decisions. Its live Gmail
   history consumer and automatic recovery worker are not implemented yet.
 
@@ -158,3 +171,16 @@ installer or deployable application. Run its local checks with:
 ```sh
 nix develop --command bash scripts/check-infra
 ```
+
+Adapters that resolve credentials or verify the Google account must implement the
+optional `Gmail.prepare_remove_inbox/3` callback. It runs before intent/admission
+and returns an opaque zero-argument mutation closure. Only invoke that closure
+inside the executor's durable dispatch fence; never persist it or its captured
+credentials in a job. Preparation failure or termination creates no intent and
+reserves no quota. Legacy lightweight adapters remain supported through
+`remove_inbox/3`.
+
+The executor also reserves a complete dispatch watchdog window inside its overall
+execution deadline. If slow preparation exhausts that window, it fails before
+admission; if database contention exhausts it after intent, the never-dispatched
+intent is cancelled and its policy settlement is retried safely.

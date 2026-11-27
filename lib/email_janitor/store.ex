@@ -1,12 +1,13 @@
 defmodule EmailJanitor.Store do
   @moduledoc "Scoped durable intents and restoration history. No raw email or provider output is accepted."
   import Ecto.Query
-  alias EmailJanitor.{Inbox, Owner, Proposal, Reconciliation}
-  alias EmailJanitor.Store.{Action, Mailbox, Migration, Scope}
+  alias EmailJanitor.{Inbox, Owner, Policy, Proposal, Reconciliation}
+  alias EmailJanitor.Store.{Action, Candidate, CandidateMigration, Mailbox, Migration, Scope}
 
   def install(%Scope{repo: repo, prefix: prefix}) do
     Ecto.Adapters.SQL.query!(repo, ~s(CREATE SCHEMA IF NOT EXISTS "#{prefix}"), [], log: false)
     Ecto.Migrator.up(repo, 1, Migration, prefix: prefix, log: false)
+    Ecto.Migrator.up(repo, 2, CandidateMigration, prefix: prefix, log: false)
   end
 
   def add_inbox(%Scope{} = scope, %Inbox{} = inbox) do
@@ -20,14 +21,14 @@ defmodule EmailJanitor.Store do
     end
   end
 
-  def intent(%Scope{} = scope, inbox_id, %Proposal{} = proposal, history_id)
+  def intent(%Scope{} = scope, inbox_id, %Proposal{} = proposal, history_id, opts \\ [])
       when is_binary(history_id) do
     if scope.repo.in_transaction?(),
       do: {:error, :outer_transaction},
-      else: do_intent(scope, inbox_id, proposal, history_id)
+      else: do_intent(scope, inbox_id, proposal, history_id, opts)
   end
 
-  defp do_intent(scope, inbox_id, proposal, history_id) do
+  defp do_intent(scope, inbox_id, proposal, history_id, opts) do
     true = Regex.match?(~r/\A[0-9]{1,32}\z/, history_id)
 
     record = %Action{
@@ -68,17 +69,91 @@ defmodule EmailJanitor.Store do
       if existing do
         {:existing, existing}
       else
-        record = struct(record, Owner.capture())
-        record = %{record | lease_expires_at: DateTime.add(clock(scope), 60)}
-        {:created, scope.repo.insert!(record, prefix: scope.prefix)}
+        ids = Enum.sort(proposal.message_ids)
+        message_key = :crypto.hash(:sha256, :erlang.term_to_binary(ids))
+
+        candidate =
+          scope.repo.get_by(Candidate, [inbox_id: inbox_id, message_key: message_key],
+            prefix: scope.prefix
+          ) ||
+            scope.repo.insert!(
+              %Candidate{inbox_id: inbox_id, message_key: message_key, message_ids: ids},
+              prefix: scope.prefix
+            )
+
+        if candidate.message_ids != ids, do: scope.repo.rollback(:candidate_conflict)
+        record = %{record | id: candidate.id}
+        policy = Keyword.get(opts, :policy, Policy.unlimited())
+        now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
+
+        case Policy.reserve(policy, inbox_id, record.id, proposal.message_ids, now) do
+          :ok ->
+            retire_overlapping_candidates(scope, inbox_id, candidate, policy)
+            record = struct(record, Owner.capture())
+            record = %{record | lease_expires_at: DateTime.add(clock(scope), 60)}
+            action = scope.repo.insert!(record, prefix: scope.prefix)
+            scope.repo.delete!(candidate, prefix: scope.prefix)
+            {:created, action}
+
+          # A block commits the host's pending-candidate metadata but never creates
+          # a Gmail mutation intent. Errors roll back the entire reservation.
+          {:blocked, reason} ->
+            retire_overlapping_candidates(scope, inbox_id, candidate, policy)
+            {:blocked, reason}
+
+          {:error, reason} ->
+            scope.repo.rollback(reason)
+        end
       end
     end)
+  end
+
+  defp retire_overlapping_candidates(scope, inbox_id, current, policy) do
+    prior =
+      scope.repo.all(
+        from(c in Candidate,
+          where:
+            c.inbox_id == ^inbox_id and c.id != ^current.id and
+              fragment("? && ?::text[]", c.message_ids, ^current.message_ids)
+        ),
+        prefix: scope.prefix
+      )
+
+    for candidate <- prior do
+      case Policy.retire_candidate(policy, inbox_id, candidate.id, candidate.message_ids) do
+        :ok -> scope.repo.delete!(candidate, prefix: scope.prefix)
+        {:error, reason} -> scope.repo.rollback(reason)
+      end
+    end
+
+    :ok
   end
 
   def get(%Scope{} = scope, inbox_id, id) do
     scope.repo.one(from(a in Action, where: a.id == ^id and a.inbox_id == ^inbox_id),
       prefix: scope.prefix
     )
+  end
+
+  @doc "Read the current durable action and settle while transitions are excluded."
+  def with_locked_action(%Scope{} = scope, inbox_id, id, fun) do
+    scope.repo.transaction(fn ->
+      mailbox =
+        scope.repo.one(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if is_nil(mailbox), do: scope.repo.rollback(:unknown_action)
+
+      action =
+        scope.repo.one(
+          from(a in Action, where: a.id == ^id and a.inbox_id == ^inbox_id, lock: "FOR UPDATE"),
+          prefix: scope.prefix
+        )
+
+      if is_nil(action), do: scope.repo.rollback(:unknown_action)
+      fun.(action)
+    end)
   end
 
   @doc "Fence an owner immediately before dispatch. Expired or different processes cannot send."

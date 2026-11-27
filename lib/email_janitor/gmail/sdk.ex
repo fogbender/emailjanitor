@@ -138,6 +138,7 @@ defmodule EmailJanitor.Gmail.SDK do
   The returned transient closure sends only batchModify with a 15-second default
   transport budget. Never persist the closure or inspect its captured environment.
   """
+  @impl true
   def prepare_remove_inbox(inbox_id, ids, opts) do
     guarded(fn ->
       with true <-
