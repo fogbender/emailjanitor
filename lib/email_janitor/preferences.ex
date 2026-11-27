@@ -23,7 +23,6 @@ defmodule EmailJanitor.Preferences do
     @primary_key {:id, Ecto.UUID, autogenerate: false}
     schema "preference_changes" do
       field(:target_key, :string)
-      field(:instruction_hash, :binary)
       field(:revision, :integer)
       field(:changed, :boolean)
       timestamps(type: :utc_datetime_usec, updated_at: false)
@@ -46,7 +45,12 @@ defmodule EmailJanitor.Preferences do
   end
 
   def install(%Scope{} = scope),
-    do: Ecto.Migrator.up(scope.repo, 3, __MODULE__.Migration, prefix: scope.prefix, log: false)
+    do:
+      Ecto.Migrator.up(scope.repo, 3, __MODULE__.Migration,
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
 
   def snapshot(%Scope{} = scope, inbox_id) do
     transaction(scope, fn ->
@@ -55,7 +59,8 @@ defmodule EmailJanitor.Preferences do
       mailbox =
         scope.repo.one(from(m in Mailbox, where: m.id == ^inbox_id, lock: "FOR SHARE"),
           prefix: scope.prefix,
-          log: false
+          log: false,
+          telemetry_event: nil
         ) || scope.repo.rollback(:unknown_inbox)
 
       snapshot_value(scope, mailbox)
@@ -68,6 +73,15 @@ defmodule EmailJanitor.Preferences do
         Content.read(snapshot.global) <>
         "\nThis inbox:\n" <> Content.read(snapshot.local)
     )
+  end
+
+  @doc "Remove metadata receipts beyond the seven-day retry window; hosts also call this during maintenance."
+  def purge_receipts(%Scope{} = scope, now \\ DateTime.utc_now()) do
+    transaction(scope, fn ->
+      Lock.acquire(scope, :exclusive)
+      prune(scope, now)
+      :ok
+    end)
   end
 
   @doc "Replace one instruction scope after a planner has distilled the user's correction. No model I/O in this transaction."
@@ -85,27 +99,33 @@ defmodule EmailJanitor.Preferences do
          {:ok, key} <- target_key(target, expected.inbox_id),
          true <-
            byte_size(instruction) <= 15_000 and String.valid?(instruction) and
-             not String.contains?(instruction, <<0>>) do
-      hash = :crypto.hash(:sha256, instruction)
-
+             not Regex.match?(~r/[\x00-\x08\x0B-\x1F\x7F]/u, instruction) do
       transaction(scope, fn ->
         Lock.acquire(scope, :exclusive)
         # Registration takes the shared namespace lock, so a newly registered
         # inbox cannot miss a concurrent global instruction-version increment.
         mailboxes =
-          scope.repo.all(from(m in Mailbox, order_by: [asc: m.id], lock: "FOR UPDATE"),
+          scope.repo.all(
+            from(m in Mailbox,
+              where: ^(key == "all") or m.id == ^expected.inbox_id,
+              order_by: [asc: m.id],
+              lock: "FOR UPDATE"
+            ),
             prefix: scope.prefix,
-            log: false
+            log: false,
+            telemetry_event: nil
           )
 
         mailbox =
           Enum.find(mailboxes, &(&1.id == expected.inbox_id)) ||
             scope.repo.rollback(:unknown_inbox)
 
-        case scope.repo.get(Change, id, prefix: scope.prefix, log: false) do
-          %Change{target_key: ^key, instruction_hash: ^hash} = receipt -> receipt
+        prune(scope, DateTime.utc_now())
+
+        case scope.repo.get(Change, id, prefix: scope.prefix, log: false, telemetry_event: nil) do
+          %Change{target_key: ^key} = receipt -> receipt
           %Change{} -> scope.repo.rollback(:request_conflict)
-          nil -> update(scope, mailbox, key, instruction, hash, expected, id)
+          nil -> update(scope, mailbox, key, instruction, expected, id)
         end
       end)
     else
@@ -113,7 +133,7 @@ defmodule EmailJanitor.Preferences do
     end
   end
 
-  defp update(scope, mailbox, key, instruction, hash, expected, id) do
+  defp update(scope, mailbox, key, instruction, expected, id) do
     current = snapshot_value(scope, mailbox)
 
     if current.instruction_version != expected.instruction_version or
@@ -121,7 +141,7 @@ defmodule EmailJanitor.Preferences do
          current.local_revision != expected.local_revision,
        do: scope.repo.rollback(:instructions_changed)
 
-    old = scope.repo.get(Row, key, prefix: scope.prefix, log: false)
+    old = scope.repo.get(Row, key, prefix: scope.prefix, log: false, telemetry_event: nil)
     changed = instruction != if(old, do: old.instruction, else: "")
     revision = if(old, do: old.revision, else: 0)
     revision = if changed, do: revision + 1, else: revision
@@ -129,7 +149,7 @@ defmodule EmailJanitor.Preferences do
     if changed do
       (old || %Row{key: key})
       |> Ecto.Changeset.change(instruction: instruction, revision: revision)
-      |> scope.repo.insert_or_update!(prefix: scope.prefix, log: false)
+      |> scope.repo.insert_or_update!(prefix: scope.prefix, log: false, telemetry_event: nil)
 
       query = if key == "all", do: Mailbox, else: from(m in Mailbox, where: m.id == ^mailbox.id)
 
@@ -137,26 +157,41 @@ defmodule EmailJanitor.Preferences do
         query,
         [inc: [instruction_version: 1], set: [updated_at: DateTime.utc_now()]],
         prefix: scope.prefix,
-        log: false
+        log: false,
+        telemetry_event: nil
       )
     end
+
+    if instruction == "",
+      do:
+        scope.repo.delete_all(from(c in Change, where: c.target_key == ^key),
+          prefix: scope.prefix,
+          log: false,
+          telemetry_event: nil
+        )
 
     scope.repo.insert!(
       %Change{
         id: id,
         target_key: key,
-        instruction_hash: hash,
         revision: revision,
         changed: changed
       },
       prefix: scope.prefix,
-      log: false
+      log: false,
+      telemetry_event: nil
     )
   end
 
   defp snapshot_value(scope, mailbox) do
-    global = scope.repo.get(Row, "all", prefix: scope.prefix, log: false)
-    local = scope.repo.get(Row, "inbox:" <> mailbox.id, prefix: scope.prefix, log: false)
+    global = scope.repo.get(Row, "all", prefix: scope.prefix, log: false, telemetry_event: nil)
+
+    local =
+      scope.repo.get(Row, "inbox:" <> mailbox.id,
+        prefix: scope.prefix,
+        log: false,
+        telemetry_event: nil
+      )
 
     %Snapshot{
       scope_prefix: scope.prefix,
@@ -173,10 +208,18 @@ defmodule EmailJanitor.Preferences do
   defp target_key({:inbox, id}, id), do: {:ok, "inbox:" <> id}
   defp target_key(_, _), do: {:error, :invalid_target}
 
+  defp prune(scope, now) do
+    scope.repo.delete_all(from(c in Change, where: c.inserted_at < ^DateTime.add(now, -604_800)),
+      prefix: scope.prefix,
+      log: false,
+      telemetry_event: nil
+    )
+  end
+
   defp transaction(scope, fun) do
     if scope.repo.in_transaction?(),
       do: {:error, :outer_transaction},
-      else: scope.repo.transaction(fun)
+      else: scope.repo.transaction(fun, log: false, telemetry_event: nil)
   rescue
     _ -> {:error, :preferences_unavailable}
   catch

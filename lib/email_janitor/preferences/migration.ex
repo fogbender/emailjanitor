@@ -18,7 +18,6 @@ defmodule EmailJanitor.Preferences.Migration do
     create table(:preference_changes, primary_key: false) do
       add(:id, :uuid, primary_key: true)
       add(:target_key, :text, null: false)
-      add(:instruction_hash, :binary, null: false)
       add(:revision, :bigint, null: false)
       add(:changed, :boolean, null: false)
       timestamps(type: :utc_datetime_usec, updated_at: false)
