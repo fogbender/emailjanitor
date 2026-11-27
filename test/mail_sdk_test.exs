@@ -105,11 +105,17 @@ defmodule EmailJanitor.MailSDKTest do
 
   test "receipt trusts SES envelope/verdict fields and drops MIME headers" do
     config = F.config(fn _ -> flunk("network") end)
-    {receipt, _} = F.receipt(config)
+    {receipt, json} = F.receipt(config)
     assert receipt.envelope_from == "owner@example.com"
+    assert receipt.key == "incoming/ses-123"
     assert receipt.verdicts["dkimVerdict"] == "PASS"
     refute inspect(receipt) =~ "PRIVATE-HEADER"
     refute inspect(receipt) =~ "attacker@example.net"
+
+    prefixed = put_in(json, ["receipt", "action", "objectKey"], "incoming/ses-123")
+
+    assert {:ok, %{key: "incoming/ses-123"}} =
+             Receipt.parse(config, Content.new(Jason.encode!(prefixed)))
   end
 
   test "wrong provenance, direct SNS content, missing verdicts and S3 object events are rejected" do
@@ -125,6 +131,7 @@ defmodule EmailJanitor.MailSDKTest do
       ),
       put_in(json, ["receipt", "action", "bucketName"], "attacker"),
       put_in(json, ["receipt", "action", "objectKey"], "incoming/other-message"),
+      put_in(json, ["receipt", "action", "objectKey"], "../ses-123"),
       update_in(json, ["receipt"], &Map.delete(&1, "dkimVerdict")),
       %{"Records" => [%{"s3" => %{}}]}
     ]

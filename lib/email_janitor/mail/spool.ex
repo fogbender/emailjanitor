@@ -7,7 +7,8 @@ defmodule EmailJanitor.Mail.Spool do
 
   Handlers may be retried after a crash: they MUST independently deduplicate each
   mutation, preference edit and reply using the supplied stable SES receipt ID.
-  Run sweep/2 at least minutely, including when the parser/authorizer is failing.
+  Run sweep/3 at least minutely and drain every continuation, even after errors,
+  including when the parser/authorizer is failing.
   S3 lifecycle is only a delayed fallback while this host/AWS is unavailable.
   """
   import Ecto.Query
@@ -172,31 +173,47 @@ defmodule EmailJanitor.Mail.Spool do
     end
   end
 
-  def sweep(%Scope{} = scope, %Config{} = config) do
+  @doc "Purge up to 100 eligible rows; continue every returned marker, including failed pages."
+  def sweep(%Scope{} = scope, %Config{} = config, marker \\ nil) do
     if scope.repo.in_transaction?() do
       {:error, :outer_transaction}
     else
-      now = DateTime.utc_now()
-      retire_before = DateTime.add(now, -5400)
+      if is_nil(marker) or
+           (is_binary(marker) and Regex.match?(~r/\A[A-Za-z0-9_-]{1,256}\z/, marker)) do
+        sweep_page(scope, config, marker)
+      else
+        {:error, :invalid_spool_marker}
+      end
+    end
+  end
 
-      scope.repo.delete_all(
-        from(i in Incoming, where: i.state == :deleted and i.expires_at < ^retire_before),
-        prefix: scope.prefix
+  defp sweep_page(scope, config, marker) do
+    now = DateTime.utc_now()
+    retire_before = DateTime.add(now, -5400)
+
+    scope.repo.delete_all(
+      from(i in Incoming, where: i.state == :deleted and i.expires_at < ^retire_before),
+      prefix: scope.prefix
+    )
+
+    query =
+      from(i in Incoming,
+        where: i.state != :deleted and (i.state == :purge or i.expires_at <= ^now),
+        select: i.id,
+        order_by: [asc: i.id],
+        limit: 101
       )
 
-      rows =
-        scope.repo.all(
-          from(i in Incoming,
-            where: i.state != :deleted and (i.state == :purge or i.expires_at <= ^now),
-            select: i.id,
-            limit: 100
-          ),
-          prefix: scope.prefix
-        )
+    query = if marker, do: from(i in query, where: i.id > ^marker), else: query
+    rows = scope.repo.all(query, prefix: scope.prefix)
+    page = Enum.take(rows, 100)
+    next = if length(rows) > 100, do: List.last(page), else: nil
 
-      results = Enum.map(rows, &purge(scope, &1, config))
-      if Enum.all?(results, &(&1 == :ok)), do: :ok, else: {:error, :spool_cleanup_failed}
-    end
+    results = Enum.map(page, &purge(scope, &1, config))
+
+    if Enum.all?(results, &(&1 == :ok)),
+      do: {:ok, next},
+      else: {:error, :spool_cleanup_failed, next}
   end
 
   @doc "Delete expired orphan/unroutable objects without reading their bodies. Continue the returned marker until nil."
