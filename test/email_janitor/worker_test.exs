@@ -358,4 +358,85 @@ defmodule EmailJanitor.WorkerTest do
     assert length(second) == 2 and MapSet.disjoint?(MapSet.new(first), MapSet.new(second))
     assert {:ok, []} = pending(ctx)
   end
+
+  test "a disconnect queued during admission invalidates the prepared mutation at final fence",
+       ctx do
+    owner = self()
+
+    hook = fn ->
+      executor = self()
+
+      {:ok, _} =
+        Task.start(fn ->
+          {:ok, :ok} =
+            Repo.transaction(fn ->
+              %{rows: [[backend]]} =
+                Ecto.Adapters.SQL.query!(Repo, "SELECT pg_backend_pid()", [], log: false)
+
+              send(executor, {:disconnect_backend, backend})
+
+              Ecto.Adapters.SQL.query!(
+                Repo,
+                ~s|SELECT id FROM "#{ctx.scope.prefix}".inboxes WHERE id = $1 FOR UPDATE|,
+                [ctx.box.id],
+                log: false
+              )
+
+              Repo.update_all(EmailJanitor.Store.Mailbox, [inc: [instruction_version: 1]],
+                prefix: ctx.scope.prefix,
+                log: false
+              )
+
+              :ok
+            end)
+
+          send(owner, :disconnected)
+        end)
+
+      receive do
+        {:disconnect_backend, backend} -> await_blocked(backend, 100)
+      after
+        2_000 -> flunk("disconnect task did not start")
+      end
+    end
+
+    Agent.update(ctx.quota, &Map.put(&1, :reserve_hook, hook))
+    assert {:ok, %{status: status}} = Worker.step(ctx.config)
+    assert status == :proposal_changed
+    assert_receive :disconnected, 1_000
+    assert read(ctx.state).mutations == []
+
+    assert [%Action{state: :cancelled, dispatch_started_at: nil}] =
+             Repo.all(Action, prefix: ctx.scope.prefix)
+
+    assert [%Candidate{status: :pending}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    # A fresh accepted Keep must atomically retire even cancelled-action provenance;
+    # later upgrades cannot resurrect that stale high-confidence Done candidate.
+    Agent.update(ctx.quota, &Map.delete(&1, :reserve_hook))
+    Agent.update(ctx.state, &%{&1 | model: :keep})
+    assert {:ok, %{status: :kept, recovery: :settled}} = Worker.step(ctx.config)
+
+    assert [%Candidate{status: :retired, requested: false}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+  end
+
+  defp await_blocked(_backend, 0),
+    do: flunk("disconnect must queue behind the mailbox admission lock")
+
+  defp await_blocked(backend, attempts) do
+    %{rows: [[count]]} =
+      Ecto.Adapters.SQL.query!(Repo, "SELECT cardinality(pg_blocking_pids($1))", [backend],
+        log: false
+      )
+
+    if count > 0 do
+      :ok
+    else
+      Process.sleep(5)
+      await_blocked(backend, attempts - 1)
+    end
+  end
 end

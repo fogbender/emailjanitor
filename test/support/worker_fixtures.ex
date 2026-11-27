@@ -142,6 +142,8 @@ defmodule EmailJanitor.WorkerTest.Policy do
       reserve(state, inbox, id, ids, now, %EmailJanitor.Policy.Admission{inbox_message_ids: ids})
 
   def reserve(state, _inbox, _id, _ids, _now, admission) do
+    if hook = Agent.get(state, &Map.get(&1, :reserve_hook)), do: hook.()
+
     Agent.get_and_update(state, fn value ->
       result = if value.block, do: {:blocked, value.block}, else: :ok
       {result, %{value | calls: value.calls ++ [{:reserve, admission.inbox_message_ids}]}}
