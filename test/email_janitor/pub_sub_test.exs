@@ -2,7 +2,7 @@ defmodule EmailJanitor.PubSubTest do
   use ExUnit.Case, async: false
   import ExUnit.CaptureLog
   alias EmailJanitor.{Content, Google.PubSub}
-  alias PubSub.{Config, Delivery}
+  alias PubSub.{Config, Delivery, Rejected}
   @subscription "projects/emailjanitor-test/subscriptions/mailbox-changes"
 
   defp config(resolver \\ fn -> {:ok, Content.new("SERVICE_TOKEN_SENTINEL")} end) do
@@ -93,23 +93,33 @@ defmodule EmailJanitor.PubSubTest do
     for data <- [
           %{"emailAddress" => "owner@acme.com", "historyId" => "broken"},
           %{"emailAddress" => "not-an-address", "historyId" => "102"},
-          %{
-            "emailAddress" => "owner@acme.com",
-            "historyId" => "102",
-            "body" => "PRIVATE_BODY_SENTINEL"
-          },
           [],
           String.duplicate("PRIVATE_BODY_SENTINEL", 500)
         ] do
       Tesla.Mock.mock(fn _ -> Tesla.Mock.json(%{"receivedMessages" => [received(data)]}) end)
-      log = capture_log(fn -> assert {:error, :invalid_notification} = PubSub.pull(config()) end)
+      log = capture_log(fn -> assert {:ok, [%Rejected{}]} = PubSub.pull(config()) end)
       refute log =~ "PRIVATE_BODY_SENTINEL"
     end
 
     for invalid <- [%{"ackId" => "ack"}, put_in(received(), ["message", "data"], "not-base64!")] do
       Tesla.Mock.mock(fn _ -> Tesla.Mock.json(%{"receivedMessages" => [invalid]}) end)
-      assert {:error, :invalid_notification} = PubSub.pull(config())
+      assert {:ok, [%Rejected{}]} = PubSub.pull(config())
     end
+  end
+
+  test "one malformed item does not block valid neighbors; numeric cursor and unknown keys normalize" do
+    payload = %{
+      "emailAddress" => "owner@acme.com",
+      "historyId" => 102,
+      "body" => "IGNORED_BODY_SENTINEL"
+    }
+
+    Tesla.Mock.mock(fn _ ->
+      Tesla.Mock.json(%{"receivedMessages" => [%{"ackId" => "broken"}, received(payload)]})
+    end)
+
+    assert {:ok, [%Rejected{}, %Delivery{history_id: "102"} = delivery]} = PubSub.pull(config())
+    refute inspect(delivery) =~ "IGNORED_BODY_SENTINEL"
   end
 
   test "acks cannot cross subscriptions, repeat IDs or accept arbitrary IDs" do

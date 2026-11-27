@@ -11,7 +11,16 @@ defmodule EmailJanitor.Gmail.Ingestion do
   """
   import Ecto.Query
   alias EmailJanitor.{Inbox, Message, Proposal, Store}
-  alias EmailJanitor.Gmail.{Parser, Ingestion.Arrival, Ingestion.Checkpoint, Ingestion.Migration}
+
+  alias EmailJanitor.Gmail.{
+    Parser,
+    HistoryBatch,
+    Ingestion.Arrival,
+    Ingestion.Checkpoint,
+    Ingestion.Migration
+  }
+
+  @provider_errors [:authorization_required, :forbidden, :rate_limited, :wrong_inbox]
   alias EmailJanitor.Store.{Mailbox, Scope}
 
   defmodule Eligible do
@@ -46,7 +55,8 @@ defmodule EmailJanitor.Gmail.Ingestion do
       with true <- history_id?(id) and DateTime.compare(expiry, DateTime.utc_now()) == :gt do
         transaction(scope, fn ->
           registered =
-            scope.repo.one(from(m in Mailbox, where: m.id == ^inbox.id, lock: "FOR UPDATE"),
+            scope.repo.one(
+              from(m in Mailbox, where: m.id == ^inbox.id, lock: "FOR NO KEY UPDATE"),
               prefix: scope.prefix,
               log: false
             )
@@ -109,7 +119,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
     protect(fn ->
       if history_id?(hint) do
         transaction(scope, fn ->
-          current = active!(scope, inbox)
+          current = present!(scope, inbox)
 
           requested =
             if newer?(hint, current.cursor) and
@@ -130,16 +140,17 @@ defmodule EmailJanitor.Gmail.Ingestion do
     end)
   end
 
-  @doc "Fetch complete history outside the transaction, then atomically queue IDs and advance its cursor."
+  @doc "Fetch a bounded closed-record history batch, then commit its IDs and cursor together."
   def catch_up(%Scope{} = scope, %Inbox{} = inbox, {gmail, options}) do
     protect(fn ->
       with {:ok, %Checkpoint{status: :active, address: address} = previous} <-
              checkpoint(scope, inbox.id),
            true <- address == inbox.address do
-        case gmail.history(inbox.id, previous.cursor, options) do
-          {:ok, %{complete?: true} = history} -> persist_history(scope, inbox, previous, history)
-          {:ok, %{complete?: false, reason: :history_expired}} -> mark_gap(scope, inbox, previous)
-          {:ok, %{complete?: false}} -> {:error, :incomplete_history}
+        case gmail.ingestion_batch(inbox.id, previous.cursor, options) do
+          {:ok, %HistoryBatch{} = history} -> persist_history(scope, inbox, previous, history)
+          {:error, :history_expired} -> mark_gap(scope, inbox, previous)
+          {:error, reason} = error when reason in @provider_errors -> error
+          {:error, :incomplete_history} = error -> error
           _ -> {:error, :gmail_unavailable}
         end
       else
@@ -162,7 +173,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
               inbox_id: inbox.id,
               generation: current.generation,
               message_id: id,
-              observed_history_id: history.history_id,
+              observed_history_id: history.through_id,
               status: :pending,
               inserted_at: now,
               updated_at: now
@@ -184,16 +195,16 @@ defmodule EmailJanitor.Gmail.Ingestion do
           end)
 
         requested =
-          if current.requested_id && newer?(current.requested_id, history.history_id),
+          if current.requested_id && newer?(current.requested_id, history.through_id),
             do: current.requested_id
 
         scope.repo.update!(
-          Ecto.Changeset.change(current, cursor: history.history_id, requested_id: requested),
+          Ecto.Changeset.change(current, cursor: history.through_id, requested_id: requested),
           prefix: scope.prefix,
           log: false
         )
 
-        %{cursor: history.history_id, discovered_count: discovered}
+        %{cursor: history.through_id, discovered_count: discovered, more?: history.more?}
       end)
     else
       _ -> {:error, :invalid_history}
@@ -233,6 +244,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
           )
         end)
       else
+        {:error, reason} = error when reason in @provider_errors -> error
         _ -> {:error, :watch_unavailable}
       end
     end)
@@ -331,6 +343,7 @@ defmodule EmailJanitor.Gmail.Ingestion do
         end
       else
         {:error, :not_found} -> {:skip, :deleted_arrival}
+        {:error, reason} = error when reason in @provider_errors -> error
         _ -> {:error, :eligibility_unavailable}
       end
     end)
@@ -365,10 +378,18 @@ defmodule EmailJanitor.Gmail.Ingestion do
   end
 
   defp valid_history?(
-         %{history_id: id, added_message_ids: ids, started_at: %DateTime{} = started},
+         %HistoryBatch{
+           from_id: from,
+           through_id: id,
+           more?: more,
+           added_message_ids: ids,
+           started_at: %DateTime{} = started
+         },
          previous
        ) do
-    history_id?(id) and not newer?(previous.cursor, id) and valid_ids?(ids, 10_000) and
+    from == previous.cursor and is_boolean(more) and history_id?(id) and
+      not newer?(previous.cursor, id) and
+      (not more or newer?(id, previous.cursor)) and valid_ids?(ids, 1_000_000) and
       DateTime.compare(started, previous.generation_started_at) in [:eq, :gt]
   end
 
@@ -410,10 +431,15 @@ defmodule EmailJanitor.Gmail.Ingestion do
       )
 
   defp active!(scope, inbox) do
+    current = present!(scope, inbox)
+    require!(scope, current.status == :active, :history_gap)
+    current
+  end
+
+  defp present!(scope, inbox) do
     current = locked(scope, inbox.id)
     require!(scope, match?(%Checkpoint{}, current), :not_initialized)
     require!(scope, current.address == inbox.address, :wrong_inbox)
-    require!(scope, current.status == :active, :history_gap)
     current
   end
 

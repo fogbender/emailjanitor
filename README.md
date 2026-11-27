@@ -145,8 +145,9 @@ authenticated pull and exact acknowledgement. Supply a trusted subscription and
 an explicit short-lived service-token resolver. It reads no ambient credentials;
 the service token is separate from each Gmail user's OAuth token. SDK transport
 fixtures cover the actual generated requests. Pub/Sub IDs and acknowledgement
-tokens are never treated as Gmail message IDs. Malformed delivery batches fail
-closed without acknowledgement.
+tokens are never treated as Gmail message IDs. Malformed deliveries remain
+unacknowledged without blocking valid neighbors. Numeric history IDs normalize
+to strings and unknown payload fields are ignored without retaining their values.
 
 `Gmail.Ingestion.install(scope)` installs scoped migration 10. After the host calls
 `Gmail.SDK.watch/3`, `Ingestion.baseline/3` saves that watch cursor without scanning
@@ -164,9 +165,13 @@ acknowledges it. Failed routes or commits remain unacknowledged. A crash after
 commit can safely redeliver the same hint. Hosts must supervise this bounded step
 outside host transactions: ingestion writes reject outer transactions so an ack
 cannot outrun its commit. Hosts must periodically call `Ingestion.catch_up/3`
-even with no notifications: Gmail can
-delay or drop them. Catch-up atomically queues discovered message IDs and advances
-the cursor only for complete, non-regressing history, with generation/cursor CAS.
+even with no notifications: Gmail can delay or drop them. Catch-up atomically
+queues discovered message IDs and advances only through closed, non-regressing
+history records, with generation/cursor CAS. `Gmail.SDK.ingestion_batch/3` reads
+one bounded API page; `more?: true` tells the host to schedule the next batch
+immediately after its committed cursor. This avoids all-history page/count stalls.
+The distinct `HistoryBatch` type has no `complete?` field and cannot authorize
+ambiguous-action reconciliation; recovery still requires complete `history/3`.
 Independent-connection tests cover commits, rollback and competing snapshots.
 
 Pending work contains IDs, cursors and timestamps only. `eligible_thread/5` reads
@@ -181,6 +186,9 @@ and it does not implement a partial-message mask for mixed old/new conversations
 
 Expired history enters `:gap` and pauses discovery/eligibility. This deliberately
 does **not** recover arrivals missed after Gmail's history retention expires.
+Known gap-state inboxes still durably coalesce and acknowledge notification hints
+without advancing their cursor, avoiding repeated subscription backlog. Fixed
+authorization errors reach the host for reconsent without resetting the baseline.
 An explicit reconnect leaves that missed backlog in the inbox; it is not outage
 catch-up. A reviewed metadata-only recovery strategy or a surfaced reconnect
 consequence is required before launch. Host scheduling, reconnect/forget lifecycle,

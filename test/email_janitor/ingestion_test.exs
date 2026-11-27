@@ -1,5 +1,32 @@
 defmodule EmailJanitor.IngestionTest.Gmail do
-  def history(_inbox, cursor, opts), do: opts[:history].(cursor)
+  def ingestion_batch(_inbox, cursor, opts) do
+    case opts[:history].(cursor) do
+      {:ok, %EmailJanitor.Gmail.HistoryBatch{}} = result ->
+        result
+
+      {:ok, %{complete?: true} = value} ->
+        {:ok,
+         %EmailJanitor.Gmail.HistoryBatch{
+           from_id: cursor,
+           through_id: value.history_id,
+           started_at: value.started_at,
+           added_message_ids: value.added_message_ids,
+           events: value.events,
+           deleted_message_ids: value.deleted_message_ids,
+           more?: Map.get(value, :more?, false)
+         }}
+
+      {:ok, %{complete?: false, reason: :history_expired}} ->
+        {:error, :history_expired}
+
+      {:ok, %{complete?: false}} ->
+        {:error, :incomplete_history}
+
+      result ->
+        result
+    end
+  end
+
   def thread_id(_inbox, message_id, opts), do: opts[:thread_id].(message_id)
   def thread(_inbox, thread_id, opts), do: opts[:thread].(thread_id)
   def renew_watch(_inbox, topic, opts), do: opts[:renew].(topic)
@@ -134,7 +161,7 @@ defmodule EmailJanitor.IngestionTest do
     assert {:ok, _} =
              Ingestion.catch_up(scope, box, gmail(fn "100" -> {:ok, history(["message-1"])} end))
 
-    assert {:error, :gmail_unavailable} =
+    assert {:error, :authorization_required} =
              Ingestion.catch_up(
                scope,
                box,
@@ -234,7 +261,7 @@ defmodule EmailJanitor.IngestionTest do
                gmail(fn _ -> flunk("gap must not fetch history") end)
              )
 
-    assert {:error, :history_gap} = Ingestion.record_signal(scope, box, "200")
+    assert {:ok, :ok} = Ingestion.record_signal(scope, box, "200")
     assert {:ok, reconnected} = Ingestion.reconnect(scope, box, first.generation, watch("300"))
     refute reconnected.generation == first.generation
     assert reconnected.cursor == "300" and reconnected.baseline_id == "300"
@@ -459,6 +486,135 @@ defmodule EmailJanitor.IngestionTest do
     assert {:ok, %Checkpoint{requested_id: nil}} = Ingestion.checkpoint(scope, box.id)
   end
 
+  test "large backlogs commit closed-record batches and restart after the committed cursor", %{
+    scope: scope,
+    box: box
+  } do
+    baseline(scope, box)
+    ids = Enum.map(1..10_001, &"message-#{&1}")
+
+    assert {:ok, %{cursor: "101", more?: true, discovered_count: 10_001}} =
+             Ingestion.catch_up(
+               scope,
+               box,
+               gmail(fn "100" -> {:ok, Map.put(history(ids, "101"), :more?, true)} end)
+             )
+
+    assert TestRepo.aggregate(Arrival, :count, prefix: scope.prefix) == 10_001
+
+    assert {:ok, %{cursor: "500", more?: false, discovered_count: 1}} =
+             Ingestion.catch_up(
+               scope,
+               box,
+               gmail(fn "101" -> {:ok, history(["later-message"], "500")} end)
+             )
+
+    assert TestRepo.aggregate(Arrival, :count, prefix: scope.prefix) == 10_002
+  end
+
+  test "gap-state hints are committed and acknowledged while eligibility stays paused", %{
+    scope: scope,
+    box: box
+  } do
+    baseline(scope, box)
+
+    assert {:error, :history_gap} =
+             Ingestion.catch_up(scope, box, gmail(fn _ -> {:error, :history_expired} end))
+
+    assert {:ok, %{recorded: 1, acknowledged: 1, failed: 0}} =
+             NotificationWorker.poll_once(
+               {PubSub, [deliveries: [delivery("200")], ack: fn _ -> :ok end]},
+               fn _ -> {:ok, scope, box} end
+             )
+
+    assert {:ok, %Checkpoint{status: :gap, cursor: "100", requested_id: "200"}} =
+             Ingestion.checkpoint(scope, box.id)
+
+    assert {:error, :history_gap} = Ingestion.pending(scope, box)
+  end
+
+  test "reconnect's mailbox lock is compatible with foreign-key share locks", %{
+    scope: scope,
+    box: box
+  } do
+    first = baseline(scope, box)
+    owner = self()
+
+    holder =
+      Task.async(fn ->
+        Sandbox.unboxed_run(TestRepo, fn ->
+          TestRepo.transaction(fn ->
+            Ecto.Adapters.SQL.query!(
+              TestRepo,
+              ~s(SELECT id FROM "#{scope.prefix}".inboxes WHERE id = $1 FOR KEY SHARE),
+              [box.id],
+              log: false
+            )
+
+            send(owner, {:key_share_held, self()})
+
+            receive do
+              :release -> :ok
+            after
+              5000 -> raise "test timeout"
+            end
+          end)
+        end)
+      end)
+
+    assert_receive {:key_share_held, holder_pid}
+
+    reconnect =
+      Task.async(fn ->
+        Sandbox.unboxed_run(TestRepo, fn ->
+          Ingestion.reconnect(scope, box, first.generation, watch("300"))
+        end)
+      end)
+
+    result = Task.yield(reconnect, 1000)
+    send(holder_pid, :release)
+    assert {:ok, :ok} = Task.await(holder)
+    if result == nil, do: Task.shutdown(reconnect, :brutal_kill)
+    assert {:ok, {:ok, %Checkpoint{cursor: "300"}}} = result
+  end
+
+  test "fixed provider authorization errors reach hosts without changing the checkpoint", %{
+    scope: scope,
+    box: box
+  } do
+    first = baseline(scope, box)
+
+    assert {:ok, _} =
+             Ingestion.catch_up(scope, box, gmail(fn _ -> {:ok, history(["message-1"])} end))
+
+    for reason <- [:authorization_required, :forbidden, :rate_limited, :wrong_inbox] do
+      assert {:error, ^reason} =
+               Ingestion.catch_up(scope, box, gmail(fn _ -> {:error, reason} end))
+
+      assert {:error, ^reason} =
+               Ingestion.renew_watch(
+                 scope,
+                 box,
+                 "topic",
+                 {Gmail, [renew: fn _ -> {:error, reason} end]}
+               )
+
+      assert {:error, ^reason} =
+               Ingestion.eligible_thread(
+                 scope,
+                 box,
+                 first.generation,
+                 "message-1",
+                 {Gmail, [thread_id: fn _ -> {:error, reason} end]}
+               )
+    end
+
+    assert {:ok, %Checkpoint{cursor: "102", generation: generation, status: :active}} =
+             Ingestion.checkpoint(scope, box.id)
+
+    assert generation == first.generation
+  end
+
   test "generated Pub/Sub SDK and committed signal storage cooperate before exact acknowledgement",
        %{scope: scope, box: box} do
     baseline(scope, box)
@@ -476,6 +632,7 @@ defmodule EmailJanitor.IngestionTest do
       if String.ends_with?(env.url, ":pull") do
         Tesla.Mock.json(%{
           "receivedMessages" => [
+            %{"ackId" => "malformed-neighbor"},
             %{
               "ackId" => "ACK_SENTINEL",
               "message" => %{
@@ -501,7 +658,7 @@ defmodule EmailJanitor.IngestionTest do
       end
     end)
 
-    assert {:ok, %{recorded: 1, acknowledged: 1, failed: 0}} =
+    assert {:ok, %{recorded: 1, acknowledged: 1, failed: 1}} =
              NotificationWorker.poll_once({EmailJanitor.Google.PubSub, config}, fn _ ->
                {:ok, scope, box}
              end)

@@ -8,7 +8,7 @@ defmodule EmailJanitor.Gmail.SDK do
   """
   @behaviour EmailJanitor.Gmail
   alias EmailJanitor.{Address, Content}
-  alias EmailJanitor.Gmail.{Config, Parser}
+  alias EmailJanitor.Gmail.{Config, Parser, HistoryBatch}
   alias GoogleApi.Gmail.V1.{Api.Users, Connection, Model}
 
   @impl true
@@ -166,6 +166,78 @@ defmodule EmailJanitor.Gmail.SDK do
         _ -> {:error, :invalid_history_id}
       end
     end)
+  end
+
+  @doc """
+  Fetch one closed-record ingestion batch. This is never recovery/retry evidence.
+  Gmail returns records in increasing history ID order; when another page exists,
+  checkpoint only its last complete record and fetch afresh after that ID.
+  """
+  def ingestion_batch(inbox_id, start_id, opts) do
+    guarded(fn ->
+      with true <- history_id?(start_id),
+           {:ok, connection, _} <- verified(inbox_id, opts) do
+        started = DateTime.utc_now()
+
+        case call(fn ->
+               Users.gmail_users_history_list(connection, "me",
+                 startHistoryId: start_id,
+                 maxResults: 500
+               )
+             end) do
+          {:ok, %Model.ListHistoryResponse{} = response} ->
+            ingestion_page(response, start_id, started)
+
+          {:error, :not_found} ->
+            {:error, :history_expired}
+
+          {:error, _} = error ->
+            error
+
+          _ ->
+            {:error, :gmail_unavailable}
+        end
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :invalid_history_id}
+      end
+    end)
+  end
+
+  defp ingestion_page(response, start, started) do
+    records = response.history || []
+
+    with true <- history_id?(response.historyId),
+         true <- is_list(records) and length(records) <= 500,
+         {:ok, events, added, deleted} <- history_records(records),
+         ids = Enum.map(records, &String.to_integer(&1.id)),
+         true <- ids == Enum.sort(Enum.uniq(ids)),
+         true <- String.to_integer(response.historyId) >= String.to_integer(start),
+         true <-
+           Enum.all?(
+             ids,
+             &(&1 > String.to_integer(start) and &1 <= String.to_integer(response.historyId))
+           ),
+         true <-
+           response.nextPageToken in [nil, ""] or
+             (is_binary(response.nextPageToken) and byte_size(response.nextPageToken) in 1..8192),
+         more = response.nextPageToken not in [nil, ""],
+         true <- not more or records != [] do
+      through = if more, do: List.last(records).id, else: response.historyId
+
+      {:ok,
+       %HistoryBatch{
+         from_id: start,
+         through_id: through,
+         started_at: started,
+         more?: more,
+         added_message_ids: Enum.uniq(added),
+         deleted_message_ids: Enum.uniq(deleted),
+         events: Enum.uniq(events) |> Enum.sort_by(&String.to_integer(&1.history_id))
+       }}
+    else
+      _ -> {:error, :invalid_history}
+    end
   end
 
   defp verified(inbox_id, opts) do

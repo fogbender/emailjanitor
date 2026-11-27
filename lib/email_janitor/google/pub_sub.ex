@@ -44,6 +44,11 @@ defmodule EmailJanitor.Google.PubSub do
     defstruct @enforce_keys
   end
 
+  defmodule Rejected do
+    @moduledoc "A malformed delivery, without retaining its payload or acknowledgement token."
+    defstruct reason: :invalid_notification
+  end
+
   def pull(%Config{} = config, max_messages \\ 100) do
     protect(fn ->
       with true <- is_integer(max_messages) and max_messages in 1..100,
@@ -114,16 +119,13 @@ defmodule EmailJanitor.Google.PubSub do
   end
 
   defp parse_deliveries(received, subscription) do
-    Enum.reduce_while(received, {:ok, []}, fn item, {:ok, acc} ->
-      case delivery(item, subscription) do
-        {:ok, delivery} -> {:cont, {:ok, [delivery | acc]}}
-        _ -> {:halt, {:error, :invalid_notification}}
-      end
-    end)
-    |> case do
-      {:ok, deliveries} -> {:ok, Enum.reverse(deliveries)}
-      error -> error
-    end
+    {:ok,
+     Enum.map(received, fn item ->
+       case delivery(item, subscription) do
+         {:ok, delivery} -> delivery
+         _ -> %Rejected{}
+       end
+     end)}
   end
 
   defp delivery(
@@ -138,16 +140,16 @@ defmodule EmailJanitor.Google.PubSub do
          {:ok, decoded} <- decode_data(data),
          true <- byte_size(decoded) <= 2048,
          {:ok, value} when is_map(value) <- Jason.decode(decoded),
-         true <- Enum.sort(Map.keys(value)) == ~w(emailAddress historyId),
          {:ok, address} <- Address.normalize(value["emailAddress"]),
-         true <- history_id?(value["historyId"]) do
+         history = normalize_history_id(value["historyId"]),
+         true <- history_id?(history) do
       {:ok,
        %Delivery{
          subscription: subscription,
          ack_id: Content.new(ack),
          message_id: id,
          email_address: address,
-         history_id: value["historyId"]
+         history_id: history
        }}
     else
       _ -> {:error, :invalid_notification}
@@ -178,6 +180,11 @@ defmodule EmailJanitor.Google.PubSub do
   end
 
   defp history_id?(id), do: is_binary(id) and Regex.match?(~r/\A[0-9]{1,32}\z/, id)
+
+  defp normalize_history_id(value) when is_integer(value) and value >= 0,
+    do: Integer.to_string(value)
+
+  defp normalize_history_id(value), do: value
 
   defp valid_text?(text, limit),
     do:
