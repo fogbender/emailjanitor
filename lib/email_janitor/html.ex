@@ -6,7 +6,7 @@ defmodule EmailJanitor.HTML do
     with {:ok, document} <- Floki.parse_document(Content.read(content)) do
       document
       |> Floki.filter_out("script, style, title, head, template")
-      |> fragments()
+      |> fragments(:visible)
       |> Enum.join(" ")
       |> String.replace(~r/\s+/u, " ")
       |> String.slice(0, limit)
@@ -19,35 +19,63 @@ defmodule EmailJanitor.HTML do
     _ -> {:error, :invalid_html}
   end
 
-  defp fragments(nodes) when is_list(nodes), do: Enum.flat_map(nodes, &fragments/1)
-  defp fragments(text) when is_binary(text), do: [text]
+  defp fragments(nodes, visibility) when is_list(nodes),
+    do: Enum.flat_map(nodes, &fragments(&1, visibility))
 
-  defp fragments({tag, attrs, children}) do
-    if hidden?(attrs) do
+  defp fragments(text, :visible) when is_binary(text), do: [text]
+  defp fragments(text, _) when is_binary(text), do: []
+
+  defp fragments({tag, attrs, children}, inherited_visibility) do
+    style = inline_style(attrs)
+
+    visibility =
+      case style["visibility"] do
+        value when value in ["hidden", "collapse"] -> :hidden
+        value when value in ["visible", "initial"] -> :visible
+        _ -> inherited_visibility
+      end
+
+    if hidden?(attrs, style) do
       []
     else
-      href = if tag == "a", do: for({"href", value} <- attrs, do: value), else: []
-      href ++ fragments(children)
+      href =
+        if tag == "a" and visibility == :visible,
+          do: for({"href", value} <- attrs, do: value),
+          else: []
+
+      href ++ fragments(children, visibility)
     end
   end
 
-  defp fragments(_), do: []
+  defp fragments(_, _), do: []
 
-  defp hidden?(attrs) do
-    style =
-      attrs
-      |> Enum.filter(fn {name, _} -> name == "style" end)
-      |> Enum.map_join(";", &elem(&1, 1))
-      |> declarations()
+  defp inline_style(attrs) do
+    attrs
+    |> Enum.filter(fn {name, _} -> name == "style" end)
+    |> Enum.map_join(";", &elem(&1, 1))
+    |> declarations()
+  end
 
+  defp hidden?(attrs, style) do
     display = style["display"]
 
     visible_display =
-      display in ~w(block inline inline-block flex inline-flex grid inline-grid table table-row table-cell contents flow-root initial unset inherit)
+      display in ~w(block inline inline-block flex inline-flex grid inline-grid table inline-table table-row table-cell table-caption table-column table-column-group table-row-group table-header-group table-footer-group list-item contents flow-root initial unset inherit) or
+        display in [
+          "block flow",
+          "inline flow",
+          "block flow-root",
+          "inline flow-root",
+          "block flex",
+          "inline flex",
+          "block grid",
+          "inline grid",
+          "block table",
+          "inline table"
+        ]
 
     (Enum.any?(attrs, fn {name, _} -> name == "hidden" end) and not visible_display) or
-      display == "none" or style["visibility"] in ["hidden", "collapse"] or
-      style["opacity"] in ["0", "0.0", "0%"] or style["mso-hide"] == "all" or
+      display == "none" or style["opacity"] in ["0", "0.0", "0%"] or
       (style["max-height"] in ["0", "0px", "0em", "0rem"] and style["overflow"] == "hidden")
   end
 
