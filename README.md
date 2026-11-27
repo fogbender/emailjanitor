@@ -407,7 +407,8 @@ have been changed by this helper slice.
 
 Targeted execution preserves uncovered Done work as a stable metadata-only
 candidate when an earlier overlapping action is still live. It returns
-`{:blocked, :already_reserved}` without another quota reservation or Gmail intent;
+`{:deferred, covering_action_id, recovery_result}` without another quota reservation
+or Gmail intent. The covering result retains settlement/reconciliation retry IDs;
 a fresh eligible subset can then pass normal admission. Candidate existence is
 not new-arrival or paid-backlog authorization by itself.
 Policy adapters must explicitly implement `retire_candidate_messages/4` to support

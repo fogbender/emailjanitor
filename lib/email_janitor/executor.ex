@@ -203,8 +203,7 @@ defmodule EmailJanitor.Executor do
           existing(scope, inbox, action, opts)
 
         :deferred ->
-          existing(scope, inbox, action, opts)
-          {:blocked, :already_reserved}
+          {:deferred, action.id, existing(scope, inbox, action, opts)}
 
         :created ->
           apply_intent(scope, inbox, action, mutation, opts)
