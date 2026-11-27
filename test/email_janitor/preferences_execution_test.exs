@@ -130,6 +130,82 @@ defmodule EmailJanitor.PreferencesExecutionTest do
     end
   end
 
+  test "local correction completes while another inbox is locked, while a global correction waits",
+       ctx do
+    {:ok, other} = EmailJanitor.Inbox.new("locked-other", "other@example.com")
+    unboxed(fn -> {:ok, _} = Store.add_inbox(ctx.scope, other) end)
+    {:ok, initial} = unboxed(fn -> Preferences.snapshot(ctx.scope, ctx.inbox.id) end)
+    observer = self()
+
+    holder =
+      Task.async(fn ->
+        unboxed(fn ->
+          TestRepo.transaction(fn ->
+            Ecto.Adapters.SQL.query!(
+              TestRepo,
+              "SELECT id FROM ej_preferences_concurrency.inboxes WHERE id=$1 FOR UPDATE",
+              [other.id],
+              log: false
+            )
+
+            send(observer, :other_mailbox_locked)
+
+            receive do
+              :release -> :ok
+            after
+              5000 -> TestRepo.rollback(:test_timeout)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive :other_mailbox_locked
+
+    local =
+      Task.async(fn ->
+        unboxed(fn ->
+          Preferences.replace(
+            ctx.scope,
+            {:inbox, ctx.inbox.id},
+            initial,
+            Content.new("Only this inbox."),
+            Ecto.UUID.generate()
+          )
+        end)
+      end)
+
+    result = Task.yield(local, 1000)
+
+    if is_nil(result) do
+      send(holder.pid, :release)
+      Task.await(holder)
+      Task.await(local)
+      flunk("A local correction waited on another inbox's lock")
+    end
+
+    assert {:ok, {:ok, _}} = result
+    {:ok, current} = unboxed(fn -> Preferences.snapshot(ctx.scope, ctx.inbox.id) end)
+
+    global =
+      Task.async(fn ->
+        unboxed(fn ->
+          Preferences.replace(
+            ctx.scope,
+            :all,
+            current,
+            Content.new("All inboxes."),
+            Ecto.UUID.generate()
+          )
+        end)
+      end)
+
+    wait_for_database_lock(200)
+    assert is_nil(Task.yield(global, 10))
+    send(holder.pid, :release)
+    assert {:ok, :ok} = Task.await(holder)
+    assert {:ok, _} = Task.await(global)
+  end
+
   test "concurrent snapshots never combine preference text and versions from different commits",
        ctx do
     observer = self()
