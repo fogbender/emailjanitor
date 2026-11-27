@@ -39,7 +39,7 @@ defmodule EmailJanitor.Worker.Migration do
     create(
       constraint(:janitor_worker_deferrals, :worker_deferral_status,
         check:
-          "status IN ('unreadable', 'transient', 'blocked', 'invalid') AND attempts >= 0 AND instruction_version > 0"
+          "status IN ('unreadable', 'transient', 'blocked', 'invalid', 'rejected') AND attempts >= 0 AND instruction_version > 0"
       )
     )
 
@@ -55,13 +55,28 @@ defmodule EmailJanitor.Worker.Migration do
       add(:requested, :boolean, null: false, default: false)
       add(:attempts, :integer, null: false, default: 0)
       add(:invalid_attempts, :integer, null: false, default: 0)
+      add(:rejected_attempts, :integer, null: false, default: 0)
       add(:next_attempt_at, :utc_datetime_usec)
       timestamps(type: :utc_datetime_usec)
     end
 
     create(
       constraint(:janitor_worker_candidates, :worker_candidate_status,
-        check: "status IN ('pending', 'retired') AND attempts >= 0 AND invalid_attempts >= 0"
+        check:
+          "status IN ('pending', 'retired') AND attempts >= 0 AND invalid_attempts >= 0 AND rejected_attempts >= 0"
+      )
+    )
+
+    create table(:janitor_worker_model_streaks, primary_key: false) do
+      add(:inbox_id, references(:inboxes, type: :text), primary_key: true)
+      add(:instruction_version, :integer, null: false)
+      add(:bad_threads, {:array, :text}, null: false)
+      timestamps(type: :utc_datetime_usec)
+    end
+
+    create(
+      constraint(:janitor_worker_model_streaks, :worker_model_streak_bound,
+        check: "instruction_version > 0 AND cardinality(bad_threads) BETWEEN 1 AND 4"
       )
     )
 
@@ -99,7 +114,7 @@ defmodule EmailJanitor.Worker.Deferral do
     field(:fingerprint, :string)
     field(:instruction_version, :integer)
     field(:message_ids, {:array, :string})
-    field(:status, Ecto.Enum, values: [:unreadable, :transient, :blocked, :invalid])
+    field(:status, Ecto.Enum, values: [:unreadable, :transient, :blocked, :invalid, :rejected])
     field(:attempts, :integer, default: 0)
     field(:next_attempt_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
@@ -130,6 +145,7 @@ defmodule EmailJanitor.Worker.Candidate do
     field(:requested, :boolean, default: false)
     field(:attempts, :integer, default: 0)
     field(:invalid_attempts, :integer, default: 0)
+    field(:rejected_attempts, :integer, default: 0)
     field(:next_attempt_at, :utc_datetime_usec)
     timestamps(type: :utc_datetime_usec)
   end
@@ -146,6 +162,17 @@ defmodule EmailJanitor.Worker.Arrival do
     field(:observed_history_id, :string)
     field(:status, Ecto.Enum, values: [:pending, :processed])
     field(:last_attempt_at, :utc_datetime_usec)
+    timestamps(type: :utc_datetime_usec)
+  end
+end
+
+defmodule EmailJanitor.Worker.ModelStreak do
+  @moduledoc false
+  use Ecto.Schema
+  @primary_key {:inbox_id, :string, autogenerate: false}
+  schema "janitor_worker_model_streaks" do
+    field(:instruction_version, :integer)
+    field(:bad_threads, {:array, :string})
     timestamps(type: :utc_datetime_usec)
   end
 end

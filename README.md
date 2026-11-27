@@ -432,12 +432,16 @@ outcomes, never bodies, credentials or raw model/provider responses. Stable
 `:unreadable_content` keeps arrivals pending and probes only minimal thread
 revision metadata every fifteen minutes until the revision or instructions
 change; transient failures remain retryable with exponential backoff. Invalid
-model output stops automatic candidate retries after eight attempts while keeping
+model output stops automatic candidate retries after eight consecutive invalid attempts while keeping
 provenance for an explicit requeue. Unsupported policy contracts stay pending and
 probe only revision metadata until content/instruction versions change; hosts must
 bump the mailbox version when correcting a policy/configuration incompatibility.
 Request-specific400/413/422 model rejections defer only that conversation;
-authentication,429,5xx and transport outages preserve inbox-wide backoff.
+authentication,429,5xx, quota/policy and transport outages preserve inbox-wide backoff.
+Four distinct rejected/invalid conversations without a successful classification
+trip inbox backoff too, bounding misconfiguration-induced400 bursts. Four repeated
+rejections for unchanged content switch to metadata-only probes; candidate caps
+remain paused until an explicit exact recheck.
 Reports retain the underlying fixed failure reason even for local deferrals.
 Durable last-attempt ordering lets never-attempted arrivals run before due failed
 retries. Bulk host backlog discovery preserves requested backoff and exhausted

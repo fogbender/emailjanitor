@@ -3,8 +3,8 @@ defmodule EmailJanitor.Worker.Ledger do
   import Ecto.Query
   alias EmailJanitor.Gmail.Ingestion
   alias EmailJanitor.Gmail.Ingestion.Checkpoint
-  alias EmailJanitor.Store.{Action, Scope}
-  alias EmailJanitor.Worker.{Arrival, Deferral, Receipt, Watch, Candidate}
+  alias EmailJanitor.Store.{Action, Mailbox, Scope}
+  alias EmailJanitor.Worker.{Arrival, Deferral, Receipt, Watch, Candidate, ModelStreak}
 
   def install(%Scope{} = scope) do
     case Ingestion.install(scope) do
@@ -274,7 +274,15 @@ defmodule EmailJanitor.Worker.Ledger do
           from(c in Candidate,
             where: c.inbox_id == ^inbox.id and c.candidate_id == ^uuid and c.status == :pending
           ),
-          [set: [requested: true, attempts: 0, invalid_attempts: 0, next_attempt_at: nil]],
+          [
+            set: [
+              requested: true,
+              attempts: 0,
+              invalid_attempts: 0,
+              rejected_attempts: 0,
+              next_attempt_at: nil
+            ]
+          ],
           prefix: scope.prefix,
           log: false
         )
@@ -347,7 +355,7 @@ defmodule EmailJanitor.Worker.Ledger do
         on: a.inbox_id == p.inbox_id and a.id == p.candidate_id,
         where:
           p.inbox_id == ^inbox.id and p.status == :pending and not p.requested and
-            p.invalid_attempts < 8 and
+            p.invalid_attempts < 8 and p.rejected_attempts < 4 and
             ((not is_nil(c.id) and c.thread_id == p.thread_id) or
                (a.state == :cancelled and is_nil(a.dispatch_started_at) and
                   a.thread_id == p.thread_id)),
@@ -359,9 +367,18 @@ defmodule EmailJanitor.Worker.Ledger do
         from(p in Candidate,
           where:
             p.inbox_id == ^inbox.id and not p.requested and p.invalid_attempts < 8 and
+              p.rejected_attempts < 4 and
               p.candidate_id in subquery(candidates)
         ),
-        [set: [requested: true, attempts: 0, invalid_attempts: 0, next_attempt_at: nil]],
+        [
+          set: [
+            requested: true,
+            attempts: 0,
+            invalid_attempts: 0,
+            rejected_attempts: 0,
+            next_attempt_at: nil
+          ]
+        ],
         prefix: scope.prefix,
         log: false
       )
@@ -371,13 +388,16 @@ defmodule EmailJanitor.Worker.Ledger do
 
   def finish_candidate(scope, inbox, candidate, result, now) do
     case result do
-      status when status in [:retry, :unreadable, :invalid_decision] ->
+      status when status in [:retry, :unreadable, :invalid_decision, :model_rejected] ->
         attempts = min(candidate.attempts + 1, 16)
 
         invalid_attempts =
           if status == :invalid_decision, do: min(candidate.invalid_attempts + 1, 8), else: 0
 
-        capped = invalid_attempts >= 8
+        rejected_attempts =
+          if status == :model_rejected, do: min(candidate.rejected_attempts + 1, 4), else: 0
+
+        capped = invalid_attempts >= 8 or rejected_attempts >= 4
 
         scope.repo.update_all(
           from(c in Candidate,
@@ -389,6 +409,7 @@ defmodule EmailJanitor.Worker.Ledger do
             set: [
               attempts: attempts,
               invalid_attempts: invalid_attempts,
+              rejected_attempts: rejected_attempts,
               requested: not capped,
               next_attempt_at:
                 DateTime.add(now, if(status == :unreadable, do: 900, else: delay(attempts)))
@@ -410,6 +431,71 @@ defmodule EmailJanitor.Worker.Ledger do
     end
 
     :ok
+  end
+
+  # Bound distinct bad model results across conversations, without retaining any
+  # response text. A valid classification resets the streak; safeguards do not.
+  def model_outcome(scope, inbox, thread, version, result, now) do
+    bad? = result in [{:error, :model_rejected}, {:error, :invalid_decision}]
+    good? = match?({:ok, %EmailJanitor.Proposal{}}, result) or result == {:keep, :classifier_kept}
+
+    if bad? or good? do
+      case scope.repo.transaction(fn ->
+             mailbox =
+               scope.repo.one(
+                 from(m in Mailbox,
+                   where: m.id == ^inbox.id,
+                   lock: "FOR NO KEY UPDATE"
+                 ),
+                 prefix: scope.prefix,
+                 log: false
+               )
+
+             if mailbox && mailbox.instruction_version == version do
+               if good? do
+                 scope.repo.delete_all(from(s in ModelStreak, where: s.inbox_id == ^inbox.id),
+                   prefix: scope.prefix,
+                   log: false
+                 )
+
+                 false
+               else
+                 old = scope.repo.get(ModelStreak, inbox.id, prefix: scope.prefix, log: false)
+
+                 previous =
+                   if old && old.instruction_version == version, do: old.bad_threads, else: []
+
+                 threads = Enum.uniq(previous ++ [thread]) |> Enum.take(4)
+
+                 scope.repo.insert_all(
+                   ModelStreak,
+                   [
+                     %{
+                       inbox_id: inbox.id,
+                       instruction_version: version,
+                       bad_threads: threads,
+                       inserted_at: now,
+                       updated_at: now
+                     }
+                   ],
+                   prefix: scope.prefix,
+                   log: false,
+                   conflict_target: [:inbox_id],
+                   on_conflict: {:replace, [:instruction_version, :bad_threads, :updated_at]}
+                 )
+
+                 length(threads) >= 4
+               end
+             else
+               false
+             end
+           end) do
+        {:ok, throttled?} -> throttled?
+        _ -> raise "worker metadata unavailable"
+      end
+    else
+      false
+    end
   end
 
   defp pending_source?(scope, inbox, candidate) do

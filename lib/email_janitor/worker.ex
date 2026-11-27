@@ -27,6 +27,7 @@ defmodule EmailJanitor.Worker do
     :activation_failed,
     :invalid_activation,
     :model_rejected,
+    :policy_unavailable,
     :gmail_unavailable,
     :unreadable_content,
     :invalid_thread_snapshot
@@ -264,7 +265,8 @@ defmodule EmailJanitor.Worker do
               :model_unavailable,
               :gmail_unavailable,
               :eligibility_unavailable,
-              :self_mail_unavailable
+              :self_mail_unavailable,
+              :policy_unavailable
             ],
        do: true
 
@@ -303,7 +305,20 @@ defmodule EmailJanitor.Worker do
               options
             )
 
-          finish_review(config, checkpoint, eligible, targets, snapshot, version, now, result)
+          throttled? =
+            Ledger.model_outcome(
+              config.scope,
+              config.inbox,
+              eligible.thread_id,
+              version,
+              result,
+              now
+            )
+
+          finished =
+            finish_review(config, checkpoint, eligible, targets, snapshot, version, now, result)
+
+          if throttled?, do: result, else: finished
         end
 
       {:skip, reason} when reason in [:deleted_arrival, :not_in_inbox, :prebaseline_inbox] ->
@@ -442,10 +457,12 @@ defmodule EmailJanitor.Worker do
   defp finish_review(config, checkpoint, eligible, _targets, snapshot, version, now, error) do
     old = Ledger.deferral(config.scope, config.inbox, checkpoint.generation, eligible.thread_id)
 
+    same? = old && old.instruction_version == version && old.fingerprint == snapshot.fingerprint
+
     capped =
-      error == {:error, :invalid_decision} and not is_nil(old) and old.status == :invalid and
-        old.attempts >= 7 and
-        old.instruction_version == version and old.fingerprint == snapshot.fingerprint
+      same? &&
+        ((error == {:error, :invalid_decision} and old.status == :invalid and old.attempts >= 7) or
+           (error == {:error, :model_rejected} and old.status == :rejected and old.attempts >= 3))
 
     Ledger.defer(
       config.scope,
@@ -458,6 +475,7 @@ defmodule EmailJanitor.Worker do
       cond do
         capped -> :blocked
         error == {:error, :invalid_decision} -> :invalid
+        error == {:error, :model_rejected} -> :rejected
         true -> :transient
       end,
       now
@@ -505,7 +523,18 @@ defmodule EmailJanitor.Worker do
             policy: %Policy{adapter: Gate, context: %{config: config}}
           )
 
-        finish_recheck(config, checkpoint, candidate, snapshot, version, now, review)
+        throttled? =
+          Ledger.model_outcome(
+            config.scope,
+            config.inbox,
+            candidate.thread_id,
+            version,
+            review,
+            now
+          )
+
+        finished = finish_recheck(config, checkpoint, candidate, snapshot, version, now, review)
+        if throttled?, do: review, else: finished
       end
     else
       {:blocked, :upgrade_required} ->
@@ -612,7 +641,12 @@ defmodule EmailJanitor.Worker do
   end
 
   defp finish_recheck(config, _checkpoint, candidate, _snapshot, _version, now, error) do
-    reason = if error == {:error, :invalid_decision}, do: :invalid_decision, else: :retry
+    reason =
+      case error do
+        {:error, reason} when reason in [:invalid_decision, :model_rejected] -> reason
+        _ -> :retry
+      end
+
     Ledger.finish_candidate(config.scope, config.inbox, candidate, reason, now)
     if inbox_failure?(error), do: error, else: {:deferred, status(error)}
   end

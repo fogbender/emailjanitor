@@ -815,6 +815,193 @@ defmodule EmailJanitor.WorkerTest do
     assert read(ctx.state).mutations == [["z-new"]]
   end
 
+  test "quota adapter outages back off arrivals after one model call", ctx do
+    observer = self()
+    messages = Enum.map(1..4, &Fixtures.message(id: "arrival-#{&1}", thread_id: "thread-#{&1}"))
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    Agent.update(ctx.quota, &Map.put(&1, :reserve_error, true))
+
+    config = %{
+      ctx.config
+      | report: fn status ->
+          send(observer, {:policy_outcome, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    assert_receive {:policy_outcome, :policy_unavailable}, 1_000
+    refute_receive {:policy_outcome, _}, 250
+    assert length(read(ctx.state).model_inputs) == 1
+    assert read(ctx.state).mutations == []
+  end
+
+  test "quota adapter outages also back off requested candidates", ctx do
+    observer = self()
+    messages = Enum.map(1..3, &Fixtures.message(id: "arrival-#{&1}", thread_id: "thread-#{&1}"))
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    for _ <- 1..3, do: assert({:ok, %{status: :blocked}} = Worker.step(ctx.config))
+    assert {:ok, 3} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.quota, &Map.put(%{&1 | block: nil}, :reserve_error, true))
+
+    config = %{
+      ctx.config
+      | report: fn status ->
+          send(observer, {:candidate_policy, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    assert_receive {:candidate_policy, :policy_unavailable}, 1_000
+    refute_receive {:candidate_policy, _}, 250
+    assert length(read(ctx.state).model_inputs) == 4
+    assert read(ctx.state).mutations == []
+  end
+
+  test "four distinct failed model conversations trip inbox backoff", ctx do
+    observer = self()
+    messages = Enum.map(1..7, &Fixtures.message(id: "arrival-#{&1}", thread_id: "thread-#{&1}"))
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          model: :rejected,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    config = %{
+      ctx.config
+      | report: fn status ->
+          send(observer, {:rejection_report, status})
+          :ok
+        end
+    }
+
+    start_supervised!(
+      {EmailJanitor.Worker.Server,
+       list: fn -> {:ok, ["trusted"]} end,
+       resolve: fn _ -> {:ok, config} end,
+       interval_ms: 5_000,
+       max_concurrency: 1}
+    )
+
+    for _ <- 1..4, do: assert_receive({:rejection_report, :model_rejected}, 1_500)
+    refute_receive {:rejection_report, _}, 250
+    assert length(read(ctx.state).model_inputs) == 4
+    assert read(ctx.state).mutations == []
+
+    assert [%{bad_threads: threads}] =
+             Repo.all(EmailJanitor.Worker.ModelStreak, prefix: ctx.scope.prefix)
+
+    assert length(threads) == 4
+  end
+
+  test "successful classification resets the distinct rejected-conversation streak", ctx do
+    messages = Enum.map(1..5, &Fixtures.message(id: "arrival-#{&1}", thread_id: "thread-#{&1}"))
+
+    Agent.update(
+      ctx.state,
+      &%{
+        &1
+        | messages: messages,
+          model: :rejected,
+          arrivals: %{"100" => %{through: "101", ids: Enum.map(messages, fn m -> m.id end)}}
+      }
+    )
+
+    for _ <- 1..3, do: assert({:ok, %{status: :deferred}} = Worker.step(ctx.config))
+    Agent.update(ctx.state, &%{&1 | model: :done})
+    assert {:ok, %{status: :done}} = Worker.step(ctx.config)
+    assert Repo.all(EmailJanitor.Worker.ModelStreak, prefix: ctx.scope.prefix) == []
+    Agent.update(ctx.state, &%{&1 | model: :rejected})
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+
+    assert [%{bad_threads: [_]}] =
+             Repo.all(EmailJanitor.Worker.ModelStreak, prefix: ctx.scope.prefix)
+  end
+
+  test "unchanged content stops model rejection retries after four attempts", ctx do
+    Agent.update(ctx.state, &%{&1 | model: :rejected})
+
+    for _ <- 1..4 do
+      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+      advance(ctx.clock, 901)
+    end
+
+    assert [%Deferral{status: :blocked}] = Repo.all(Deferral, prefix: ctx.scope.prefix)
+    assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+    assert length(read(ctx.state).model_inputs) == 4
+
+    Repo.update_all(EmailJanitor.Store.Mailbox, [set: [instruction_version: 2]],
+      prefix: ctx.scope.prefix,
+      log: false
+    )
+
+    Agent.update(ctx.state, &%{&1 | model: :done})
+    assert {:ok, %{status: :done}} = Worker.step(ctx.config)
+  end
+
+  test "candidate rejection cap survives repeated bulk discovery until explicit repair", ctx do
+    Agent.update(ctx.quota, &%{&1 | block: :cap})
+    assert {:ok, %{status: :blocked}} = Worker.step(ctx.config)
+    assert {:ok, 1} = Worker.queue_backlog(ctx.scope, ctx.box)
+    Agent.update(ctx.state, &%{&1 | model: :rejected})
+
+    for count <- 1..4 do
+      assert {:ok, %{status: :deferred}} = Worker.step(ctx.config)
+
+      assert [%Candidate{rejected_attempts: ^count}] =
+               Repo.all(Candidate, prefix: ctx.scope.prefix)
+
+      advance(ctx.clock, 901)
+    end
+
+    assert {:ok, 0} = Worker.queue_backlog(ctx.scope, ctx.box)
+    assert {:ok, %{status: :idle}} = Worker.step(ctx.config)
+    [%Candidate{candidate_id: id}] = Repo.all(Candidate, prefix: ctx.scope.prefix)
+    assert :ok = Worker.queue_recheck(ctx.scope, ctx.box, id)
+
+    assert [%Candidate{rejected_attempts: 0, requested: true}] =
+             Repo.all(Candidate, prefix: ctx.scope.prefix)
+  end
+
   defp await_blocked(_backend, 0),
     do: flunk("disconnect must queue behind the mailbox admission lock")
 

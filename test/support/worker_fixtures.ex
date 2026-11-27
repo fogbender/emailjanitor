@@ -179,7 +179,13 @@ defmodule EmailJanitor.WorkerTest.Policy do
     if hook = Agent.get(state, &Map.get(&1, :reserve_hook)), do: hook.()
 
     Agent.get_and_update(state, fn value ->
-      result = if value.block, do: {:blocked, value.block}, else: :ok
+      result =
+        cond do
+          Map.get(value, :reserve_error, false) -> {:error, :temporary}
+          value.block -> {:blocked, value.block}
+          true -> :ok
+        end
+
       {result, %{value | calls: value.calls ++ [{:reserve, admission.inbox_message_ids}]}}
     end)
   end
