@@ -168,11 +168,41 @@ defmodule EmailJanitor.ConversationPlannerTest do
     end
   end
 
+  test "a persistent current request uses the same predicate as its later history turn" do
+    for control <- ["\r", "\f", "\e", <<0>>, <<127>>] do
+      Req.Test.stub(__MODULE__, fn _ -> flunk("invalid persistent request reached provider") end)
+
+      assert {:error, :conversation_unavailable} =
+               Planner.plan(
+                 inbox(),
+                 snapshot(inbox()),
+                 Content.new("Request" <> control),
+                 [],
+                 [],
+                 Keyword.put(opts(:azure), :chat_history, [])
+               )
+
+      # The absent-option callers keep their existing transient input contract.
+      Req.Test.stub(__MODULE__, &response(&1, :azure, answer("A transient explanation.")))
+
+      assert {:ok, _} =
+               Planner.plan(
+                 inbox(),
+                 snapshot(inbox()),
+                 Content.new("Request" <> control),
+                 [],
+                 [],
+                 opts(:azure)
+               )
+    end
+  end
+
   test "persistent explanatory replies omit copied complete short or HTML forwarded bodies" do
     for provider <- [:azure, :bedrock],
         {body, quoted} <- [
           {"Hi", "Hi"},
           {"x", "x"},
+          {"1", "1"},
           {"PIN42!", "PIN42!"},
           {"<b>PIN42!</b>", "PIN42!"},
           {"PIN42!", "pin42"},
@@ -214,6 +244,33 @@ defmodule EmailJanitor.ConversationPlannerTest do
     end
   end
 
+  test "short incidental substrings and punctuation-only bodies keep useful explanations" do
+    for {body, explanation} <- [
+          {"x", "Please explain the previous action."},
+          {"Hi", "This was an unsolicited offer."},
+          {"1", "There are 12 matching messages."},
+          {".", "It appears to be an unsolicited offer."},
+          {"-", "It appears to be an unsolicited offer."}
+        ] do
+      {:ok, evidence} = Evidence.new("sender@example.org", "Offer", Content.new(body))
+      Req.Test.stub(__MODULE__, &response(&1, :azure, answer(explanation)))
+
+      assert {:ok, plan} =
+               Planner.plan(
+                 inbox(),
+                 snapshot(inbox()),
+                 Content.new("Explain the action"),
+                 [],
+                 [],
+                 opts(:azure)
+                 |> Keyword.put(:chat_history, [])
+                 |> Keyword.put(:request_evidence, evidence)
+               )
+
+      assert Content.read(plan.reply) == explanation
+    end
+  end
+
   test "persistent replies guard fetched body excerpts but keep concise paraphrases" do
     box = inbox()
     passage = "Synthetic private sales details with a unique confidential description."
@@ -251,6 +308,40 @@ defmodule EmailJanitor.ConversationPlannerTest do
              )
 
     assert Content.read(plan.reply) == paraphrase
+  end
+
+  test "maximum current body evidence retains a concise unrelated answer" do
+    box = inbox()
+
+    messages =
+      for n <- 1..5,
+          do: message(id: "message-#{n}", body: String.duplicate("bounded private source ", 400))
+
+    refs =
+      Enum.map(messages, fn message ->
+        {:ok, ref} = Reference.new(box.id, message.id, message.thread_id, "Sender", "Subject")
+        ref
+      end)
+
+    {:ok, forwarded} =
+      Evidence.new("sender@example.org", "Offer", Content.new(String.duplicate("f", 8_000)))
+
+    explanation = "It appears to be an unsolicited offer."
+    Req.Test.stub(__MODULE__, &response(&1, :azure, answer(explanation)))
+
+    assert {:ok, plan} =
+             Planner.plan(
+               box,
+               snapshot(box),
+               Content.new("Explain the action"),
+               refs,
+               messages,
+               opts(:azure)
+               |> Keyword.put(:chat_history, [])
+               |> Keyword.put(:request_evidence, forwarded)
+             )
+
+    assert Content.read(plan.reply) == explanation
   end
 
   test "history overflow drops oldest complete pairs without blocking an otherwise valid request" do

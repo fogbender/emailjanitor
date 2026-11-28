@@ -51,6 +51,7 @@ defmodule EmailJanitor.Conversation.Planner do
          true <- byte_size(Content.read(request)) in 1..16_000,
          true <- String.valid?(Content.read(request)),
          {:ok, history} <- chat_history(opts),
+         true <- history == :absent or history_text?(Content.read(request), 16_000),
          {:ok, forwarded} <- Evidence.decode(Keyword.get(opts, :request_evidence)),
          true <- snapshot.inbox_id == inbox.id,
          true <- is_list(references) and length(references) <= 10,
@@ -195,7 +196,7 @@ defmodule EmailJanitor.Conversation.Planner do
 
   defp retainable_reply(%Plan{operation: :answer} = plan, _history, bodies, forwarded) do
     sources = if forwarded, do: [Content.new(forwarded["body"]) | bodies], else: bodies
-    reply = comparison_texts(Content.read(plan.reply))
+    reply = reply_comparisons(Content.read(plan.reply))
 
     if Enum.any?(sources, &copied_reply?(reply, &1)),
       do: %{plan | reply: Content.new(@omitted_reply)},
@@ -208,22 +209,50 @@ defmodule EmailJanitor.Conversation.Planner do
     raw = Content.read(source)
 
     variants =
-      case EmailJanitor.HTML.readable(source, 8_000) do
-        {:ok, readable} -> [raw, Content.read(readable)]
-        _ -> [raw]
+      if String.contains?(raw, ["<", "&"]) do
+        case EmailJanitor.HTML.readable(source, 8_000) do
+          {:ok, readable} -> [raw, Content.read(readable)]
+          _ -> [raw]
+        end
+      else
+        [raw]
       end
 
     Enum.any?(variants, fn text ->
-      Enum.any?(comparison_texts(text), fn body ->
-        body != "" and
-          Enum.any?(replies, fn reply ->
-            String.contains?(reply, body) or
-              body
-              |> String.graphemes()
-              |> Enum.chunk_every(24, 1, :discard)
-              |> Enum.any?(&String.contains?(reply, Enum.join(&1)))
-          end)
+      Enum.any?(comparison_texts(text), fn {form, body} ->
+        {reply, passages} = Map.fetch!(replies, form)
+
+        cond do
+          not Regex.match?(~r/[\p{L}\p{N}]/u, body) ->
+            false
+
+          String.length(body) < 24 ->
+            boundary = "(?:^|[^\\p{L}\\p{N}])" <> Regex.escape(body) <> "(?:$|[^\\p{L}\\p{N}])"
+            Regex.match?(Regex.compile!(boundary, "u"), reply)
+
+          is_nil(passages) ->
+            false
+
+          true ->
+            :binary.match(body, passages) != :nomatch
+        end
       end)
+    end)
+  end
+
+  # Only the reply (at most 1024 bytes) is windowed, once per normalization.
+  # A compiled multi-pattern search then scans each bounded evidence body.
+  defp reply_comparisons(text) do
+    Map.new(comparison_texts(text), fn {form, reply} ->
+      passages =
+        reply
+        |> String.graphemes()
+        |> Enum.chunk_every(24, 1, :discard)
+        |> Enum.map(&Enum.join/1)
+        |> Enum.uniq()
+
+      compiled = if passages == [], do: nil, else: :binary.compile_pattern(passages)
+      {form, {reply, compiled}}
     end)
   end
 
@@ -235,8 +264,10 @@ defmodule EmailJanitor.Conversation.Planner do
       |> String.replace(~r/\s+/u, " ")
       |> String.trim()
 
-    [normalized, normalized |> String.replace(~r/[^\p{L}\p{N}]+/u, " ") |> String.trim()]
-    |> Enum.uniq()
+    [
+      literal: normalized,
+      words: normalized |> String.replace(~r/[^\p{L}\p{N}]+/u, " ") |> String.trim()
+    ]
   end
 
   defp instruction(entry),
