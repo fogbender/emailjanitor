@@ -226,9 +226,12 @@ defmodule EmailJanitor.Conversation.Planner do
           not Regex.match?(~r/[\p{L}\p{N}]/u, body) ->
             false
 
-          String.length(body) < 24 ->
-            boundary = "(?:^|[^\\p{L}\\p{N}])" <> Regex.escape(body) <> "(?:$|[^\\p{L}\\p{N}])"
+          Regex.match?(~r/\A[a-z0-9]{1,4}\z/u, body) ->
+            boundary = "(?:^|[^a-z0-9])" <> Regex.escape(body) <> "(?:$|[^a-z0-9])"
             Regex.match?(Regex.compile!(boundary, "u"), reply)
+
+          String.length(body) < 24 ->
+            String.contains?(reply, body)
 
           is_nil(passages) ->
             false

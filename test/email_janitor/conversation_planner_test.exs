@@ -140,7 +140,12 @@ defmodule EmailJanitor.ConversationPlannerTest do
   end
 
   test "invalid history is rejected before provider dispatch" do
-    Req.Test.stub(__MODULE__, fn _ -> flunk("invalid history reached provider") end)
+    owner = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(owner, :invalid_history_provider_reached)
+      response(conn, :azure, answer("A provider response."))
+    end)
 
     pair = {Content.new("Earlier request"), Content.new("Earlier answer")}
 
@@ -165,12 +170,19 @@ defmodule EmailJanitor.ConversationPlannerTest do
                  [],
                  opts(:azure) |> Keyword.put(:chat_history, history)
                )
+
+      refute_received :invalid_history_provider_reached
     end
   end
 
   test "a persistent current request uses the same predicate as its later history turn" do
+    owner = self()
+
     for control <- ["\r", "\f", "\e", <<0>>, <<127>>] do
-      Req.Test.stub(__MODULE__, fn _ -> flunk("invalid persistent request reached provider") end)
+      Req.Test.stub(__MODULE__, fn conn ->
+        send(owner, :invalid_current_provider_reached)
+        response(conn, :azure, answer("A provider response."))
+      end)
 
       assert {:error, :conversation_unavailable} =
                Planner.plan(
@@ -181,6 +193,8 @@ defmodule EmailJanitor.ConversationPlannerTest do
                  [],
                  Keyword.put(opts(:azure), :chat_history, [])
                )
+
+      refute_received :invalid_current_provider_reached
 
       # The absent-option callers keep their existing transient input contract.
       Req.Test.stub(__MODULE__, &response(&1, :azure, answer("A transient explanation.")))
@@ -195,6 +209,32 @@ defmodule EmailJanitor.ConversationPlannerTest do
                  opts(:azure)
                )
     end
+  end
+
+  test "a complete CJK body quoted inside a CJK explanation is omitted after actual SDK dispatch" do
+    owner = self()
+    body = "明日の会議は中止です"
+    {:ok, evidence} = Evidence.new("sender@example.org", "Notice", Content.new(body))
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(owner, :cjk_provider_reached)
+      response(conn, :azure, answer("メールには" <> body <> "と書かれています"))
+    end)
+
+    assert {:ok, plan} =
+             Planner.plan(
+               inbox(),
+               snapshot(inbox()),
+               Content.new("Explain the action"),
+               [],
+               [],
+               opts(:azure)
+               |> Keyword.put(:chat_history, [])
+               |> Keyword.put(:request_evidence, evidence)
+             )
+
+    assert_receive :cjk_provider_reached
+    assert Content.read(plan.reply) == "I can discuss the message without quoting its contents."
   end
 
   test "persistent explanatory replies omit copied complete short or HTML forwarded bodies" do
